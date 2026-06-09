@@ -1,9 +1,5 @@
 # Symphony Jira Python MVP
 
-This package implements the Jira/Codex-CLI Symphony path through Phase 4 of
-`docs/JIRA_CODEX_PYTHON_SPEC.md`, plus the Phase 5 polling loop, Phase 6
-dashboard/API, and initial Phase 7 hardening.
-
 It uses Jira REST credentials from `WORKFLOW.md`, prepares a per-issue local
 workspace, runs the locally installed `codex` CLI with `codex exec --json`, stores
 run data in SQLite, and posts Jira comments from the Python orchestrator.
