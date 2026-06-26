@@ -115,9 +115,10 @@ def build_state(
 ) -> dict[str, Any]:
     runs = store.list_runs(limit=recent_limit)
     enriched = [enrich_run(run, store, workflow) for run in runs]
+    latest_run_ids_by_issue = latest_run_ids(enriched)
     running = [run for run in enriched if run["status"] == "running"]
     queued = [run for run in enriched if run["status"] == "queued"]
-    blocked = [run for run in enriched if run["status"] == "blocked"]
+    blocked = [run for run in enriched if is_actionable_blocked_run(run, latest_run_ids_by_issue)]
     completed_or_failed = [run for run in enriched if run["status"] in {"completed", "failed", "cancelled"}]
 
     return {
@@ -132,6 +133,25 @@ def build_state(
         "all_runs": enriched,
         "runtime": runtime or {},
     }
+
+
+def latest_run_ids(runs: list[dict[str, Any]]) -> dict[str, str]:
+    latest: dict[str, str] = {}
+    for run in runs:
+        issue_identifier = str(run.get("issue_identifier") or "")
+        run_id = str(run.get("id") or "")
+        if issue_identifier and run_id and issue_identifier not in latest:
+            latest[issue_identifier] = run_id
+    return latest
+
+
+def is_actionable_blocked_run(run: dict[str, Any], latest_run_ids_by_issue: dict[str, str]) -> bool:
+    if run.get("status") != "blocked":
+        return False
+    issue_identifier = str(run.get("issue_identifier") or "")
+    if latest_run_ids_by_issue.get(issue_identifier) != run.get("id"):
+        return False
+    return not run.get("human_inputs")
 
 
 def orchestrator_snapshot(orchestrator: Any | None) -> dict[str, Any] | None:
@@ -157,8 +177,10 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
             "elapsed_seconds": elapsed_seconds(run),
             "plan_path": str(plan_path),
             "plan_exists": plan_path.exists(),
+            "plan_content": read_text_if_exists(plan_path),
             "review_path": str(review_path),
             "review_exists": review_path.exists(),
+            "review_content": read_text_if_exists(review_path),
             "review_history_path": str(review_history_path),
             "review_history_exists": review_history_path.exists(),
             "human_inputs": human_inputs,
@@ -222,7 +244,10 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }}
     .panel {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; }}
     .muted {{ color: #6b7280; }}
-    pre {{ white-space: pre-wrap; max-height: 12rem; overflow: auto; }}
+    pre {{ white-space: pre-wrap; max-height: 28rem; overflow: auto; }}
+    details {{ max-width: 42rem; }}
+    summary {{ cursor: pointer; color: #1f2937; font-weight: 600; }}
+    .preview {{ color: #4b5563; margin-top: 0.35rem; }}
   </style>
 </head>
 <body>
@@ -262,9 +287,9 @@ def render_run_row(run: dict[str, Any]) -> str:
         f"<td>{escape(run.get('verification_status'))}</td>"
         f"<td>{render_plan_cell(run)}</td>"
         f"<td>{render_review_cell(run)}</td>"
-        f"<td><pre>{escape(display_error(run)[:1000])}</pre></td>"
+        f"<td>{render_long_text_cell(display_error(run), 'Show full error')}</td>"
         f"<td>{render_human_input_cell(run)}</td>"
-        f"<td><pre>{escape(final_message[:1000])}</pre></td>"
+        f"<td>{render_long_text_cell(final_message, 'Show full final message')}</td>"
         "</tr>"
     )
 
@@ -290,13 +315,43 @@ def format_elapsed(value: Any) -> str:
 def render_review_cell(run: dict[str, Any]) -> str:
     if not run.get("review_exists"):
         return "none"
-    return f"<code>{escape(run.get('review_path'))}</code>"
+    content = str(run.get("review_content") or "")
+    return (
+        f"<code>{escape(run.get('review_path'))}</code>"
+        f"{render_long_text_cell(content, 'Show review', force_details=True) if content else ''}"
+    )
 
 
 def render_plan_cell(run: dict[str, Any]) -> str:
     if not run.get("plan_exists"):
         return "none"
-    return f"<code>{escape(run.get('plan_path'))}</code>"
+    content = str(run.get("plan_content") or "")
+    return (
+        f"<code>{escape(run.get('plan_path'))}</code>"
+        f"{render_long_text_cell(content, 'Show plan', force_details=True) if content else ''}"
+    )
+
+
+def render_long_text_cell(value: Any, summary: str, *, force_details: bool = False) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    preview = text if len(text) <= 220 else f"{text[:220]}..."
+    if len(text) <= 220 and not force_details:
+        return f"<pre>{escape(text)}</pre>"
+    return (
+        f"<details><summary>{escape(summary)}</summary>"
+        f"<div class=\"preview\">{escape(preview)}</div>"
+        f"<pre>{escape(text)}</pre>"
+        "</details>"
+    )
+
+
+def read_text_if_exists(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
 
 
 def display_blocked_phase(run: dict[str, Any]) -> str:

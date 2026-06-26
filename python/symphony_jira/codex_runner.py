@@ -109,12 +109,7 @@ class CodexRunner:
             returncode = await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             timed_out = True
-            process.terminate()
-            try:
-                returncode = await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                returncode = await process.wait()
+            returncode = await terminate_process(process, terminate_timeout_seconds=5)
 
         await stdout_task
         stderr_text = await stderr_task
@@ -168,6 +163,21 @@ async def maybe_await(value):
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def terminate_process(process: Any, *, terminate_timeout_seconds: int) -> int | None:
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return await process.wait()
+    try:
+        return await asyncio.wait_for(process.wait(), timeout=terminate_timeout_seconds)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return await process.wait()
+        return await process.wait()
 
 
 def event_type_from(raw: dict[str, Any]) -> str:

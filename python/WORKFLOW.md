@@ -54,14 +54,7 @@ codex:
   require_plan_approval: true
   planning_prompt: |
     Inspect the relevant repo areas and write a concise implementation plan/spec.
-    Include:
-    - understood Jira requirement
-    - affected repos/files
-    - proposed code change
-    - verification plan
-    - open questions or risky assumptions
-    Do not edit files during the planning pass.
-    If requirements are unclear enough that implementation would be risky, stop and ask for clarification instead of editing.
+    Pay extra attention to report/table behavior, translations, API compatibility, persistence/schema behavior, backward compatibility, and which repo owns the change.
   review_after_run: true
   max_review_iterations: 10
   review_prompt: |
@@ -105,4 +98,3 @@ Repository rules:
 - Run the configured verification command.
 - To run tests, go to "/home/adkuppa/compost/" and run "docker-compose run foyr bash" or "docker-compose run cpm bash" and you'll have the environment.
 - Before you handoff, make sure the changes you made are working and not causing api or ui failures.
-

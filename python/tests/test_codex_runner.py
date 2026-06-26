@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from symphony_jira.codex_runner import CodexRunner, looks_blocked
+from symphony_jira.codex_runner import CodexRunner, terminate_process, looks_blocked
 from symphony_jira.config import CodexConfig
 
 
@@ -62,6 +62,16 @@ class CodexRunnerTests(unittest.TestCase):
 
             asyncio.run(run())
 
+    def test_timeout_cleanup_ignores_process_that_already_exited(self) -> None:
+        async def run() -> None:
+            process = AlreadyExitedProcess()
+            returncode = await terminate_process(process, terminate_timeout_seconds=1)
+
+            self.assertEqual(returncode, 0)
+            self.assertTrue(process.terminate_called)
+
+        asyncio.run(run())
+
 
 def write_fake_codex(root: Path) -> Path:
     path = root / "fake_codex.py"
@@ -80,6 +90,18 @@ print("stderr line", file=sys.stderr)
     )
     path.chmod(path.stat().st_mode | 0o111)
     return path
+
+
+class AlreadyExitedProcess:
+    def __init__(self) -> None:
+        self.terminate_called = False
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        raise ProcessLookupError()
+
+    async def wait(self) -> int:
+        return 0
 
 
 def write_large_event_fake_codex(root: Path) -> Path:

@@ -119,9 +119,10 @@ class CodexConfig(BaseModel):
     require_plan_approval: bool = False
     planning_prompt: str = (
         "Before implementation, inspect the relevant code and produce a concise implementation plan/spec. "
-        "Include: understood requirement, affected repos/files, proposed change, verification plan, and open questions. "
+        "Include: understood requirement, affected repos/files, proposed change, verification plan, assumptions, and open questions. "
+        "Do not make product, UX, data-ordering, default-behavior, or ownership decisions that are not explicitly stated by Jira or clearly established by existing code. "
         "Do not edit files during the planning pass. "
-        "If requirements are unclear enough that implementation would be risky, ask for clarification instead of planning risky changes."
+        "If multiple reasonable choices exist, ask for clarification instead of choosing silently."
     )
     output_plan_file: str = ".symphony/codex-plan.md"
     review_after_run: bool = False

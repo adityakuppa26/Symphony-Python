@@ -12,6 +12,7 @@ from symphony_jira.orchestrator import (
     SingleIssueOrchestrator,
     classify_review_decision,
     finish_comment,
+    parse_human_request,
     retry_backoff_seconds,
     select_dispatchable_issues,
 )
@@ -130,6 +131,27 @@ class OrchestratorTests(unittest.TestCase):
             classify_review_decision('```json\n{"decision":"changes_required","findings":["fix it"]}\n```'),
             "changes_required",
         )
+
+    def test_structured_human_request_json_is_supported(self) -> None:
+        self.assertEqual(
+            parse_human_request('{"decision":"needs_human","question":"Apply to CPM only?"}'),
+            "Apply to CPM only?",
+        )
+        self.assertEqual(
+            parse_human_request('```json\n{"decision":"needs_human","question":"Which repo?"}\n```'),
+            "Which repo?",
+        )
+        self.assertEqual(
+            parse_human_request('{"decision":"ready_for_approval","questions":["Where should the column go?"]}'),
+            "Where should the column go?",
+        )
+        self.assertEqual(
+            parse_human_request(
+                '{"decision":"ready_for_approval","assumptions":[{"assumption":"Place the column last","needs_human":true}]}'
+            ),
+            "Place the column last",
+        )
+        self.assertIsNone(parse_human_request('{"decision":"approve","question":"Nope"}'))
 
     def test_polling_orchestrator_respects_concurrency(self) -> None:
         async def run() -> None:
@@ -283,6 +305,8 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(latest.status, "completed")
                 self.assertIn("Human clarification:", runner.prompts[-1])
                 self.assertIn("Use the CPM report flow only.", runner.prompts[-1])
+                self.assertIn("Continue implementation from the existing workspace.", runner.prompts[-1])
+                self.assertIn("Leave an updated final report", runner.prompts[-1])
                 self.assertIsNotNone(store.list_human_inputs(run_id=blocked_run.id)[0]["consumed_at"])
 
         asyncio.run(run())
@@ -367,6 +391,161 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.run.status, "blocked")
             self.assertEqual(result.run.blocked_phase, "planning")
 
+    def test_needs_human_json_blocks_planning_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_path = write_workflow(
+                root,
+                write_fake_codex(root),
+                codex_extra="""
+  plan_before_implementation: true
+  planning_prompt: |
+    Write a plan only.
+""",
+            )
+            workflow = load_workflow(workflow_path, environ={"TEST_JIRA_TOKEN": "token"})
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = MessageCodexRunner(['{"decision":"needs_human","question":"Which repo should change?"}'])
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / ".symphony" / "symphony.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            self.assertIsNotNone(result.run)
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "planning")
+            self.assertEqual(result.run.error, "Which repo should change?")
+
+    def test_plan_assumption_needing_human_blocks_planning_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_path = write_workflow(
+                root,
+                write_fake_codex(root),
+                codex_extra="""
+  plan_before_implementation: true
+  planning_prompt: |
+    Write a plan only.
+""",
+            )
+            workflow = load_workflow(workflow_path, environ={"TEST_JIRA_TOKEN": "token"})
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = MessageCodexRunner(
+                [
+                    '{"decision":"ready_for_approval","assumptions":[{"assumption":"Place the new column after Status","needs_human":true}],"questions":[]}'
+                ]
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / ".symphony" / "symphony.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            self.assertIsNotNone(result.run)
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "planning")
+            self.assertEqual(result.run.error, "Place the new column after Status")
+
+    def test_needs_human_json_blocks_implementation_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(write_workflow(root, write_fake_codex(root)), environ={"TEST_JIRA_TOKEN": "token"})
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = MessageCodexRunner(['{"decision":"needs_human","question":"Should I update translations?"}'])
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / ".symphony" / "symphony.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            self.assertIsNotNone(result.run)
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "implementation")
+            self.assertEqual(result.run.error, "Should I update translations?")
+
+    def test_needs_human_json_blocks_review_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_path = write_workflow(
+                root,
+                write_fake_codex(root),
+                codex_extra="""
+  review_after_run: true
+  max_review_iterations: 1
+""",
+            )
+            workflow = load_workflow(workflow_path, environ={"TEST_JIRA_TOKEN": "token"})
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = MessageCodexRunner(
+                [
+                    "Implementation complete.",
+                    '{"decision":"needs_human","question":"Is this behavior acceptable?"}',
+                ]
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / ".symphony" / "symphony.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            self.assertIsNotNone(result.run)
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "review")
+            self.assertEqual(result.run.error, "Is this behavior acceptable?")
+
     def test_plan_approval_gate_waits_for_human_before_implementation(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:
@@ -403,7 +582,7 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(first.run.blocked_phase, "planning_approval")
                 self.assertEqual(runner.prompts_seen, ["plan"])
 
-                store.add_human_input("T-1", run_id=first.run.id, response="Approved. Keep the change small.")
+                store.add_human_input("T-1", run_id=first.run.id, response="Approved.")
                 polling = PollingOrchestrator(workflow, jira, store, codex_runner=runner)
                 await polling.poll_once()
                 await asyncio.gather(*(item.task for item in polling.running.values()))
@@ -415,7 +594,120 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(latest.status, "completed")
                 self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
                 self.assertIn("human plan approval", runner.implementation_prompt)
-                self.assertIn("Approved. Keep the change small.", runner.implementation_prompt)
+                self.assertIn("Approved.", runner.implementation_prompt)
+
+        asyncio.run(run())
+
+    def test_plan_approval_feedback_refines_plan_and_waits_for_approval_again(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workflow_path = write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  require_plan_approval: true
+  planning_prompt: |
+    Write a plan only.
+""",
+                )
+                workflow = load_workflow(workflow_path, environ={"TEST_JIRA_TOKEN": "token"})
+                issue = Issue(
+                    id="10001",
+                    identifier="T-1",
+                    title="Fix bug",
+                    description="Please fix",
+                    status="To Do",
+                    labels=["codex-ready"],
+                    url="https://jira.example.test/browse/T-1",
+                )
+                store = Store(root / ".symphony" / "symphony.sqlite3")
+                runner = PlanFeedbackCodexRunner()
+                jira = FakeJira(issue)
+
+                first = await SingleIssueOrchestrator(workflow, jira, store, codex_runner=runner).run_once("T-1")
+
+                self.assertIsNotNone(first.run)
+                assert first.run is not None
+                self.assertEqual(first.run.status, "blocked")
+                self.assertEqual(first.run.blocked_phase, "planning_approval")
+
+                store.add_human_input("T-1", run_id=first.run.id, response="Put the new column after Amount.")
+                polling = PollingOrchestrator(workflow, jira, store, codex_runner=runner)
+                await polling.poll_once()
+                await asyncio.gather(*(item.task for item in polling.running.values()))
+                await polling.reap_finished()
+
+                revised = store.latest_run_for_issue("T-1")
+                self.assertIsNotNone(revised)
+                assert revised is not None
+                self.assertEqual(revised.status, "blocked")
+                self.assertEqual(revised.blocked_phase, "planning_approval")
+                self.assertEqual(runner.prompts_seen, ["plan", "plan_refinement"])
+                self.assertIn("Human feedback to incorporate", runner.refinement_prompt)
+                self.assertIn("Put the new column after Amount.", runner.refinement_prompt)
+                assert first.workspace is not None
+                self.assertEqual(
+                    (first.workspace.path / ".symphony" / "codex-plan.md").read_text(encoding="utf-8"),
+                    "Revised plan: put the column after Amount.",
+                )
+
+        asyncio.run(run())
+
+    def test_planning_clarification_refines_plan_then_waits_for_approval(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workflow_path = write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  require_plan_approval: true
+  planning_prompt: |
+    Write a plan only.
+""",
+                )
+                workflow = load_workflow(workflow_path, environ={"TEST_JIRA_TOKEN": "token"})
+                issue = Issue(
+                    id="10001",
+                    identifier="T-1",
+                    title="Fix bug",
+                    description="Please fix",
+                    status="To Do",
+                    labels=["codex-ready"],
+                    url="https://jira.example.test/browse/T-1",
+                )
+                store = Store(root / ".symphony" / "symphony.sqlite3")
+                runner = PlanningQuestionThenPlanCodexRunner()
+                jira = FakeJira(issue)
+
+                first = await SingleIssueOrchestrator(workflow, jira, store, codex_runner=runner).run_once("T-1")
+
+                self.assertIsNotNone(first.run)
+                assert first.run is not None
+                self.assertEqual(first.run.status, "blocked")
+                self.assertEqual(first.run.blocked_phase, "planning")
+                self.assertEqual(first.run.error, "Where should the column go?")
+
+                store.add_human_input("T-1", run_id=first.run.id, response="After Amount.")
+                polling = PollingOrchestrator(workflow, jira, store, codex_runner=runner)
+                await polling.poll_once()
+                await asyncio.gather(*(item.task for item in polling.running.values()))
+                await polling.reap_finished()
+
+                revised = store.latest_run_for_issue("T-1")
+                self.assertIsNotNone(revised)
+                assert revised is not None
+                self.assertEqual(revised.status, "blocked")
+                self.assertEqual(revised.blocked_phase, "planning_approval")
+                self.assertEqual(runner.prompts_seen, ["plan_question", "plan_refinement"])
+                assert first.workspace is not None
+                self.assertEqual(
+                    (first.workspace.path / ".symphony" / "codex-plan.md").read_text(encoding="utf-8"),
+                    "Plan after clarification: put the column after Amount.",
+                )
 
         asyncio.run(run())
 
@@ -565,6 +857,19 @@ class StatusCodexRunner:
         return codex_result(workspace_path, status)
 
 
+class MessageCodexRunner:
+    def __init__(self, messages: list[str]) -> None:
+        self.messages = messages
+
+    async def run(self, prompt, workspace_path, config, *, timeout_seconds, event_callback=None, log_callback=None):
+        return codex_result(
+            workspace_path,
+            "completed",
+            final_message=self.messages.pop(0),
+            final_path=config.output_last_message_file,
+        )
+
+
 class PromptStatusCodexRunner(StatusCodexRunner):
     def __init__(self, statuses: list[str]) -> None:
         super().__init__(statuses)
@@ -622,6 +927,52 @@ class PlanThenImplementCodexRunner:
         self.prompts_seen.append("implementation")
         self.implementation_prompt = prompt
         return codex_result(workspace_path, "completed", final_message="implemented")
+
+
+class PlanFeedbackCodexRunner:
+    def __init__(self) -> None:
+        self.prompts_seen: list[str] = []
+        self.refinement_prompt = ""
+
+    async def run(self, prompt, workspace_path, config, *, timeout_seconds, event_callback=None, log_callback=None):
+        if "human feedback to incorporate" in prompt.lower():
+            self.prompts_seen.append("plan_refinement")
+            self.refinement_prompt = prompt
+            return codex_result(
+                workspace_path,
+                "completed",
+                final_message="Revised plan: put the column after Amount.",
+                final_path=config.output_last_message_file,
+            )
+        self.prompts_seen.append("plan")
+        return codex_result(
+            workspace_path,
+            "completed",
+            final_message="Initial plan: put the column last.",
+            final_path=config.output_last_message_file,
+        )
+
+
+class PlanningQuestionThenPlanCodexRunner:
+    def __init__(self) -> None:
+        self.prompts_seen: list[str] = []
+
+    async def run(self, prompt, workspace_path, config, *, timeout_seconds, event_callback=None, log_callback=None):
+        if "human feedback to incorporate" in prompt.lower():
+            self.prompts_seen.append("plan_refinement")
+            return codex_result(
+                workspace_path,
+                "completed",
+                final_message="Plan after clarification: put the column after Amount.",
+                final_path=config.output_last_message_file,
+            )
+        self.prompts_seen.append("plan_question")
+        return codex_result(
+            workspace_path,
+            "completed",
+            final_message='{"decision":"needs_human","question":"Where should the column go?"}',
+            final_path=config.output_last_message_file,
+        )
 
 
 def codex_result(

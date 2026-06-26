@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from .codex_runner import CodexRunner
-from .config import WorkflowConfig
+from .codex_runner import CodexRunner, CodexRunResult
+from .config import CodexConfig, WorkflowConfig
 from .logging import redact_text
 from .models import Issue, RunRecord, issue_description_fingerprint, utc_now
 from .store import Store
@@ -61,6 +61,45 @@ class OrchestratorError(Exception):
     """Raised when an issue cannot be dispatched."""
 
 
+PRIORITY_RANKS = {
+    "highest": 0,
+    "blocker": 0,
+    "critical": 0,
+    "high": 1,
+    "major": 1,
+    "medium": 2,
+    "normal": 2,
+    "low": 3,
+    "minor": 3,
+    "lowest": 4,
+    "trivial": 4,
+}
+
+NON_RETRYABLE_ERROR_MARKERS = (
+    "prompt rendering failed",
+    "missing required labels",
+    "status is not active",
+    "workflow",
+    "codex command not found",
+    "workspace.source_repo",
+    "source_repo",
+    "jira token",
+    "jira email",
+)
+
+REVIEW_CHANGE_MARKERS = (
+    "changes_required",
+    "changes required",
+    "needs another pass",
+    "must fix",
+    "should fix before",
+)
+
+PLAN_APPROVAL_RESPONSES = {"approved", "approved.", "approve", "approve."}
+
+TRUTHY_STRINGS = {"true", "yes", "y", "1", "required", "needs_human"}
+
+
 class SingleIssueOrchestrator:
     def __init__(
         self,
@@ -96,10 +135,19 @@ class SingleIssueOrchestrator:
 
         prompt = render_prompt(self.workflow, issue)
         generation_prompt = prompt
+        previous_phase = previous_run.blocked_phase if previous_run else None
+        human_response = str((human_input or {}).get("response") or "")
         plan_approved_by_human = (
             human_input is not None
             and previous_run is not None
-            and previous_run.blocked_phase == "planning_approval"
+            and previous_phase == "planning_approval"
+            and is_plan_approval_response(human_response)
+        )
+        plan_refinement_requested = (
+            human_input is not None
+            and previous_run is not None
+            and previous_phase in {"planning", "planning_approval"}
+            and not plan_approved_by_human
         )
         if plan_approved_by_human:
             generation_prompt = build_approved_plan_implementation_prompt(
@@ -109,6 +157,14 @@ class SingleIssueOrchestrator:
                 human_input=human_input or {},
                 plan_message=read_plan_message_for_run(previous_run, self.config.codex.output_plan_file),
             )
+        elif plan_refinement_requested:
+            generation_prompt = build_plan_refinement_prompt(
+                issue=issue,
+                original_prompt=prompt,
+                previous_run=previous_run,
+                human_input=human_input or {},
+                previous_plan_message=read_plan_message_for_run(previous_run, self.config.codex.output_plan_file),
+            )
         elif human_input is not None:
             generation_prompt = build_human_resume_prompt(
                 issue=issue,
@@ -116,6 +172,7 @@ class SingleIssueOrchestrator:
                 previous_run=previous_run,
                 human_input=human_input,
             )
+        generation_prompt = add_human_request_contract(generation_prompt)
         if dry_run:
             return OnceResult(issue=issue, prompt=generation_prompt, run=None, workspace=None, dry_run=True)
 
@@ -153,30 +210,42 @@ class SingleIssueOrchestrator:
             total_event_offset = 0
             plan_message: str | None = None
             run_implementation = True
-            if self.config.codex.plan_before_implementation and not plan_approved_by_human:
-                plan_prompt = build_planning_prompt(
-                    issue=issue,
-                    implementation_prompt=generation_prompt,
-                    planning_instructions=self.config.codex.planning_prompt,
-                )
+            should_run_planning = (
+                self.config.codex.plan_before_implementation
+                and not plan_approved_by_human
+                and (human_input is None or plan_refinement_requested)
+            )
+            if should_run_planning:
+                if plan_refinement_requested:
+                    plan_prompt = generation_prompt
+                else:
+                    plan_prompt = build_planning_prompt(
+                        issue=issue,
+                        implementation_prompt=generation_prompt,
+                        planning_instructions=self.config.codex.planning_prompt,
+                    )
                 plan_config = self.config.codex.model_copy(
                     update={"output_last_message_file": self.config.codex.output_plan_file}
                 )
-                plan_result = await self.codex_runner.run(
-                    plan_prompt,
-                    workspace.path,
-                    plan_config,
-                    timeout_seconds=self.config.agent.timeout_seconds,
-                    event_callback=lambda seq, event_type, raw, offset=total_event_offset: self.store.add_codex_event(
-                        run.id, offset + seq, f"plan.{event_type}", raw
-                    ),
-                    log_callback=lambda level, message: self.store.add_log(run.id, level, self.redact(message) or ""),
+                plan_result, total_event_offset = await self._run_codex_pass(
+                    prompt=plan_prompt,
+                    workspace_path=workspace.path,
+                    config=plan_config,
+                    run_id=run.id,
+                    event_offset=total_event_offset,
+                    event_prefix="plan",
                 )
-                total_event_offset += max(len(plan_result.events), 1)
                 status = plan_result.status
                 plan_message = plan_result.final_message
                 error = self.redact(plan_result.error)
-                if status != "completed":
+                plan_human_request = parse_human_request(plan_message or plan_result.error)
+                if plan_human_request:
+                    status = "blocked"
+                    final_message = plan_message
+                    error = plan_human_request
+                    blocked_phase = "planning"
+                    run_implementation = False
+                elif status != "completed":
                     final_message = plan_message
                     blocked_phase = "planning"
                     run_implementation = False
@@ -195,20 +264,22 @@ class SingleIssueOrchestrator:
 
             generation_pass = 1
             while run_implementation:
-                codex_result = await self.codex_runner.run(
-                    generation_prompt,
-                    workspace.path,
-                    self.config.codex,
-                    timeout_seconds=self.config.agent.timeout_seconds,
-                    event_callback=lambda seq, event_type, raw, offset=total_event_offset: self.store.add_codex_event(
-                        run.id, offset + seq, event_type, raw
-                    ),
-                    log_callback=lambda level, message: self.store.add_log(run.id, level, self.redact(message) or ""),
+                codex_result, total_event_offset = await self._run_codex_pass(
+                    prompt=generation_prompt,
+                    workspace_path=workspace.path,
+                    config=self.config.codex,
+                    run_id=run.id,
+                    event_offset=total_event_offset,
                 )
-                total_event_offset += max(len(codex_result.events), 1)
                 status = codex_result.status
                 final_message = codex_result.final_message
                 error = self.redact(codex_result.error)
+                implementation_human_request = parse_human_request(final_message or codex_result.error)
+                if implementation_human_request:
+                    status = "blocked"
+                    error = implementation_human_request
+                    blocked_phase = "implementation"
+                    break
 
                 if status != "completed":
                     blocked_phase = "implementation"
@@ -242,17 +313,14 @@ class SingleIssueOrchestrator:
                 review_config = self.config.codex.model_copy(
                     update={"output_last_message_file": self.config.codex.output_review_file}
                 )
-                review_result = await self.codex_runner.run(
-                    review_prompt,
-                    workspace.path,
-                    review_config,
-                    timeout_seconds=self.config.agent.timeout_seconds,
-                    event_callback=lambda seq, event_type, raw, offset=total_event_offset: self.store.add_codex_event(
-                        run.id, offset + seq, f"review.{event_type}", raw
-                    ),
-                    log_callback=lambda level, message: self.store.add_log(run.id, level, self.redact(message) or ""),
+                review_result, total_event_offset = await self._run_codex_pass(
+                    prompt=review_prompt,
+                    workspace_path=workspace.path,
+                    config=review_config,
+                    run_id=run.id,
+                    event_offset=total_event_offset,
+                    event_prefix="review",
                 )
-                total_event_offset += max(len(review_result.events), 1)
                 review_message = review_result.final_message or review_result.error or ""
                 review_history.append(f"## Review pass {generation_pass}\n\n{review_message}".strip())
                 write_review_files(workspace.path, self.config.codex, review_message, review_history)
@@ -260,6 +328,13 @@ class SingleIssueOrchestrator:
                 if review_result.status != "completed":
                     status = review_result.status
                     error = self.redact(review_result.error or "Codex review pass failed")
+                    blocked_phase = "review"
+                    break
+
+                review_human_request = parse_human_request(review_message)
+                if review_human_request:
+                    status = "blocked"
+                    error = review_human_request
                     blocked_phase = "review"
                     break
 
@@ -312,6 +387,33 @@ class SingleIssueOrchestrator:
         stored_run = self.store.get_run(run.id)
         assert stored_run is not None
         return OnceResult(issue=issue, prompt=prompt, run=stored_run, workspace=workspace, dry_run=False)
+
+    async def _run_codex_pass(
+        self,
+        *,
+        prompt: str,
+        workspace_path: Path,
+        config: CodexConfig,
+        run_id: str,
+        event_offset: int,
+        event_prefix: str | None = None,
+    ) -> tuple[CodexRunResult, int]:
+        def add_event(seq: int, event_type: str, raw: dict[str, Any], offset: int = event_offset) -> None:
+            stored_event_type = f"{event_prefix}.{event_type}" if event_prefix else event_type
+            self.store.add_codex_event(run_id, offset + seq, stored_event_type, raw)
+
+        def add_log(level: str, message: str) -> None:
+            self.store.add_log(run_id, level, self.redact(message) or "")
+
+        result = await self.codex_runner.run(
+            prompt,
+            workspace_path,
+            config,
+            timeout_seconds=self.config.agent.timeout_seconds,
+            event_callback=add_event,
+            log_callback=add_log,
+        )
+        return result, event_offset + max(len(result.events), 1)
 
     async def _run_after_run_best_effort(self, issue: Issue, workspace: WorkspaceInfo) -> HookResult | None:
         try:
@@ -417,7 +519,7 @@ class PollingOrchestrator:
         jira: JiraLike,
         store: Store,
         *,
-            workspace_manager: WorkspaceManager | None = None,
+        workspace_manager: WorkspaceManager | None = None,
         codex_runner: CodexRunner | None = None,
         secret_values: list[str | None] | None = None,
         search_limit: int = 50,
@@ -733,20 +835,7 @@ def sort_issues_for_dispatch(issues: list[Issue]) -> list[Issue]:
 
 
 def priority_rank(priority: str | None) -> int:
-    ranks = {
-        "highest": 0,
-        "blocker": 0,
-        "critical": 0,
-        "high": 1,
-        "major": 1,
-        "medium": 2,
-        "normal": 2,
-        "low": 3,
-        "minor": 3,
-        "lowest": 4,
-        "trivial": 4,
-    }
-    return ranks.get((priority or "").lower(), 5)
+    return PRIORITY_RANKS.get((priority or "").lower(), 5)
 
 
 def updated_timestamp(issue: Issue) -> float:
@@ -768,18 +857,7 @@ def is_retryable_error(error: str | None) -> bool:
     if not error:
         return True
     lowered = error.lower()
-    non_retryable = [
-        "prompt rendering failed",
-        "missing required labels",
-        "status is not active",
-        "workflow",
-        "codex command not found",
-        "workspace.source_repo",
-        "source_repo",
-        "jira token",
-        "jira email",
-    ]
-    return not any(marker in lowered for marker in non_retryable)
+    return not any(marker in lowered for marker in NON_RETRYABLE_ERROR_MARKERS)
 
 
 def build_review_prompt(
@@ -800,6 +878,7 @@ Review instructions:
 
 Decision contract:
 - Prefer JSON: {{"decision":"approve","findings":[],"residual_risk":"low"}}.
+- If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
 - Use decision `approve` if no further code changes are needed.
 - Use decision `changes_required` if another implementation pass is needed.
 - If you cannot emit JSON, start with `APPROVE` or `CHANGES_REQUIRED`, then explain concisely.
@@ -825,6 +904,14 @@ Update the workspace to address the review feedback. Keep changes scoped to Jira
 After making changes, leave a concise final report with files changed, verification, and residual risk."""
 
 
+def add_human_request_contract(prompt: str) -> str:
+    return f"""{prompt}
+
+Human clarification contract:
+If human clarification is required before continuing, return JSON exactly in this shape:
+{{"decision":"needs_human","question":"<specific question>"}}"""
+
+
 def build_planning_prompt(*, issue: Issue, implementation_prompt: str, planning_instructions: str) -> str:
     return f"""You are preparing an implementation plan/spec for Jira issue {issue.identifier}.
 
@@ -835,7 +922,17 @@ Important constraints:
 - This is a planning pass only.
 - Inspect the repository as needed.
 - Do not edit files.
-- If the requirements are unclear enough that implementation would be risky, clearly state the clarification needed.
+- If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
+- Do not make product, UX, data-ordering, default-behavior, or repo-ownership decisions that are not explicitly stated by Jira or clearly established by existing code.
+- If multiple reasonable choices exist, ask for clarification instead of choosing silently.
+- Treat these as common ambiguity triggers: column ordering, default sorting, default visibility, label text, button placement, report/table grouping, translation requirements, migration/backward compatibility, API behavior, and which repo owns the change.
+- If no clarification is needed, write the implementation plan/spec.
+
+Structured plan contract:
+- Prefer JSON when possible.
+- If clarification is needed: {{"decision":"needs_human","question":"<specific question>"}}.
+- If ready for approval: {{"decision":"ready_for_approval","summary":"...","assumptions":[{{"assumption":"...","evidence":"...","risk":"low|medium|high","needs_human":false}}],"questions":[]}}.
+- If any assumption has needs_human=true or questions is non-empty, Symphony will stop and ask a human.
 
 Implementation prompt that will be used after planning:
 {implementation_prompt}
@@ -849,7 +946,8 @@ def build_implementation_prompt_with_plan(*, implementation_prompt: str, plan_me
 Codex planning/spec pass:
 {plan_message or "No plan was produced."}
 
-Use the plan/spec above as implementation guidance. If the plan identifies open questions that make implementation unsafe, stop and ask for clarification. Otherwise implement the scoped change, run verification, and leave the final report."""
+Use the plan/spec above as implementation guidance. If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
+Otherwise implement the scoped change, run verification, and leave the final report."""
 
 
 def build_approved_plan_implementation_prompt(
@@ -871,7 +969,42 @@ Approved plan/spec from the previous planning pass:
 Human confirmation or adjustments:
 {response}
 
-Implement according to the approved plan and human confirmation. If the confirmation asks for plan adjustments, apply those adjustments. Keep changes scoped, run verification, and leave a concise final report with files changed, verification, and residual risk."""
+Implement according to the approved plan and human confirmation. If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
+If the confirmation asks for plan adjustments, apply those adjustments. Keep changes scoped, run verification, and leave a concise final report with files changed, verification, and residual risk."""
+
+
+def build_plan_refinement_prompt(
+    *,
+    issue: Issue,
+    original_prompt: str,
+    previous_run: RunRecord,
+    human_input: dict[str, Any],
+    previous_plan_message: str | None,
+) -> str:
+    question = human_input.get("question") or previous_run.error or "Human feedback was provided for the plan."
+    response = human_input.get("response") or ""
+    return f"""You are revising the implementation plan/spec for Jira issue {issue.identifier}.
+
+Original Jira implementation prompt:
+{original_prompt}
+
+Previous blocked phase:
+{previous_run.blocked_phase or "unknown"}
+
+Previous question or approval request:
+{question}
+
+Previous plan/spec:
+{previous_plan_message or previous_run.final_message or "No previous plan/spec was found."}
+
+Human feedback to incorporate:
+{response}
+
+This is still a planning pass only.
+Do not edit implementation files.
+Use the human feedback to produce a revised complete plan/spec.
+If additional human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
+If ready for approval, return the revised plan/spec. Symphony will write it to the plan file and wait for human approval again before implementation."""
 
 
 def read_plan_message_for_run(run: RunRecord, output_plan_file: str) -> str | None:
@@ -896,6 +1029,7 @@ def build_human_resume_prompt(
     previous_phase = previous_run.blocked_phase if previous_run else None
     question = human_input.get("question") or previous_error or "Codex requested human clarification."
     response = human_input.get("response") or ""
+    phase_instructions = human_resume_phase_instructions(previous_phase)
     return f"""{original_prompt}
 
 This is a resumed run for Jira issue {issue.identifier}. A previous Codex attempt was blocked and a human has provided clarification.
@@ -915,7 +1049,24 @@ Previous final message:
 Human clarification:
 {response}
 
-Continue from the existing workspace. Preserve useful existing changes, revise anything that conflicts with the clarification, run the configured verification, and leave a concise final report with files changed, verification, and residual risk."""
+{phase_instructions}"""
+
+
+def human_resume_phase_instructions(previous_phase: str | None) -> str:
+    if previous_phase == "implementation":
+        return """Continue implementation from the existing workspace.
+Apply the human clarification as implementation guidance.
+Preserve useful existing changes, revise anything that conflicts with the clarification, and run the configured verification.
+Leave an updated final report with files changed, verification, and residual risk.
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
+    if previous_phase == "review":
+        return """Continue the review from the existing workspace.
+Use the human clarification to complete the review decision.
+If changes are required, return the normal review decision so Symphony can run another implementation pass.
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
+    return """Continue from the existing workspace.
+Preserve useful existing changes, revise anything that conflicts with the clarification, run the configured verification, and leave a concise final report with files changed, verification, and residual risk.
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
 
 
 def classify_review_decision(review_message: str | None) -> str:
@@ -935,16 +1086,60 @@ def classify_review_decision(review_message: str | None) -> str:
     if first_line.startswith("approve") or first_line.startswith("approved"):
         return "approve"
 
-    change_markers = [
-        "changes_required",
-        "changes required",
-        "needs another pass",
-        "must fix",
-        "should fix before",
-    ]
-    if any(marker in normalized for marker in change_markers):
+    if any(marker in normalized for marker in REVIEW_CHANGE_MARKERS):
         return "changes_required"
     return "approve"
+
+
+def parse_human_request(message: str | None) -> str | None:
+    if not message:
+        return None
+    structured = parse_review_json(message)
+    if not structured:
+        return None
+    decision = str(structured.get("decision") or structured.get("status") or "").strip().lower()
+    if decision in {"needs_human", "needs human", "human_required", "requires_human"}:
+        question = structured.get("question") or structured.get("message") or structured.get("reason")
+        question_text = str(question or "").strip()
+        return question_text or "Codex requested human clarification."
+
+    questions = structured.get("questions")
+    if isinstance(questions, list):
+        question_texts = [str(question).strip() for question in questions if str(question).strip()]
+        if question_texts:
+            return question_texts[0]
+
+    assumptions = structured.get("assumptions") or structured.get("risky_assumptions")
+    if isinstance(assumptions, list):
+        for assumption in assumptions:
+            if not isinstance(assumption, dict):
+                continue
+            if not truthy_value(assumption.get("needs_human") or assumption.get("requires_human")):
+                continue
+            question = (
+                assumption.get("question")
+                or assumption.get("decision")
+                or assumption.get("assumption")
+                or assumption.get("description")
+            )
+            question_text = str(question or "").strip()
+            return question_text or "Codex identified an assumption that needs human confirmation."
+    return None
+
+
+def is_plan_approval_response(response: str) -> bool:
+    normalized = response.strip().lower()
+    return normalized in PLAN_APPROVAL_RESPONSES
+
+
+def truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY_STRINGS
+    return bool(value)
 
 
 def parse_review_json(review_message: str) -> dict[str, Any] | None:

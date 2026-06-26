@@ -57,6 +57,36 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("Codex could not run verification", html)
             self.assertIn("done", html)
 
+    def test_dashboard_expands_long_final_message_and_plan_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"})
+            store = Store(root / "db.sqlite3")
+            issue = Issue(
+                id="1",
+                identifier="T-1",
+                title="Title",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            long_final = "Plan summary\n" + ("x" * 1200) + "FULL-END"
+            run = store.create_run(issue, root / "workspaces" / "T-1", branch_name="codex/T-1", status="queued")
+            store.update_run(run.id, status="blocked", blocked_phase="planning_approval", final_message=long_final)
+            plan_path = root / "workspaces" / "T-1" / ".symphony" / "codex-plan.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text("Plan content\nCOLUMN ORDER QUESTION", encoding="utf-8")
+
+            state = build_state(workflow, store)
+            html = render_dashboard_html(state)
+
+            self.assertEqual(state["all_runs"][0]["plan_content"], "Plan content\nCOLUMN ORDER QUESTION")
+            self.assertIn("<details", html)
+            self.assertIn("Show full final message", html)
+            self.assertIn("FULL-END", html)
+            self.assertIn("Show plan", html)
+            self.assertIn("COLUMN ORDER QUESTION", html)
+
     def test_blocked_run_dashboard_shows_human_input_form(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -90,7 +120,9 @@ class DashboardTests(unittest.TestCase):
             self.assertIn(f"/api/v1/runs/{blocked.id}/human-input", html)
 
             store.add_human_input("T-1", run_id=blocked.id, response="Change foyr2 only.")
-            html = render_dashboard_html(build_state(workflow, store))
+            state = build_state(workflow, store)
+            html = render_dashboard_html(state)
+            self.assertEqual(state["blocked_issues"], [])
             self.assertIn("queued for resume", html)
             self.assertIn("Change foyr2 only.", html)
 
@@ -116,6 +148,29 @@ class DashboardTests(unittest.TestCase):
             table_body = html.split("<tbody>", 1)[1]
 
             self.assertLess(table_body.index("T-2"), table_body.index("T-1"))
+
+    def test_blocked_summary_ignores_old_blocked_runs_after_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"})
+            store = Store(root / "db.sqlite3")
+            issue = Issue(id="1", identifier="T-1", title="Title", status="To Do", labels=["codex-ready"], url="u")
+            store.update_run(
+                store.create_run(issue, root / "workspaces" / "T-1", branch_name=None).id,
+                status="blocked",
+                blocked_phase="planning_approval",
+            )
+            time.sleep(0.01)
+            store.update_run(
+                store.create_run(issue, root / "workspaces" / "T-1", branch_name=None).id,
+                status="completed",
+            )
+
+            state = build_state(workflow, store)
+            html = render_dashboard_html(state)
+
+            self.assertEqual(state["blocked_issues"], [])
+            self.assertIn("<strong>Blocked</strong><br>none", html)
 
 
 def write_workflow(root: Path) -> Path:
