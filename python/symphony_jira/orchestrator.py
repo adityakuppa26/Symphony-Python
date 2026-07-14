@@ -868,7 +868,7 @@ def build_review_prompt(
     implementation_message: str | None,
     review_instructions: str,
 ) -> str:
-    return f"""You are reviewing a completed Codex implementation for Jira issue {issue.identifier}.
+    return f"""You are reviewing a completed implementation for Jira issue {issue.identifier}.
 
 Issue title: {issue.title}
 Workspace: {workspace_path}
@@ -927,6 +927,8 @@ Important constraints:
 - If multiple reasonable choices exist, ask for clarification instead of choosing silently.
 - Treat these as common ambiguity triggers: column ordering, default sorting, default visibility, label text, button placement, report/table grouping, translation requirements, migration/backward compatibility, API behavior, and which repo owns the change.
 - If no clarification is needed, write the implementation plan/spec.
+- Reason and cover all the edge cases (including the ones JIRA requirements might be missing) and ask the human whenever there is a confusion.
+- The implementation should make minimal changes and not rewrite existing logic unless explicity asked in the requirements.
 
 Structured plan contract:
 - Prefer JSON when possible.
@@ -937,7 +939,7 @@ Structured plan contract:
 Implementation prompt that will be used after planning:
 {implementation_prompt}
 
-Write the plan/spec now."""
+Write the plan/spec now. Let's think step-by-step..."""
 
 
 def build_implementation_prompt_with_plan(*, implementation_prompt: str, plan_message: str | None) -> str:
