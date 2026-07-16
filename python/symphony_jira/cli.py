@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+from .attachment_analysis import build_attachment_analyzer
 from .config import resolve_configured_secret, validate_preflight
 from .dashboard import create_app
 from .jira import JiraClient
@@ -75,7 +76,10 @@ async def command_once(args: argparse.Namespace) -> int:
         workflow.path,
         workflow.config,
         check_jira_credentials=True,
-        check_codex=not args.dry_run,
+        check_codex=(
+            not args.dry_run
+            or workflow.config.tracker.requirements.attachment_analyzer == "codex"
+        ),
     )
     if preflight:
         for issue in preflight:
@@ -83,7 +87,12 @@ async def command_once(args: argparse.Namespace) -> int:
         return 1
 
     store = Store(workflow.path.parent / ".symphony" / "symphony.sqlite3")
-    async with JiraClient(workflow.config.tracker, environ=os.environ) as jira:
+    attachment_analyzer = build_attachment_analyzer(workflow)
+    async with JiraClient(
+        workflow.config.tracker,
+        environ=os.environ,
+        attachment_analyzer=attachment_analyzer,
+    ) as jira:
         if not args.issue:
             if not args.dry_run:
                 print("once requires --issue unless --dry-run is set.", file=sys.stderr)
@@ -160,7 +169,12 @@ async def command_run(args: argparse.Namespace) -> int:
         return 1
 
     store = Store(workflow.path.parent / ".symphony" / "symphony.sqlite3")
-    async with JiraClient(workflow.config.tracker, environ=os.environ) as jira:
+    attachment_analyzer = build_attachment_analyzer(workflow)
+    async with JiraClient(
+        workflow.config.tracker,
+        environ=os.environ,
+        attachment_analyzer=attachment_analyzer,
+    ) as jira:
         orchestrator = PollingOrchestrator(workflow, jira, store, secret_values=secret_values_for(workflow))
         if args.poll_once:
             await orchestrator.poll_once()

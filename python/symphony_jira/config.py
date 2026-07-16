@@ -4,9 +4,16 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 class ConfigError(Exception):
@@ -24,6 +31,183 @@ class JiraAuthConfig(BaseModel):
     email_config_key: str | None = None
 
 
+class JiraRequirementsConfig(BaseModel):
+    """Controls the material Jira sources included in a requirements snapshot."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    custom_fields: list[str] = Field(default_factory=list)
+    acceptance_criteria_fields: list[str] = Field(default_factory=list)
+    field_authority: dict[str, str] = Field(default_factory=dict)
+    description_authority: str = "product"
+    comment_authority: str = "product"
+    comment_authority_by_author: dict[str, str] = Field(default_factory=dict)
+    authority_rank: dict[str, int] = Field(
+        default_factory=lambda: {
+            "context": 10,
+            "supporting_evidence": 10,
+            "engineering_context": 20,
+            "product": 30,
+            "product_owner": 40,
+        }
+    )
+    attachment_authority: str = "supporting_evidence"
+    relation_authority: str = "context"
+    comment_page_size: int = 100
+    related_issue_hydration_max_concurrency: int = 8
+    download_attachments: bool = True
+    max_attachment_bytes: int = 10 * 1024 * 1024
+    attachment_download_max_concurrency: int = 4
+    require_attachment_analysis: bool = True
+    attachment_analyzer: Literal["basic", "codex"] = "basic"
+    attachment_analysis_timeout_seconds: int = 120
+    attachment_pdf_max_pages: int = 4
+    attachment_analysis_max_concurrency: int = 1
+    attachment_analysis_max_output_characters: int = 12_000
+    hydrate_search_results: bool = True
+    discover_epic_children: bool = True
+    child_issue_jql: str | None = None
+    child_issue_max_pages: int = 100
+    symphony_comment_patterns: list[str] = Field(
+        default_factory=lambda: [
+            r"^Codex run started for [A-Z][A-Z0-9_]*-\d+\.",
+            r"^Codex run completed for [A-Z][A-Z0-9_]*-\d+\.",
+            r"^Codex run failed for [A-Z][A-Z0-9_]*-\d+\.",
+            r"^Codex run is blocked for [A-Z][A-Z0-9_]*-\d+\.",
+            r"^Codex plan/spec is ready for [A-Z][A-Z0-9_]*-\d+\.",
+        ]
+    )
+
+    @field_validator(
+        "comment_page_size",
+        "related_issue_hydration_max_concurrency",
+        "max_attachment_bytes",
+        "attachment_download_max_concurrency",
+        "attachment_analysis_timeout_seconds",
+        "attachment_pdf_max_pages",
+        "attachment_analysis_max_concurrency",
+        "attachment_analysis_max_output_characters",
+        "child_issue_max_pages",
+    )
+    @classmethod
+    def positive_requirements_limit(cls, value: int, info) -> int:
+        if value <= 0:
+            raise ValueError(f"tracker.requirements.{info.field_name} must be positive")
+        upper_bounds = {
+            "related_issue_hydration_max_concurrency": 32,
+            "attachment_download_max_concurrency": 32,
+            "attachment_analysis_timeout_seconds": 900,
+            "attachment_pdf_max_pages": 20,
+            "attachment_analysis_max_concurrency": 4,
+            "attachment_analysis_max_output_characters": 50_000,
+            "child_issue_max_pages": 1_000,
+        }
+        maximum = upper_bounds.get(info.field_name)
+        if maximum is not None and value > maximum:
+            raise ValueError(
+                f"tracker.requirements.{info.field_name} must be at most {maximum}"
+            )
+        return value
+
+    @field_validator("custom_fields", "acceptance_criteria_fields")
+    @classmethod
+    def unique_non_blank_fields(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @field_validator("authority_rank", mode="before")
+    @classmethod
+    def valid_authority_rank(cls, value: Any) -> dict[str, int]:
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                "tracker.requirements.authority_rank must be a mapping"
+            )
+        normalized: dict[str, int] = {
+            "context": 10,
+            "supporting_evidence": 10,
+            "engineering_context": 20,
+            "product": 30,
+            "product_owner": 40,
+        }
+        provided: dict[str, int] = {}
+        for authority, rank in value.items():
+            if not isinstance(authority, str):
+                raise ValueError(
+                    "tracker.requirements.authority_rank keys must be strings"
+                )
+            if isinstance(rank, bool) or not isinstance(rank, int):
+                raise ValueError(
+                    "tracker.requirements.authority_rank values must be integers"
+                )
+            key = authority.strip().casefold()
+            if not key:
+                raise ValueError("tracker.requirements.authority_rank keys must not be blank")
+            if rank < 0:
+                raise ValueError(
+                    "tracker.requirements.authority_rank values must be non-negative"
+                )
+            normalized[key] = rank
+            if key in provided and provided[key] != rank:
+                raise ValueError(
+                    "tracker.requirements.authority_rank contains conflicting "
+                    f"normalized key {key!r}"
+                )
+            provided[key] = rank
+        return normalized
+
+    @model_validator(mode="after")
+    def configured_authorities_are_ranked(self) -> "JiraRequirementsConfig":
+        ranked = self.authority_rank
+        if not self.hydrate_search_results:
+            raise ValueError(
+                "tracker.requirements.hydrate_search_results must be true so "
+                "completed-work identity always uses a full Jira snapshot"
+            )
+
+        def normalize(value: str, location: str) -> str:
+            authority = value.strip().casefold()
+            if not authority:
+                raise ValueError(
+                    f"tracker.requirements.{location} must not be blank"
+                )
+            if authority not in ranked:
+                raise ValueError(
+                    f"tracker.requirements.{location} authority {value!r} is not "
+                    "present in tracker.requirements.authority_rank"
+                )
+            return authority
+
+        self.description_authority = normalize(
+            self.description_authority, "description_authority"
+        )
+        self.comment_authority = normalize(
+            self.comment_authority, "comment_authority"
+        )
+        self.attachment_authority = normalize(
+            self.attachment_authority, "attachment_authority"
+        )
+        self.relation_authority = normalize(
+            self.relation_authority, "relation_authority"
+        )
+        self.field_authority = {
+            field_id: normalize(authority, f"field_authority.{field_id}")
+            for field_id, authority in self.field_authority.items()
+        }
+        normalized_by_author: dict[str, str] = {}
+        for identity, authority in self.comment_authority_by_author.items():
+            normalized_identity = identity.strip().casefold()
+            if not normalized_identity:
+                raise ValueError(
+                    "tracker.requirements.comment_authority_by_author keys "
+                    "must not be blank"
+                )
+            normalized_by_author[normalized_identity] = normalize(
+                authority,
+                f"comment_authority_by_author.{identity}",
+            )
+        self.comment_authority_by_author = normalized_by_author
+        return self
+
+
 class TrackerConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -39,6 +223,7 @@ class TrackerConfig(BaseModel):
     handoff_status: str | None = None
     comment_on_start: bool = False
     comment_on_finish: bool = True
+    requirements: JiraRequirementsConfig = Field(default_factory=JiraRequirementsConfig)
 
     @field_validator("base_url")
     @classmethod
@@ -132,6 +317,19 @@ class CodexConfig(BaseModel):
         "Focus on correctness, regressions, tests, and translation consistency."
     )
     max_review_iterations: int = 1
+    human_review_triage_prompt: str = (
+        "Classify pasted human code-review feedback against the exact frozen "
+        "requirements snapshot, validated PlanSpec, approval, prior reviews, and "
+        "current workspace diff. Use code_changes only when the comments can be "
+        "addressed without changing behavior, scope, architecture, acceptance "
+        "criteria, affected surfaces, compatibility, or non-goals. Use "
+        "plan_changes_required when any of those must change. Do not edit files "
+        "during triage."
+    )
+    output_human_review_triage_file: str = (
+        ".symphony/codex-human-review-triage.md"
+    )
+
     output_review_file: str = ".symphony/codex-review.md"
     output_review_history_file: str = ".symphony/codex-review-history.md"
 

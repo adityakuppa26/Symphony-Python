@@ -2,11 +2,24 @@ import html
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
+from .human_review import (
+    HumanReviewContextError,
+    capture_workspace_diff,
+    read_frozen_text_artifact,
+    validate_frozen_snapshot_artifacts,
+)
 from .models import RunRecord
-from .store import Store
+from .orchestrator import (
+    validate_plan_repository_baselines,
+)
+from .plan_spec import PlanSpecError, parse_plan_spec
+from .store import Store, StoreIntegrityError
 from .workflow import WorkflowDefinition
+
+MAX_HUMAN_REVIEW_REQUEST_BYTES = 1024 * 1024
+
 
 
 def create_app(
@@ -37,12 +50,42 @@ def create_app(
         run = store.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="run not found")
+        try:
+            snapshot = (
+                store.get_requirements_snapshot(
+                    run.issue_identifier,
+                    run.issue_fingerprint,
+                )
+                if run.issue_fingerprint
+                else None
+            )
+        except StoreIntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"stored requirements snapshot failed integrity validation: {exc}",
+            ) from exc
+        source_review_actions = store.list_human_review_actions_for_source_run(
+            run.id
+        )
+        result_review_action = store.human_review_action_for_result_run(run.id)
         return {
             "run": enrich_run(run, store, workflow),
             "codex_events": [event.model_dump(mode="json") for event in store.list_codex_events(run_id)],
             "logs": store.list_logs(run_id=run_id),
             "jira_actions": store.list_jira_actions(run_id=run_id),
             "human_inputs": store.list_human_inputs(run_id=run_id),
+            "requirements_snapshot": (
+                snapshot.model_dump(mode="json") if snapshot else None
+            ),
+            "human_review_actions": [
+                public_human_review_action(action)
+                for action in source_review_actions
+            ],
+            "human_review_action": (
+                public_human_review_action(result_review_action)
+                if result_review_action
+                else None
+            ),
         }
 
     @app.post("/api/v1/runs/{run_id}/human-input")
@@ -52,37 +95,216 @@ def create_app(
             raise HTTPException(status_code=404, detail="run not found")
         if run.status != "blocked":
             raise HTTPException(status_code=409, detail="human input can only be added to blocked runs")
+        if not store.is_latest_actionable_blocked_run(run.id):
+            raise HTTPException(
+                status_code=409,
+                detail="this historical run is no longer the latest actionable blocked run",
+            )
+        if store.latest_unconsumed_human_input_for_issue(run.issue_identifier) is not None:
+            raise HTTPException(status_code=409, detail="human input is already pending for this issue")
 
         body = await request.body()
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
-            payload = await request.json()
-            response = str(payload.get("response") or "").strip()
+            try:
+                raw_payload = await request.json()
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="request body must contain valid JSON",
+                ) from exc
+            if not isinstance(raw_payload, dict):
+                raise HTTPException(status_code=400, detail="request body must be an object")
+            payload = raw_payload
         else:
             form = parse_qs(body.decode(errors="replace"))
-            response = str((form.get("response") or [""])[0]).strip()
-        if not response and run.blocked_phase == "planning_approval":
-            response = "Approved."
-        if not response:
-            raise HTTPException(status_code=400, detail="response is required")
+            payload = {key: values[0] if values else "" for key, values in form.items()}
 
-        record = store.add_human_input(
-            run.issue_identifier,
-            run_id=run.id,
-            question=run.error,
-            response=response,
-        )
+        action = str(payload.get("action") or "").strip().lower()
+        response = str(payload.get("response") or "").strip()
+        approver_identity = str(payload.get("approver_identity") or "").strip()
+        approval: dict[str, Any] | None = None
+        if action == "approve":
+            if run.blocked_phase != "planning_approval":
+                raise HTTPException(status_code=409, detail="this run is not waiting for plan approval")
+            if not approver_identity:
+                raise HTTPException(status_code=400, detail="approver identity is required")
+            requirements_snapshot_hash = str(run.issue_fingerprint or "").strip()
+            if not requirements_snapshot_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="run has no requirements snapshot hash; regenerate the plan before approval",
+                )
+            try:
+                plan_spec_hash = current_plan_spec_hash(run, workflow, store)
+            except PlanSpecError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"the plan cannot be approved: {exc}",
+                ) from exc
+            try:
+                record, approval = store.add_approved_human_input(
+                    run.issue_identifier,
+                    run_id=run.id,
+                    question=run.error,
+                    approver_identity=approver_identity,
+                    plan_spec_hash=plan_spec_hash,
+                    requirements_snapshot_hash=requirements_snapshot_hash,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        elif not response:
+            raise HTTPException(status_code=400, detail="response is required")
+        else:
+            try:
+                record = store.add_human_input(
+                    run.issue_identifier,
+                    run_id=run.id,
+                    question=run.error,
+                    response=response,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if approval:
+            record.update(
+                {
+                    key: approval[key]
+                    for key in (
+                        "approver_identity",
+                        "approved_at",
+                        "plan_spec_hash",
+                        "requirements_snapshot_hash",
+                    )
+                }
+            )
         if orchestrator is not None:
             await orchestrator.poll_once()
         if "text/html" in request.headers.get("accept", "") and "application/json" not in content_type:
             return RedirectResponse("/", status_code=303)
         return {"status": "ok", "human_input": record}
 
+    @app.post("/api/v1/runs/{run_id}/human-review")
+    async def address_human_review(run_id: str, request: Request):
+        run = store.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="run not found")
+        if run.status != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail="human review can only be addressed from completed runs",
+            )
+        if not store.is_latest_actionable_completed_run(run.id):
+            raise HTTPException(
+                status_code=409,
+                detail="this completed run is no longer the latest actionable run",
+            )
+
+        body = await request.body()
+        if len(body) > MAX_HUMAN_REVIEW_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="human review request is too large",
+            )
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            try:
+                raw_payload = await request.json()
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="request body must contain valid JSON",
+                ) from exc
+            if not isinstance(raw_payload, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="request body must be an object",
+                )
+            payload = raw_payload
+        else:
+            form = parse_qs(body.decode(errors="replace"))
+            payload = {
+                key: values[0] if values else ""
+                for key, values in form.items()
+            }
+
+        reviewer_value = payload.get("reviewer_identity")
+        source_value = payload.get("source_url") or payload.get("source_link")
+        comments_value = payload.get("comments")
+        for field_name, field_value in (
+            ("reviewer_identity", reviewer_value),
+            ("source_url", source_value),
+            ("comments", comments_value),
+        ):
+            if field_value is not None and not isinstance(field_value, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{field_name} must be a string",
+                )
+        reviewer_identity = (reviewer_value or "").strip()
+        source_url = (source_value or "").strip()
+        comments = (comments_value or "").strip()
+        if not reviewer_identity:
+            raise HTTPException(
+                status_code=400,
+                detail="reviewer identity is required",
+            )
+        if not source_url:
+            raise HTTPException(
+                status_code=400,
+                detail="review source/PR link is required",
+            )
+        parsed_source = urlparse(source_url)
+        if parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc:
+            raise HTTPException(
+                status_code=400,
+                detail="review source/PR link must be an absolute HTTP(S) URL",
+            )
+        if not comments:
+            raise HTTPException(
+                status_code=400,
+                detail="review comments are required",
+            )
+
+        try:
+            context = prepare_human_review_context(run, workflow, store)
+            action, result_run = store.create_human_review_action(
+                run.id,
+                reviewer_identity=reviewer_identity,
+                source_url=source_url,
+                comments=comments,
+                **context,
+            )
+        except (HumanReviewContextError, PlanSpecError, StoreIntegrityError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"completed review context is not reusable: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if orchestrator is not None:
+            await orchestrator.poll_once()
+            action = store.get_human_review_action(action["id"]) or action
+            result_run = store.get_run(result_run.id) or result_run
+        if (
+            "text/html" in request.headers.get("accept", "")
+            and "application/json" not in content_type
+        ):
+            return RedirectResponse("/", status_code=303)
+        return {
+            "status": action["status"],
+            "human_review": summarize_human_review_action(action),
+            "run": run_to_dict(result_run),
+        }
+
     @app.get("/api/v1/issues/{issue_key}")
     async def issue_detail(issue_key: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "issue_key": issue_key,
             "runs": [run_to_dict(run) for run in store.list_runs_for_issue(issue_key)],
+            "requirements_snapshot_versions": store.list_requirements_snapshot_versions(
+                issue_key
+            ),
         }
         if jira is not None:
             try:
@@ -164,10 +386,234 @@ def run_to_dict(run: RunRecord) -> dict[str, Any]:
     return run.model_dump(mode="json")
 
 
+def public_human_review_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Return review audit data without its internal fencing credential."""
+
+    return {
+        key: value
+        for key, value in action.items()
+        if key != "claim_token"
+    }
+
+
+def summarize_human_review_action(
+    action: dict[str, Any],
+) -> dict[str, Any]:
+    frozen_context_fields = {
+        "approval",
+        "claim_token",
+        "plan_spec",
+        "source_final_message",
+        "source_review",
+        "source_review_history",
+        "workspace_diff",
+    }
+    return {
+        key: value
+        for key, value in public_human_review_action(action).items()
+        if key not in frozen_context_fields
+    }
+
+
+def current_plan_spec_hash(
+    run: RunRecord,
+    workflow: WorkflowDefinition,
+    store: Store,
+) -> str:
+    plan_path = Path(run.workspace_path) / workflow.config.codex.output_plan_file
+    try:
+        plan_content = read_frozen_text_artifact(
+            Path(run.workspace_path),
+            workflow.config.codex.output_plan_file,
+            label="validated PlanSpec artifact",
+            required=True,
+        )
+    except HumanReviewContextError as exc:
+        raise PlanSpecError(str(exc)) from exc
+    if not plan_content:
+        raise PlanSpecError(f"PlanSpec file is missing or empty: {plan_path}")
+    snapshot_hash = str(run.issue_fingerprint or "").strip()
+    if not snapshot_hash:
+        raise PlanSpecError("run has no requirements snapshot hash")
+    try:
+        snapshot = store.get_requirements_snapshot(run.issue_identifier, snapshot_hash)
+    except StoreIntegrityError as exc:
+        raise PlanSpecError(
+            f"stored requirements snapshot failed its integrity check: {exc}"
+        ) from exc
+    if snapshot is None:
+        raise PlanSpecError(
+            "the immutable requirements snapshot for this planning run is missing; "
+            "regenerate the plan before approval"
+        )
+    plan_spec = parse_plan_spec(
+        plan_content,
+        expected_issue_key=run.issue_identifier,
+        expected_snapshot_hash=snapshot_hash,
+        requirements_snapshot=snapshot,
+    )
+    original_plan_content = str(run.final_message or "").strip()
+    if not original_plan_content:
+        raise PlanSpecError(
+            "the validated PlanSpec produced by the planning run is missing; regenerate the plan"
+        )
+    original_plan_spec = parse_plan_spec(
+        original_plan_content,
+        expected_issue_key=run.issue_identifier,
+        expected_snapshot_hash=snapshot_hash,
+        requirements_snapshot=snapshot,
+    )
+    plan_hash = plan_spec.content_hash()
+    if plan_hash != original_plan_spec.content_hash():
+        raise PlanSpecError(
+            "the PlanSpec file differs from the exact validated PlanSpec produced by planning; "
+            "request adjustments and return to planning"
+        )
+    baseline_error = validate_plan_repository_baselines(
+        plan_spec, Path(run.workspace_path), require_clean=True
+    )
+    if baseline_error:
+        raise PlanSpecError(
+            f"PlanSpec repository baseline validation failed: {baseline_error}"
+        )
+    return plan_hash
+
+
+def prepare_human_review_context(
+    run: RunRecord,
+    workflow: WorkflowDefinition,
+    store: Store,
+) -> dict[str, Any]:
+    snapshot_hash = str(run.issue_fingerprint or "").strip()
+    if not snapshot_hash:
+        raise HumanReviewContextError(
+            "completed run has no requirements snapshot hash"
+        )
+    snapshot = store.get_requirements_snapshot(
+        run.issue_identifier,
+        snapshot_hash,
+    )
+    if snapshot is None:
+        raise HumanReviewContextError(
+            "the immutable requirements snapshot for this completed run is missing"
+        )
+
+    workspace_path = Path(run.workspace_path)
+    artifact_error = validate_frozen_snapshot_artifacts(
+        workspace_path,
+        snapshot_hash,
+    )
+    if artifact_error:
+        raise HumanReviewContextError(artifact_error)
+
+    expected_plan_hash = str(run.plan_spec_hash or "").strip()
+    if not expected_plan_hash:
+        raise HumanReviewContextError(
+            "completed run has no trusted PlanSpec hash"
+        )
+    plan_path = workspace_path / workflow.config.codex.output_plan_file
+    plan_content = read_frozen_text_artifact(
+        workspace_path,
+        workflow.config.codex.output_plan_file,
+        label="validated PlanSpec artifact",
+        required=True,
+    )
+    if not plan_content:
+        raise HumanReviewContextError(
+            f"validated PlanSpec file is missing or empty: {plan_path}"
+        )
+    plan_spec = parse_plan_spec(
+        plan_content,
+        expected_issue_key=run.issue_identifier,
+        expected_snapshot_hash=snapshot_hash,
+        requirements_snapshot=snapshot,
+    )
+    if plan_spec.content_hash() != expected_plan_hash:
+        raise HumanReviewContextError(
+            "validated PlanSpec file does not match the completed run's trusted hash"
+        )
+    baseline_error = validate_plan_repository_baselines(
+        plan_spec,
+        workspace_path,
+        require_clean=False,
+    )
+    if baseline_error:
+        raise HumanReviewContextError(
+            f"validated PlanSpec repository baseline is invalid: {baseline_error}"
+        )
+
+    approval: dict[str, Any] | None = None
+    if run.plan_approval_id:
+        approval = store.get_plan_approval(run.plan_approval_id)
+        if approval is None:
+            raise HumanReviewContextError(
+                "completed run's exact plan approval is missing"
+            )
+        if approval.get("invalidated_at"):
+            raise HumanReviewContextError(
+                "completed run's exact plan approval is no longer active"
+            )
+        if approval.get("issue_identifier") != run.issue_identifier:
+            raise HumanReviewContextError(
+                "completed run's plan approval belongs to another Jira issue"
+            )
+        if approval.get("plan_spec_hash") != expected_plan_hash:
+            raise HumanReviewContextError(
+                "completed run's plan approval does not match its PlanSpec"
+            )
+        if approval.get("requirements_snapshot_hash") != snapshot_hash:
+            raise HumanReviewContextError(
+                "completed run's plan approval does not match its requirements snapshot"
+            )
+    elif workflow.config.codex.require_plan_approval:
+        raise HumanReviewContextError(
+            "completed run has no persisted plan approval"
+        )
+
+    review_path = workspace_path / workflow.config.codex.output_review_file
+    review_history_path = (
+        workspace_path / workflow.config.codex.output_review_history_file
+    )
+    source_review = read_frozen_text_artifact(
+        workspace_path,
+        workflow.config.codex.output_review_file,
+        label="completed run review artifact",
+        required=workflow.config.codex.review_after_run,
+    )
+    source_review_history = read_frozen_text_artifact(
+        workspace_path,
+        workflow.config.codex.output_review_history_file,
+        label="completed run review-history artifact",
+    )
+    if workflow.config.codex.review_after_run and not source_review:
+        raise HumanReviewContextError(
+            f"completed run's review artifact is missing or empty: {review_path}"
+        )
+
+    workspace_diff = capture_workspace_diff(workspace_path, plan_spec)
+    return {
+        "plan_spec": plan_content,
+        "approval": approval,
+        "source_review": source_review,
+        "source_review_history": source_review_history,
+        "workspace_diff": workspace_diff.content,
+        "workspace_diff_hash": workspace_diff.content_hash,
+    }
+
+
 def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> dict[str, Any]:
     data = run_to_dict(run)
     events = store.list_codex_events(run.id)
     human_inputs = store.list_human_inputs(run_id=run.id)
+    plan_approvals = store.list_plan_approvals(run_id=run.id)
+    active_plan_approval = store.latest_plan_approval_for_run(run.id, active_only=True)
+    resolved_plan_approval = (
+        store.get_plan_approval(run.plan_approval_id)
+        if run.plan_approval_id
+        else None
+    )
+    source_review_actions = store.list_human_review_actions_for_source_run(run.id)
+    result_review_action = store.human_review_action_for_result_run(run.id)
     plan_path = Path(run.workspace_path) / workflow.config.codex.output_plan_file
     review_path = Path(run.workspace_path) / workflow.config.codex.output_review_file
     review_history_path = Path(run.workspace_path) / workflow.config.codex.output_review_history_file
@@ -183,9 +629,26 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
             "review_content": read_text_if_exists(review_path),
             "review_history_path": str(review_history_path),
             "review_history_exists": review_history_path.exists(),
+            "review_history_content": read_text_if_exists(review_history_path),
             "human_inputs": human_inputs,
+            "plan_approvals": plan_approvals,
+            "active_plan_approval": active_plan_approval,
+            "resolved_plan_approval": resolved_plan_approval,
+            "requirements_snapshot_hash": run.issue_fingerprint,
             "human_input_pending": run.status == "blocked" and not human_inputs,
             "human_input_submitted": any(item.get("consumed_at") is None for item in human_inputs),
+            "human_review_actions": [
+                summarize_human_review_action(action)
+                for action in source_review_actions
+            ],
+            "human_review_action": (
+                summarize_human_review_action(result_review_action)
+                if result_review_action
+                else None
+            ),
+            "human_review_actionable": store.is_latest_actionable_completed_run(
+                run.id
+            ),
         }
     )
     return data
@@ -374,21 +837,110 @@ def display_error(run: dict[str, Any]) -> str:
 
 def render_human_input_cell(run: dict[str, Any]) -> str:
     inputs = run.get("human_inputs") or []
+    review_actions = run.get("human_review_actions") or []
+    review_lineage = render_human_review_lineage(
+        run.get("human_review_action")
+    )
+    if run.get("status") == "completed":
+        if review_actions:
+            latest_review = review_actions[0]
+            return review_lineage + (
+                f"<strong>{escape(latest_review.get('status'))}</strong>"
+                f"<div>Reviewer: {escape(latest_review.get('reviewer_identity'))}</div>"
+                f"<div><a href=\"{escape(latest_review.get('source_url'))}\">"
+                "Review source / PR</a></div>"
+                f"<pre>{escape((latest_review.get('comments') or '')[:500])}</pre>"
+                f"<div class=\"muted\">Result run: "
+                f"<code>{escape(latest_review.get('result_run_id'))}</code></div>"
+            )
+        if not run.get("human_review_actionable"):
+            return review_lineage or "none"
+        action_url = (
+            f"/api/v1/runs/{escape(run.get('id'))}/human-review"
+        )
+        return review_lineage + (
+            "<details><summary>Address Human Review</summary>"
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input name=\"reviewer_identity\" required "
+            "placeholder=\"Reviewer identity\"><br>"
+            "<input name=\"source_url\" type=\"url\" required "
+            "placeholder=\"PR or review URL\"><br>"
+            "<textarea name=\"comments\" required rows=\"6\" cols=\"42\" "
+            "placeholder=\"Paste human review comments\"></textarea><br>"
+            "<button type=\"submit\">Address Human Review</button>"
+            "</form></details>"
+        )
     if run.get("status") != "blocked":
-        return "none"
+        return review_lineage or "none"
     if inputs:
         latest = inputs[0]
         state = "queued for resume" if latest.get("consumed_at") is None else "consumed"
-        return f"<strong>{escape(state)}</strong><pre>{escape((latest.get('response') or '')[:500])}</pre>"
+        approval_details = ""
+        if latest.get("approval_id"):
+            approval_details = (
+                f"<div>Approved by {escape(latest.get('approver_identity'))} "
+                f"at {escape(latest.get('approved_at'))}</div>"
+                f"<div class=\"muted\">PlanSpec: <code>{escape(latest.get('plan_spec_hash'))}</code><br>"
+                "Requirements snapshot: "
+                f"<code>{escape(latest.get('requirements_snapshot_hash'))}</code></div>"
+            )
+        return (
+            review_lineage
+            + f"<strong>{escape(state)}</strong>{approval_details}"
+            f"<pre>{escape((latest.get('response') or '')[:500])}</pre>"
+        )
+    action_url = f"/api/v1/runs/{escape(run.get('id'))}/human-input"
     if run.get("blocked_phase") == "planning_approval":
-        placeholder = "Confirm the plan or enter requested adjustments"
-        button = "Confirm Plan"
-    else:
-        placeholder = "Add clarification for Codex"
-        button = "Resume"
-    return (
-        f"<form method=\"post\" action=\"/api/v1/runs/{escape(run.get('id'))}/human-input\">"
-        f"<textarea name=\"response\" rows=\"4\" cols=\"36\" placeholder=\"{escape(placeholder)}\"></textarea><br>"
-        f"<button type=\"submit\">{escape(button)}</button>"
+        snapshot_hash = escape(run.get("requirements_snapshot_hash"))
+        return review_lineage + (
+            "<div><strong>Approve the exact validated PlanSpec</strong>"
+            f"<div class=\"muted\">Requirements snapshot: <code>{snapshot_hash}</code></div>"
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input type=\"hidden\" name=\"action\" value=\"approve\">"
+            "<input name=\"approver_identity\" required placeholder=\"Approver identity\">"
+            "<button type=\"submit\">Approve Exact Plan</button>"
+            "</form>"
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input type=\"hidden\" name=\"action\" value=\"feedback\">"
+            "<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
+            "placeholder=\"Describe requested adjustments\"></textarea><br>"
+            "<button type=\"submit\">Request Adjustments</button>"
+            "</form></div>"
+        )
+    return review_lineage + (
+        f"<form method=\"post\" action=\"{action_url}\">"
+        "<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
+        "placeholder=\"Add clarification for Codex\"></textarea><br>"
+        "<button type=\"submit\">Resume</button>"
         "</form>"
+    )
+
+
+def render_human_review_lineage(action: dict[str, Any] | None) -> str:
+    if not action:
+        return ""
+    source_url = str(action.get("source_url") or "")
+    parsed_source = urlparse(source_url)
+    if parsed_source.scheme in {"http", "https"} and parsed_source.netloc:
+        source = (
+            f'<a href="{escape(source_url)}">Review source / PR</a>'
+        )
+    else:
+        source = "Review source unavailable"
+    decision = str(action.get("triage_decision") or "")
+    planning_notice = ""
+    if decision == "plan_changes_required":
+        planning_notice = (
+            '<div class="muted">Requires a new PlanSpec and approval. Reopen the '
+            "issue to an active status for replanning; update authoritative Jira "
+            "evidence first if product requirements changed."
+            "</div>"
+        )
+    return (
+        '<div class="review-lineage"><strong>Human-review continuation</strong>'
+        f"<div>Reviewer: {escape(action.get('reviewer_identity'))}</div>"
+        f"<div>{source}</div>"
+        f"<div class=\"muted\">Action: <code>{escape(action.get('id'))}</code><br>"
+        f"Source run: <code>{escape(action.get('source_run_id'))}</code></div>"
+        f"{planning_notice}</div>"
     )

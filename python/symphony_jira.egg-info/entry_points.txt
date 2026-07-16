@@ -1,0 +1,2 @@
+[console_scripts]
+symphony-jira = symphony_jira.cli:main
