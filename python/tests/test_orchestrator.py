@@ -34,10 +34,13 @@ from symphony_jira.orchestrator import (
     PollingOrchestrator,
     SingleIssueOrchestrator,
     apply_default_epic_strategy,
+    build_automation_implementation_prompt,
+    build_automation_planning_prompt,
     capture_automation_mutation_guard,
     classify_review_decision,
     finish_comment,
     parse_human_request,
+    parse_automation_replan_request,
     planning_requirements_snapshot_prompt,
     retry_backoff_seconds,
     restore_automation_mutation_guard,
@@ -160,7 +163,198 @@ class TerminalReconciliationJira(FakeJira):
         return await super().get_issue(key, include_comments=include_comments)
 
 
+def gated_automation_workflow(root: Path, *, review_iterations: int = 3):
+    workflow = load_workflow(
+        write_workflow(
+            root,
+            write_fake_codex(root),
+            codex_extra=f"""
+  plan_before_implementation: true
+  require_plan_approval: true
+  review_after_run: true
+  max_review_iterations: {review_iterations}
+""",
+        ),
+        environ={"TEST_JIRA_TOKEN": "token"},
+    )
+    workflow.config.automation.enabled = True
+    workflow.config.automation.require_plan_approval = True
+    workflow.config.automation.review_after_run = True
+    workflow.config.automation.max_review_iterations = review_iterations
+    return workflow
+
+
+def gated_automation_issue() -> Issue:
+    return Issue(
+        id="10001",
+        identifier="T-1",
+        title="Implement and automate the focused behavior",
+        description="Implement the focused behavior and add regression coverage",
+        status="To Do",
+        labels=["codex-ready"],
+        url="https://jira.example.test/browse/T-1",
+    )
+
+
+def approve_development_run(store: Store, run):
+    assert run.plan_spec_hash is not None
+    assert run.issue_fingerprint is not None
+    return store.add_approved_human_input(
+        run.issue_identifier,
+        run_id=run.id,
+        approver_identity="dev-approver@example.test",
+        plan_spec_hash=run.plan_spec_hash,
+        requirements_snapshot_hash=run.issue_fingerprint,
+        question=run.error,
+    )
+
+
+def approve_automation_run(store: Store, run):
+    assert run.automation_plan_hash is not None
+    assert run.issue_fingerprint is not None
+    assert run.plan_spec_hash is not None
+    assert run.automation_development_diff_hash is not None
+    assert run.automation_repository_diff_hash is not None
+    return store.add_approved_automation_human_input(
+        run.issue_identifier,
+        run_id=run.id,
+        approver_identity="automation-approver@example.test",
+        automation_plan_hash=run.automation_plan_hash,
+        requirements_snapshot_hash=run.issue_fingerprint,
+        development_plan_spec_hash=run.plan_spec_hash,
+        development_plan_approval_id=run.plan_approval_id,
+        development_workspace_diff_hash=(
+            run.automation_development_diff_hash
+        ),
+        automation_repository_diff_hash=(
+            run.automation_repository_diff_hash
+        ),
+        question=run.error,
+    )
+
+
+async def dispatch_pending_human_resume(polling: PollingOrchestrator) -> None:
+    await polling.poll_once()
+    pending = [item.task for item in polling.running.values()]
+    if pending:
+        await asyncio.gather(*pending)
+    await polling.reap_finished()
+
+
+async def run_to_automation_approval(
+    root: Path,
+    runner,
+    *,
+    review_iterations: int = 3,
+):
+    workflow = gated_automation_workflow(
+        root,
+        review_iterations=review_iterations,
+    )
+    issue = gated_automation_issue()
+    jira = FakeJira(issue)
+    store = Store(root / "db.sqlite3")
+    planned = await SingleIssueOrchestrator(
+        workflow,
+        jira,
+        store,
+        codex_runner=runner,
+    ).run_once("T-1")
+    assert planned.run is not None
+    approve_development_run(store, planned.run)
+    polling = PollingOrchestrator(
+        workflow,
+        jira,
+        store,
+        codex_runner=runner,
+    )
+    await dispatch_pending_human_resume(polling)
+    automation_planned = store.latest_run_for_issue("T-1")
+    assert automation_planned is not None
+    return (
+        workflow,
+        jira,
+        store,
+        polling,
+        planned.run,
+        automation_planned,
+    )
+
+
 class OrchestratorTests(unittest.TestCase):
+    def test_automation_prompts_treat_missing_environment_as_non_blocking(self) -> None:
+        issue = hydrated_test_issue(
+            Issue(
+                id="10001",
+                identifier="T-1",
+                title="Source-only automation",
+                description="Add deterministic automation coverage",
+                status="To Do",
+                url="https://jira.example.test/browse/T-1",
+            )
+        )
+        planning_prompt = build_automation_planning_prompt(
+            issue=issue,
+            planning_instructions="Plan focused coverage.",
+            requirements_snapshot_hash="a" * 64,
+            development_plan_message="{}",
+            development_plan_spec_hash="b" * 64,
+            development_diff="diff --git a/a b/a",
+            development_diff_hash="c" * 64,
+            development_final_message="Development completed.",
+            automation_repository="automation",
+            automation_repository_baseline_sha="d" * 40,
+        )
+        implementation_prompt = build_automation_implementation_prompt(
+            issue=issue,
+            implementation_instructions="Apply the focused plan.",
+            development_plan_spec_hash="b" * 64,
+            development_diff_hash="c" * 64,
+            automation_plan_message="{}",
+            automation_plan_hash="e" * 64,
+            automation_repository="automation",
+        )
+
+        self.assertIn(
+            "Missing runtime access, credentials, a focused suite selector, or live fixture",
+            planning_prompt,
+        )
+        self.assertIn(
+            "must never produce `needs_human`",
+            planning_prompt,
+        )
+        self.assertIn(
+            "Do not derive authoritative expected values",
+            planning_prompt,
+        )
+        self.assertIn(
+            "environment or literal fixture values",
+            implementation_prompt,
+        )
+        self.assertIn(
+            '"decision":"automation_plan_changes_required"',
+            implementation_prompt,
+        )
+        self.assertEqual(
+            parse_automation_replan_request(
+                '{"decision":"automation_plan_changes_required",'
+                '"reason":"fixture values are not checked in"}'
+            ),
+            "fixture values are not checked in",
+        )
+        environment_replan = parse_automation_replan_request(
+            '{"decision":"needs_human","question":"Which configured automation '
+            "environment should supply the authoritative fixture data, and what are "
+            "the literal Project Created Date values for ABC, ABCD, DEF, and DEFG "
+            "under 8265815gc_1? No runnable environment or focused-testng.xml is "
+            'locally available, so these expectations cannot be derived safely."}'
+        )
+        self.assertIn("unavailable automation infrastructure", environment_replan or "")
+        product_question_replan = parse_automation_replan_request(
+            '{"decision":"needs_human","question":"Which user-visible state is expected?"}'
+        )
+        self.assertIn("automation planning must first resolve", product_question_replan or "")
+
     def test_default_codex_runner_excludes_configured_jira_credential_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -249,8 +443,11 @@ class OrchestratorTests(unittest.TestCase):
                 labels=["codex-ready"],
                 url="https://jira.example.test/browse/T-1",
             )
-            runner = AutomationWorkflowCodexRunner("update_required")
             store = Store(root / "db.sqlite3")
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                binding_store=store,
+            )
 
             result = asyncio.run(
                 SingleIssueOrchestrator(
@@ -285,6 +482,278 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertIn("Validated automation plan", runner.review_prompt)
             self.assertIn("Automation:", result.run.final_message or "")
+            self.assertIsNotNone(runner.binding_at_implementation_start)
+            assert runner.binding_at_implementation_start is not None
+            self.assertIsNotNone(
+                runner.binding_at_implementation_start.automation_plan_hash
+            )
+            self.assertIsNotNone(
+                runner.binding_at_implementation_start.automation_development_diff_hash
+            )
+            self.assertIsNotNone(
+                runner.binding_at_implementation_start.automation_repository_diff_hash
+            )
+            self.assertIsNone(
+                runner.binding_at_implementation_start.automation_result_hash
+            )
+
+    def test_gated_automation_flow_requires_exact_approval_between_reviews(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner = AutomationWorkflowCodexRunner(
+                    "update_required",
+                    review_decisions=["approve", "approve"],
+                    named_review_phases=True,
+                )
+                (
+                    _workflow,
+                    _jira,
+                    store,
+                    polling,
+                    development_planned,
+                    automation_planned,
+                ) = await run_to_automation_approval(root, runner)
+
+                self.assertEqual(development_planned.status, "blocked")
+                self.assertEqual(
+                    development_planned.blocked_phase,
+                    "planning_approval",
+                )
+                self.assertEqual(automation_planned.status, "blocked")
+                self.assertEqual(
+                    automation_planned.blocked_phase,
+                    "automation_planning_approval",
+                )
+                self.assertEqual(
+                    runner.phases,
+                    [
+                        "development_plan",
+                        "development_implementation",
+                        "development_review",
+                        "automation_planning",
+                    ],
+                )
+                self.assertEqual(
+                    runner.phases.count("automation_implementation"),
+                    0,
+                )
+                self.assertIsNotNone(automation_planned.plan_approval_id)
+                self.assertIsNotNone(automation_planned.automation_plan_hash)
+                self.assertIsNone(
+                    automation_planned.automation_plan_approval_id
+                )
+                approved_plan_hash = automation_planned.automation_plan_hash
+
+                _input, automation_approval = approve_automation_run(
+                    store,
+                    automation_planned,
+                )
+                await dispatch_pending_human_resume(polling)
+
+                completed = store.latest_run_for_issue("T-1")
+                assert completed is not None
+                self.assertEqual(completed.status, "completed", completed.error)
+                self.assertNotEqual(completed.id, automation_planned.id)
+                self.assertEqual(
+                    completed.attempt,
+                    automation_planned.attempt + 1,
+                )
+                self.assertEqual(
+                    completed.automation_plan_hash,
+                    approved_plan_hash,
+                )
+                self.assertEqual(
+                    completed.automation_plan_approval_id,
+                    automation_approval["id"],
+                )
+                self.assertEqual(
+                    automation_approval["run_id"],
+                    automation_planned.id,
+                )
+                self.assertEqual(
+                    runner.phases,
+                    [
+                        "development_plan",
+                        "development_implementation",
+                        "development_review",
+                        "automation_planning",
+                        "automation_implementation",
+                        "automation_review",
+                    ],
+                )
+                self.assertEqual(runner.phases.count("development_plan"), 1)
+                self.assertEqual(
+                    runner.phases.count("development_implementation"),
+                    1,
+                )
+                self.assertEqual(runner.phases.count("automation_planning"), 1)
+
+        asyncio.run(run())
+
+    def test_gated_noop_automation_plan_still_requires_approval(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner = AutomationWorkflowCodexRunner(
+                    "no_update_required",
+                    review_decisions=["approve", "approve"],
+                    named_review_phases=True,
+                )
+                (
+                    _workflow,
+                    _jira,
+                    store,
+                    polling,
+                    _development_planned,
+                    automation_planned,
+                ) = await run_to_automation_approval(root, runner)
+
+                self.assertEqual(automation_planned.status, "blocked")
+                self.assertEqual(
+                    automation_planned.blocked_phase,
+                    "automation_planning_approval",
+                )
+                self.assertEqual(runner.phases.count("automation_planning"), 1)
+                self.assertEqual(
+                    runner.phases.count("automation_implementation"),
+                    0,
+                )
+
+                approve_automation_run(store, automation_planned)
+                await dispatch_pending_human_resume(polling)
+
+                completed = store.latest_run_for_issue("T-1")
+                assert completed is not None
+                self.assertEqual(completed.status, "completed", completed.error)
+                self.assertEqual(runner.phases.count("development_plan"), 1)
+                self.assertEqual(
+                    runner.phases.count("development_implementation"),
+                    1,
+                )
+                self.assertEqual(runner.phases.count("automation_planning"), 1)
+                self.assertEqual(
+                    runner.phases.count("automation_implementation"),
+                    0,
+                )
+                self.assertEqual(runner.phases.count("automation_review"), 1)
+
+        asyncio.run(run())
+
+    def test_automation_review_changes_reuse_the_exact_approved_plan(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner = AutomationWorkflowCodexRunner(
+                    "update_required",
+                    review_decisions=["approve", "changes_required", "approve"],
+                    named_review_phases=True,
+                )
+                (
+                    _workflow,
+                    _jira,
+                    store,
+                    polling,
+                    _development_planned,
+                    automation_planned,
+                ) = await run_to_automation_approval(root, runner)
+                _input, automation_approval = approve_automation_run(
+                    store,
+                    automation_planned,
+                )
+
+                await dispatch_pending_human_resume(polling)
+
+                completed = store.latest_run_for_issue("T-1")
+                assert completed is not None
+                self.assertEqual(completed.status, "completed", completed.error)
+                self.assertEqual(
+                    completed.automation_plan_approval_id,
+                    automation_approval["id"],
+                )
+                persisted = store.get_automation_plan_approval(
+                    str(automation_approval["id"])
+                )
+                assert persisted is not None
+                self.assertIsNone(persisted["invalidated_at"])
+                self.assertEqual(runner.phases.count("development_plan"), 1)
+                self.assertEqual(
+                    runner.phases.count("development_implementation"),
+                    1,
+                )
+                self.assertEqual(runner.phases.count("development_review"), 1)
+                self.assertEqual(runner.phases.count("automation_planning"), 1)
+                self.assertEqual(
+                    runner.phases.count("automation_implementation"),
+                    2,
+                )
+                self.assertEqual(runner.phases.count("automation_review"), 2)
+
+        asyncio.run(run())
+
+    def test_automation_review_replan_invalidates_approval_and_regates(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner = AutomationWorkflowCodexRunner(
+                    "update_required",
+                    automation_decisions=["update_required", "update_required"],
+                    review_decisions=[
+                        "approve",
+                        "automation_plan_changes_required",
+                    ],
+                    named_review_phases=True,
+                )
+                (
+                    _workflow,
+                    _jira,
+                    store,
+                    polling,
+                    _development_planned,
+                    automation_planned,
+                ) = await run_to_automation_approval(root, runner)
+                development_approval_id = automation_planned.plan_approval_id
+                _input, old_automation_approval = approve_automation_run(
+                    store,
+                    automation_planned,
+                )
+
+                await dispatch_pending_human_resume(polling)
+
+                replanned = store.latest_run_for_issue("T-1")
+                assert replanned is not None
+                self.assertEqual(replanned.status, "blocked", replanned.error)
+                self.assertEqual(
+                    replanned.blocked_phase,
+                    "automation_planning_approval",
+                )
+                self.assertIsNone(replanned.automation_plan_approval_id)
+                self.assertEqual(replanned.plan_approval_id, development_approval_id)
+                old_persisted = store.get_automation_plan_approval(
+                    str(old_automation_approval["id"])
+                )
+                assert old_persisted is not None
+                self.assertIsNotNone(old_persisted["invalidated_at"])
+                assert development_approval_id is not None
+                development_approval = store.get_plan_approval(
+                    development_approval_id
+                )
+                assert development_approval is not None
+                self.assertIsNone(development_approval["invalidated_at"])
+                self.assertEqual(runner.phases.count("development_plan"), 1)
+                self.assertEqual(
+                    runner.phases.count("development_implementation"),
+                    1,
+                )
+                self.assertEqual(runner.phases.count("development_review"), 1)
+                self.assertEqual(runner.phases.count("automation_planning"), 2)
+                self.assertEqual(
+                    runner.phases.count("automation_implementation"),
+                    1,
+                )
+                self.assertEqual(runner.phases.count("automation_review"), 1)
+
+        asyncio.run(run())
 
     def test_automation_no_update_plan_skips_automation_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -444,6 +913,207 @@ class OrchestratorTests(unittest.TestCase):
                 "Add the focused regression scenario.",
                 runner.automation_plan_prompts[-1],
             )
+
+    def test_automation_planning_environment_question_replans_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Plan automation without a runtime",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                first_automation_plan_needs_environment=True,
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(result.run.attempt, 1)
+            self.assertEqual(runner.phases.count("development_implementation"), 1)
+            self.assertEqual(runner.phases.count("automation_planning"), 2)
+            self.assertEqual(runner.phases.count("automation_implementation"), 1)
+            self.assertIn(
+                "Prior automation planning feedback",
+                runner.automation_plan_prompts[-1],
+            )
+            self.assertIn(
+                "untrusted diagnostic feedback for source-only replanning",
+                runner.automation_plan_prompts[-1],
+            )
+
+    def test_automation_implementation_can_request_source_only_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Replan automation without a runtime",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                automation_implementation_replan=True,
+            )
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+            )
+
+            result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(result.run.attempt, 1)
+            self.assertEqual(runner.phases.count("development_implementation"), 1)
+            self.assertEqual(runner.phases.count("automation_planning"), 2)
+            self.assertEqual(runner.phases.count("automation_implementation"), 2)
+            self.assertIn(
+                "literal Project Created Date values",
+                runner.automation_plan_prompts[-1],
+            )
+            self.assertIn(
+                "untrusted diagnostic feedback for source-only replanning",
+                runner.automation_plan_prompts[-1],
+            )
+            self.assertIsNotNone(result.run.automation_plan_hash)
+            self.assertIsNotNone(result.run.automation_result_hash)
+
+    def test_automation_source_only_replanning_has_a_retry_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Bound source-only replanning",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                automation_implementation_replan=True,
+                persistent_automation_implementation_replan=True,
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "failed")
+            self.assertEqual(result.run.blocked_phase, "automation_planning")
+            self.assertIn("remained unimplementable after 1 attempt", result.run.error or "")
+            self.assertIn("No live environment", result.run.error or "")
+            self.assertEqual(runner.phases.count("development_implementation"), 1)
+            self.assertEqual(runner.phases.count("automation_planning"), 2)
+            self.assertEqual(runner.phases.count("automation_implementation"), 2)
+
+    def test_polling_does_not_restart_exhausted_automation_replanning(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workflow = load_workflow(
+                    write_workflow(
+                        root,
+                        write_fake_codex(root),
+                        codex_extra="  plan_before_implementation: true",
+                    ),
+                    environ={"TEST_JIRA_TOKEN": "token"},
+                )
+                workflow.config.automation.enabled = True
+                workflow.config.agent.max_retries = 3
+                issue = Issue(
+                    id="10001",
+                    identifier="T-1",
+                    title="Do not restart bounded automation replanning",
+                    description="Implement and automate the focused behavior",
+                    status="To Do",
+                    labels=["codex-ready"],
+                    url="https://jira.example.test/browse/T-1",
+                )
+                store = Store(root / "db.sqlite3")
+                runner = AutomationWorkflowCodexRunner(
+                    "update_required",
+                    automation_implementation_replan=True,
+                    persistent_automation_implementation_replan=True,
+                )
+                polling = PollingOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    store,
+                    codex_runner=runner,
+                )
+
+                await polling.poll_once()
+                await asyncio.gather(
+                    *(item.task for item in polling.running.values())
+                )
+                await polling.reap_finished()
+
+                latest = store.latest_run_for_issue("T-1")
+                assert latest is not None
+                self.assertEqual(latest.status, "failed")
+                self.assertEqual(latest.attempt, 1)
+                self.assertEqual(polling.retry_queue, {})
+                self.assertEqual(len(store.list_runs()), 1)
+                self.assertEqual(
+                    runner.phases.count("development_implementation"),
+                    1,
+                )
+
+        asyncio.run(run())
 
     def test_automation_implementation_blocks_unplanned_file_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5633,6 +6303,7 @@ class AutomationWorkflowCodexRunner:
         decision: str,
         *,
         first_automation_plan_needs_human: bool = False,
+        first_automation_plan_needs_environment: bool = False,
         unplanned_automation_file: bool = False,
         automation_decisions: list[str] | None = None,
         empty_automation_result: bool = False,
@@ -5641,11 +6312,18 @@ class AutomationWorkflowCodexRunner:
         change_development_during_automation: bool = False,
         ignored_automation_mutation_phase: str | None = None,
         ignore_planned_automation_path: bool = False,
+        binding_store: Store | None = None,
+        automation_implementation_replan: bool = False,
+        persistent_automation_implementation_replan: bool = False,
+        named_review_phases: bool = False,
         events: list[str] | None = None,
     ) -> None:
         self.decision = decision
         self.first_automation_plan_needs_human = (
             first_automation_plan_needs_human
+        )
+        self.first_automation_plan_needs_environment = (
+            first_automation_plan_needs_environment
         )
         self.unplanned_automation_file = unplanned_automation_file
         self.automation_decisions = list(automation_decisions or [decision])
@@ -5661,6 +6339,15 @@ class AutomationWorkflowCodexRunner:
             ignored_automation_mutation_phase
         )
         self.ignore_planned_automation_path = ignore_planned_automation_path
+        self.binding_store = binding_store
+        self.binding_at_implementation_start = None
+        self.automation_implementation_replan = (
+            automation_implementation_replan
+        )
+        self.persistent_automation_implementation_replan = (
+            persistent_automation_implementation_replan
+        )
+        self.named_review_phases = named_review_phases
         self.events = events
         self.phases: list[str] = []
         self.automation_plan_prompts: list[str] = []
@@ -5709,6 +6396,18 @@ class AutomationWorkflowCodexRunner:
                     ),
                     final_path=config.output_last_message_file,
                 )
+            if self.first_automation_plan_needs_environment:
+                self.first_automation_plan_needs_environment = False
+                return codex_result(
+                    workspace,
+                    "completed",
+                    final_message=(
+                        '{"decision":"needs_human","question":"Which configured '
+                        "automation environment should supply authoritative fixture "
+                        'data when no runnable environment is available?"}'
+                    ),
+                    final_path=config.output_last_message_file,
+                )
             decision = (
                 self.automation_decisions.pop(0)
                 if len(self.automation_decisions) > 1
@@ -5725,6 +6424,31 @@ class AutomationWorkflowCodexRunner:
             )
         if prompt.startswith("You are implementing the validated automation plan"):
             self.record_phase("automation_implementation")
+            if self.binding_store is not None:
+                self.binding_at_implementation_start = (
+                    self.binding_store.latest_run_for_issue("T-1")
+                )
+            if self.automation_implementation_replan:
+                if not self.persistent_automation_implementation_replan:
+                    self.automation_implementation_replan = False
+                return codex_result(
+                    workspace,
+                    "completed",
+                    final_message=json.dumps(
+                        {
+                            "decision": "needs_human",
+                            "question": (
+                                "Which configured automation environment should supply "
+                                "the authoritative fixture data, and what are the literal "
+                                "Project Created Date values for ABC, ABCD, DEF, and DEFG "
+                                "under 8265815gc_1? No runnable environment or "
+                                "focused-testng.xml is locally available, so these "
+                                "expectations cannot be derived safely."
+                            ),
+                        }
+                    ),
+                    final_path=config.output_last_message_file,
+                )
             automation_repository = workspace / "automation"
             (automation_repository / "generated-test.java").write_text(
                 "final class GeneratedTest {}\n",
@@ -5760,7 +6484,14 @@ class AutomationWorkflowCodexRunner:
                 result.final_message_path.write_text("", encoding="utf-8")
             return result
         if prompt.startswith("You are reviewing a completed implementation"):
-            self.record_phase("review")
+            review_phase = "review"
+            if self.named_review_phases:
+                review_phase = (
+                    "automation_review"
+                    if "automation-review" in config.output_last_message_file
+                    else "development_review"
+                )
+            self.record_phase(review_phase)
             self.review_prompt = prompt
             decision = self.review_decisions.pop(0)
             return codex_result(

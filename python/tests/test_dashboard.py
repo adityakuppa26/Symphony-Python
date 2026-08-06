@@ -22,6 +22,7 @@ from symphony_jira.dashboard import (
     build_state,
     create_app,
     current_plan_spec_hash,
+    prepare_bound_automation_context,
     prepare_human_review_context,
     prepare_verification_bypass_context,
     render_dashboard_html,
@@ -88,7 +89,7 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(state["recent_runs"][0]["plan_exists"])
             self.assertEqual(state["recent_runs"][0]["blocked_phase"], "implementation")
             self.assertIn("T-1", html)
-            self.assertIn("implementation", html)
+            self.assertIn("Development Implementation", html)
             self.assertIn("codex-plan.md", html)
             self.assertIn("Plan summary unavailable", html)
             self.assertNotIn("Plan content", html)
@@ -193,19 +194,27 @@ class DashboardTests(unittest.TestCase):
             workflow = load_workflow(
                 write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
             )
+            workflow.config.automation.enabled = True
             store = Store(root / "db.sqlite3")
             latest_events = {
-                "T-PLAN": ("plan.item.started", "planning"),
-                "T-REVIEW": ("review.item.started", "review"),
+                "T-PLAN": ("plan.item.started", "Development Planning"),
+                "T-REVIEW": ("review.item.started", "Development Review"),
                 "T-AUTO-PLAN": (
                     "automation_planning.item.started",
-                    "automation planning",
+                    "Automation Planning",
                 ),
                 "T-AUTO-IMPL": (
                     "automation_implementation.item.started",
-                    "automation implementation",
+                    "Automation Implementation",
                 ),
-                "T-IMPL": ("item.started", "implementation"),
+                "T-DEV-IMPL": (
+                    "development_implementation.item.started",
+                    "Development Implementation",
+                ),
+                "T-LEGACY-IMPL": (
+                    "item.started",
+                    "Development Implementation",
+                ),
                 "T-SETUP": (None, "setup"),
             }
             for index, (identifier, (event_type, _)) in enumerate(
@@ -251,6 +260,23 @@ class DashboardTests(unittest.TestCase):
                     runs_by_issue[identifier]["current_phase"],
                     expected_phase,
                 )
+            self.assertEqual(
+                runs_by_issue["T-AUTO-IMPL"]["workflow_progress"],
+                (
+                    "Development Planning: done → Dev Approval: not required → "
+                    "Development Implementation: done → "
+                    "Development Review: not required → "
+                    "Automation Planning: done → "
+                    "Automation Approval: not required → "
+                    "Automation Implementation: running → "
+                    "Automation Review: not required"
+                ),
+            )
+            html = render_dashboard_html(build_state(workflow, store))
+            self.assertIn(
+                "Development Planning: done → Dev Approval: not required",
+                html,
+            )
 
     def test_automation_artifacts_are_enriched_and_safely_summarized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,6 +395,113 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(state["all_runs"][0]["automation_result_exists"])
             self.assertIn("<th>Automation</th>", html)
             self.assertIn("Bound historical automation result", html)
+
+    def test_running_automation_implementation_shows_bound_plan_and_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.automation.enabled = True
+            store = Store(root / "db.sqlite3")
+            _, workspace_path, _, _ = create_bound_automation_dashboard_run(
+                root,
+                workflow,
+                store,
+                automation_result="Implementation has not completed.",
+                implementation_complete=False,
+            )
+            automation_test = (
+                workspace_path / "automation" / "src" / "test" / "DashboardTest.java"
+            )
+            automation_test.parent.mkdir(parents=True, exist_ok=True)
+            automation_test.write_text(
+                "final class DashboardTest { /* implementation in progress */ }\n",
+                encoding="utf-8",
+            )
+
+            state = build_state(workflow, store)
+            html = render_dashboard_html(state)
+            dashboard_run = state["all_runs"][0]
+
+            self.assertEqual(
+                dashboard_run["current_phase"],
+                "Automation Implementation",
+            )
+            self.assertTrue(dashboard_run["automation_plan_exists"])
+            self.assertFalse(dashboard_run["automation_result_exists"])
+            self.assertIn(
+                "Automation Planning: done → Automation Approval: not required → "
+                "Automation Implementation: running",
+                dashboard_run["workflow_progress"],
+            )
+            self.assertIn("Automation plan file", html)
+            self.assertIn("Automation Implementation: running", html)
+
+    def test_blocked_automation_same_scope_repository_drift_rejects_bound_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.automation.enabled = True
+            store = Store(root / "db.sqlite3")
+            run, workspace_path, _, _ = create_bound_automation_dashboard_run(
+                root,
+                workflow,
+                store,
+                automation_result="Implementation completed.",
+            )
+            store.update_run(
+                run.id,
+                status="blocked",
+                blocked_phase="automation_implementation",
+                automation_result_hash=None,
+            )
+            automation_test = (
+                workspace_path / "automation" / "src" / "test" / "DashboardTest.java"
+            )
+            automation_test.write_text(
+                "final class DashboardTest { /* changed after block */ }\n",
+                encoding="utf-8",
+            )
+
+            dashboard_run = build_state(workflow, store)["all_runs"][0]
+
+            self.assertFalse(dashboard_run["automation_plan_exists"])
+            self.assertIn(
+                "artifact could not be validated",
+                dashboard_run["automation_plan_summary"],
+            )
+
+    def test_historical_completed_run_does_not_claim_automation_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.automation.enabled = True
+            store = Store(root / "db.sqlite3")
+            create_completed_dashboard_run(root, store)
+
+            dashboard_run = build_state(workflow, store)["all_runs"][0]
+
+            self.assertIn(
+                "Development Implementation: done",
+                dashboard_run["workflow_progress"],
+            )
+            self.assertIn(
+                "Automation Planning: pending",
+                dashboard_run["workflow_progress"],
+            )
+            self.assertIn(
+                "Automation Implementation: pending",
+                dashboard_run["workflow_progress"],
+            )
+            self.assertNotIn(
+                "Automation Planning: done",
+                dashboard_run["workflow_progress"],
+            )
 
     def test_invalid_automation_result_suppresses_human_review_form(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -593,6 +726,281 @@ class DashboardTests(unittest.TestCase):
             ):
                 prepare_human_review_context(run, workflow, store)
 
+    def test_automation_plan_approval_uses_exact_frozen_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.codex.require_plan_approval = True
+            workflow.config.codex.review_after_run = True
+            workflow.config.automation.enabled = True
+            workflow.config.automation.require_plan_approval = True
+            workflow.config.automation.review_after_run = True
+            store = Store(root / "db.sqlite3")
+            run, _, _, development_approval = (
+                create_automation_planning_approval_dashboard_run(
+                    root,
+                    workflow,
+                    store,
+                )
+            )
+            assert development_approval is not None
+
+            state = build_state(workflow, store)
+            dashboard_run = state["all_runs"][0]
+            html = render_dashboard_html(state)
+
+            self.assertEqual(
+                dashboard_run["current_phase"],
+                "Automation Approval",
+            )
+            for label in (
+                "Development Planning",
+                "Dev Approval",
+                "Development Implementation",
+                "Development Review",
+                "Automation Planning",
+                "Automation Approval",
+                "Automation Implementation",
+                "Automation Review",
+            ):
+                self.assertIn(label, dashboard_run["workflow_progress"])
+            self.assertIn("Automation Approval: awaiting approval", html)
+            self.assertIn("Approve the exact validated AutomationPlan", html)
+            self.assertIn(
+                'name="action" value="approve_automation_plan"',
+                html,
+            )
+            self.assertIn("Approve Exact Automation Plan", html)
+            self.assertIn('name="approver_identity" required', html)
+
+            with patch(
+                "symphony_jira.dashboard.prepare_bound_automation_context",
+                wraps=prepare_bound_automation_context,
+            ) as validate_automation_context:
+                response = TestClient(create_app(workflow, store)).post(
+                    f"/api/v1/runs/{run.id}/human-input",
+                    json={
+                        "action": "approve_automation_plan",
+                        "approver_identity": " automation-reviewer@example.test ",
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            validate_automation_context.assert_called_once()
+            self.assertFalse(
+                validate_automation_context.call_args.kwargs["require_result"]
+            )
+            self.assertTrue(
+                validate_automation_context.call_args.kwargs["allow_partial_scope"]
+            )
+            payload = response.json()["human_input"]
+            self.assertEqual(payload["action"], "automation_plan_approval")
+            self.assertEqual(
+                payload["approver_identity"],
+                "automation-reviewer@example.test",
+            )
+            self.assertEqual(
+                payload["automation_plan_hash"],
+                run.automation_plan_hash,
+            )
+            self.assertEqual(
+                payload["requirements_snapshot_hash"],
+                run.issue_fingerprint,
+            )
+            self.assertEqual(
+                payload["development_plan_spec_hash"],
+                run.plan_spec_hash,
+            )
+            self.assertEqual(
+                payload["development_plan_approval_id"],
+                development_approval["id"],
+            )
+            self.assertEqual(
+                payload["development_workspace_diff_hash"],
+                run.automation_development_diff_hash,
+            )
+            self.assertEqual(
+                payload["automation_repository_diff_hash"],
+                run.automation_repository_diff_hash,
+            )
+            persisted = store.latest_automation_plan_approval_for_run(
+                run.id,
+                active_only=True,
+            )
+            self.assertIsNotNone(persisted)
+            self.assertEqual(
+                store.get_run(run.id).automation_plan_approval_id,
+                persisted["id"],
+            )
+
+    def test_automation_plan_approval_rejects_tampered_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.automation.enabled = True
+            workflow.config.automation.require_plan_approval = True
+            store = Store(root / "db.sqlite3")
+            run, workspace_path, automation_plan_content, _ = (
+                create_automation_planning_approval_dashboard_run(
+                    root,
+                    workflow,
+                    store,
+                )
+            )
+            automation_plan_path = (
+                workspace_path / workflow.config.automation.output_plan_file
+            )
+            automation_plan_path.write_text(
+                automation_plan_content.replace(
+                    "existing focused test suite",
+                    "a tampered test suite",
+                ),
+                encoding="utf-8",
+            )
+
+            response = TestClient(create_app(workflow, store)).post(
+                f"/api/v1/runs/{run.id}/human-input",
+                json={
+                    "action": "approve_automation_plan",
+                    "approver_identity": "reviewer@example.test",
+                },
+            )
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("cannot be approved", response.json()["detail"])
+            self.assertEqual(
+                store.list_automation_plan_approvals(run_id=run.id),
+                [],
+            )
+            self.assertEqual(store.list_human_inputs(run_id=run.id), [])
+
+    def test_disabled_automation_approval_gate_has_no_approval_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.automation.enabled = True
+            workflow.config.automation.require_plan_approval = False
+            store = Store(root / "db.sqlite3")
+            run, _, _, _ = create_automation_planning_approval_dashboard_run(
+                root,
+                workflow,
+                store,
+            )
+
+            html = render_dashboard_html(build_state(workflow, store))
+            response = TestClient(create_app(workflow, store)).post(
+                f"/api/v1/runs/{run.id}/human-input",
+                json={
+                    "action": "approve_automation_plan",
+                    "approver_identity": "reviewer@example.test",
+                },
+            )
+
+            self.assertNotIn('value="approve_automation_plan"', html)
+            self.assertIn("approval gate is disabled", html)
+            self.assertIn("Automation Approval: not required", html)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("not enabled", response.json()["detail"])
+
+    def test_historical_blocked_run_renders_no_human_input_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            store = Store(root / "db.sqlite3")
+            issue = Issue(
+                id="1",
+                identifier="T-1",
+                title="Title",
+                status="To Do",
+                url="https://jira.example.test/browse/T-1",
+            )
+            historical = store.create_run(
+                issue,
+                root / "workspaces" / "T-1",
+                branch_name=None,
+            )
+            historical = store.update_run(
+                historical.id,
+                status="blocked",
+                blocked_phase="implementation",
+                error="Old clarification",
+            )
+            time.sleep(0.01)
+            store.create_run(
+                issue,
+                root / "workspaces" / "T-1",
+                branch_name=None,
+            )
+
+            state = build_state(workflow, store)
+            html = render_dashboard_html(state)
+            historical_dashboard_run = next(
+                item for item in state["all_runs"] if item["id"] == historical.id
+            )
+
+            self.assertFalse(historical_dashboard_run["human_input_actionable"])
+            self.assertNotIn(
+                f'/api/v1/runs/{historical.id}/human-input',
+                html,
+            )
+
+    def test_dashboard_shows_separate_review_artifacts_and_histories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"}
+            )
+            workflow.config.codex.review_after_run = True
+            workflow.config.automation.enabled = True
+            workflow.config.automation.review_after_run = True
+            store = Store(root / "db.sqlite3")
+            run = create_completed_dashboard_run(root, store)
+            workspace_path = Path(run.workspace_path)
+            artifact_contents = (
+                (
+                    workflow.config.codex.output_review_file,
+                    "Development review approved.",
+                ),
+                (
+                    workflow.config.codex.output_review_history_file,
+                    "Development review history.",
+                ),
+                (
+                    workflow.config.automation.output_review_file,
+                    "Automation review approved.",
+                ),
+                (
+                    workflow.config.automation.output_review_history_file,
+                    "Automation review history.",
+                ),
+            )
+            for relative_path, content in artifact_contents:
+                path = workspace_path / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+
+            state = build_state(workflow, store)
+            dashboard_run = state["all_runs"][0]
+            html = render_dashboard_html(state)
+
+            self.assertTrue(dashboard_run["development_review_exists"])
+            self.assertTrue(dashboard_run["development_review_history_exists"])
+            self.assertTrue(dashboard_run["automation_review_exists"])
+            self.assertTrue(dashboard_run["automation_review_history_exists"])
+            self.assertIn("<strong>Development Review</strong>", html)
+            self.assertIn("<strong>Automation Review</strong>", html)
+            for relative_path, content in artifact_contents:
+                self.assertIn(relative_path, html)
+                self.assertIn(content, html)
+
     def test_blocked_automation_phase_uses_standard_resume_form(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -721,10 +1129,10 @@ class DashboardTests(unittest.TestCase):
             self.assertIn('name="action" value="approve"', html)
             self.assertIn('name="approver_identity" required', html)
             self.assertIn("Request Adjustments", html)
-            self.assertIn("plan completed", html)
+            self.assertIn("Dev Approval", html)
             self.assertNotIn("Which repo should change?", html)
             row = html.split(f"/api/v1/runs/{blocked.id}/human-input", 1)[0].rsplit("<tr>", 1)[1]
-            self.assertIn("<td>plan completed</td>", row)
+            self.assertIn("<td>Dev Approval</td>", row)
             self.assertNotIn("<td>blocked</td>", row)
             self.assertIn(f"/api/v1/runs/{blocked.id}/human-input", html)
 
@@ -767,7 +1175,13 @@ class DashboardTests(unittest.TestCase):
             )
 
             html = render_dashboard_html(build_state(workflow, store))
-            self.assertIn("Bypass Verification and Hand Off", html)
+            self.assertIn(
+                "Approve Test/Runtime Override and Continue to Review",
+                html,
+            )
+            self.assertIn("Original status: <code>test_failed</code>", html)
+            self.assertIn(str(root / "verification.json"), html)
+            self.assertNotIn("Bypass Verification and Hand Off", html)
             self.assertIn('name="action" value="bypass_verification"', html)
             self.assertIn('name="approver_identity" required', html)
             self.assertIn("Retry Verification", html)
@@ -844,7 +1258,10 @@ class DashboardTests(unittest.TestCase):
 
             self.assertIn("predates verification-time integrity binding", html)
             self.assertIn("Retry Verification", html)
-            self.assertNotIn("Bypass Verification and Hand Off", html)
+            self.assertNotIn(
+                "Approve Test/Runtime Override and Continue to Review",
+                html,
+            )
 
             with patch(
                 "symphony_jira.dashboard.prepare_verification_bypass_context",
@@ -2039,6 +2456,8 @@ def create_bound_automation_dashboard_run(
     *,
     decision: str = "update_required",
     automation_result: str,
+    implementation_complete: bool = True,
+    record_implementation_event: bool = True,
 ):
     snapshot = dashboard_requirements_snapshot()
     workspace_path = root / "workspaces" / "T-1"
@@ -2086,7 +2505,7 @@ def create_bound_automation_dashboard_run(
                 "verification": [],
             }
         )
-    else:
+    elif implementation_complete:
         automation_test = automation_repository / "src" / "test" / "DashboardTest.java"
         automation_test.parent.mkdir(parents=True, exist_ok=True)
         automation_test.write_text(
@@ -2114,12 +2533,16 @@ def create_bound_automation_dashboard_run(
         issue,
         workspace_path,
         branch_name="feature/T-1",
-        status="completed",
+        status="completed" if implementation_complete else "running",
         plan_spec_hash=development_plan.content_hash(),
         automation_plan_hash=automation_plan.content_hash(),
         automation_development_diff_hash=development_diff.content_hash,
         automation_repository_diff_hash=automation_repository_diff.content_hash,
-        automation_result_hash=automation_result_content_hash(automation_result),
+        automation_result_hash=(
+            automation_result_content_hash(automation_result)
+            if implementation_complete
+            else None
+        ),
     )
     plan_path = workspace_path / workflow.config.codex.output_plan_file
     automation_plan_path = (
@@ -2135,6 +2558,13 @@ def create_bound_automation_dashboard_run(
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+    if not implementation_complete and record_implementation_event:
+        store.add_codex_event(
+            run.id,
+            1,
+            "automation_implementation.item.started",
+            {"type": "item.started"},
+        )
     for path in (
         workspace_path / ".symphony" / "requirements-snapshot.json",
         workspace_path
@@ -2150,6 +2580,42 @@ def create_bound_automation_dashboard_run(
         development_plan_content,
         automation_plan_content,
     )
+
+
+def create_automation_planning_approval_dashboard_run(
+    root: Path,
+    workflow,
+    store: Store,
+):
+    run, workspace_path, _, automation_plan_content = (
+        create_bound_automation_dashboard_run(
+            root,
+            workflow,
+            store,
+            automation_result="Automation implementation has not started.",
+            implementation_complete=False,
+            record_implementation_event=False,
+        )
+    )
+    development_approval = None
+    if workflow.config.codex.require_plan_approval:
+        development_approval = store.add_plan_approval(
+            run.issue_identifier,
+            run_id=run.id,
+            approver_identity="development-reviewer@example.test",
+            plan_spec_hash=str(run.plan_spec_hash),
+            requirements_snapshot_hash=str(run.issue_fingerprint),
+        )
+    run = store.update_run(
+        run.id,
+        status="blocked",
+        blocked_phase="automation_planning_approval",
+        error="Automation plan is ready for approval.",
+        plan_approval_id=(
+            development_approval["id"] if development_approval else None
+        ),
+    )
+    return run, workspace_path, automation_plan_content, development_approval
 
 
 def initialize_dashboard_git_repository(repository_path: Path) -> str:

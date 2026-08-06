@@ -239,28 +239,41 @@ codex:
     - Do not approve behavioral UI changes without a targeted test or documented manual verification of the affected state transitions.
     Also, ensure that the code changes are not doing more than what's asked for. If there is an unnecessary change, add a feedback accordingly to make it a minimal but relevant change.
     Return JSON with:
-    - decision: "approve", "changes_required", "automation_plan_changes_required", or "plan_changes_required"
+    - decision: "approve", "changes_required", "plan_changes_required", or "needs_human"
     - findings: a list of concrete findings
     - residual_risk: a short risk summary
-    Use changes_required only for code changes that remain within the exact validated development and automation plans. Use automation_plan_changes_required when the development PlanSpec remains valid and only the derived automation plan must change. Use plan_changes_required when a finding changes required behavior, scope, requirements or acceptance criteria, architecture, or affected surfaces; Symphony invalidates the prior approval and returns the issue to development planning for a new PlanSpec and approval. Empty or unrecognized review output is invalid and blocks rather than approving.
-    Symphony owns required runtime verification and supplies its persisted evidence to review. Codex must never edit or invoke /home/adkuppa/compost or Podman.
+    This is the development review and runs before automation planning. Use changes_required only for development-code corrections within the exact validated development PlanSpec. Use plan_changes_required when a finding changes required behavior, scope, requirements or acceptance criteria, architecture, or affected surfaces; Symphony invalidates the prior approval and returns the issue to development planning for a new PlanSpec and approval. Never return automation_plan_changes_required from this review. Empty or unrecognized review output is invalid and blocks rather than approving.
+    Symphony owns required runtime verification. If its configured runtime is unavailable, report that as residual risk rather than asking for environment or fixture data; a human may approve a persisted verification override later. Codex must never edit or invoke /home/adkuppa/compost or Podman.
     Before you handoff, make sure the changes made are working and not causing api or ui failures.
     Focus on correctness, regressions, missing tests, and translation consistency.
 
 automation:
   enabled: true
   workspace_subdir: "automation"
+  require_plan_approval: true
   output_plan_file: ".symphony/codex-automation-plan.md"
   output_result_file: ".symphony/codex-automation-final.md"
+  review_after_run: true
+  max_review_iterations: 10
+  output_review_file: ".symphony/codex-automation-review.md"
+  output_review_history_file: ".symphony/codex-automation-review-history.md"
   planning_prompt: |
     After the approved development PlanSpec has been implemented, plan only the relevant automation update in automation/.
     Use the canonical Jira requirements, exact approved development PlanSpec, development result, and actual development diff as the behavior contract, then inspect the existing automation code for its established patterns.
     Identify the smallest useful regression or end-to-end coverage change, including the exact automation files and focused checks. Do not edit files during this planning pass.
+    No live automation environment, database, credentials, Jenkins job, Podman service, or external fixture source is configured or authoritative for this workflow. Never make implementation depend on discovering literal values there, and never ask a human to supply an environment or fixture values. Use only checked-in deterministic setup and independent assertions; do not derive authoritative expectations from the UI or API under test.
+    Environment-dependent verification is advisory and may be reported as not run. Name a focused selector only when it already exists in the checkout.
     If the development change does not warrant an automation-code update, return an explicit no-op plan with a concrete reason; do not manufacture coverage or unrelated cleanup.
   implementation_prompt: |
     Apply the automation plan only in automation/. Keep the change narrowly tied to the Jira requirements, approved development PlanSpec, and actual development implementation, and follow the repository's existing automation patterns.
     Do not edit foyr2/, cpm/, or pi/, and do not add unrelated refactors or speculative coverage.
+    Do not query or launch an automation environment, database, network service, Jenkins job, Podman container, credentials, or external fixture data. Missing runtime verification is expected: finish the source update and report the unavailable check as not run instead of asking for environment details or literal fixture values.
     If the automation plan is a no-op, leave automation/ unchanged and report the reason.
+  review_prompt: |
+    Review only the automation changes against the exact approved AutomationPlan, the approved development PlanSpec, and the implemented development diff.
+    Return JSON with decision approve, changes_required, automation_plan_changes_required, plan_changes_required, or needs_human; include concrete findings and residual risk.
+    Use changes_required only for corrections within the exact approved AutomationPlan. Use automation_plan_changes_required when that plan must change; Symphony will invalidate its approval and require a new automation plan and approval. Use plan_changes_required only when the approved development PlanSpec must change.
+    Treat unavailable live automation runtime as not run with residual risk, never as a request for environment or fixture data.
 ---
 
 You are working on Jira issue {{ issue.identifier }}.

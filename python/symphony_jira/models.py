@@ -273,6 +273,7 @@ class RunRecord(BaseModel):
     automation_repository_diff_hash: str | None = None
     automation_result_hash: str | None = None
     plan_approval_id: str | None = None
+    automation_plan_approval_id: str | None = None
     finished_at: datetime | None = None
     final_message: str | None = None
     error: str | None = None

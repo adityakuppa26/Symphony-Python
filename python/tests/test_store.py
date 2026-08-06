@@ -132,12 +132,210 @@ class StoreHumanInputTests(unittest.TestCase):
                     row[1]
                     for row in conn.execute("PRAGMA table_info(runs)").fetchall()
                 }
+                human_input_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(human_inputs)"
+                    ).fetchall()
+                }
+                automation_approval_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(automation_plan_approvals)"
+                    ).fetchall()
+                }
             self.assertIn("verification_workspace_diff_hash", columns)
             self.assertIn("verification_evidence_sha256", columns)
             self.assertIn("automation_plan_hash", columns)
             self.assertIn("automation_development_diff_hash", columns)
             self.assertIn("automation_repository_diff_hash", columns)
             self.assertIn("automation_result_hash", columns)
+            self.assertIn("automation_plan_approval_id", columns)
+            self.assertIn(
+                "automation_plan_approval_id",
+                human_input_columns,
+            )
+            self.assertTrue(
+                {
+                    "automation_plan_hash",
+                    "requirements_snapshot_hash",
+                    "development_plan_spec_hash",
+                    "development_plan_approval_id",
+                    "development_workspace_diff_hash",
+                    "automation_repository_diff_hash",
+                    "invalidated_at",
+                    "invalidation_reason",
+                }.issubset(automation_approval_columns)
+            )
+
+    def test_automation_approval_is_atomic_exact_and_resumable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            issue = make_issue()
+            run = store.create_run(issue, root / "workspace", branch_name=None)
+            requirements_hash = run.issue_fingerprint or ""
+            development_approval = store.add_plan_approval(
+                issue.identifier,
+                run_id=run.id,
+                approver_identity="dev-owner@example.test",
+                plan_spec_hash="a" * 64,
+                requirements_snapshot_hash=requirements_hash,
+            )
+            run = store.update_run(
+                run.id,
+                status="blocked",
+                blocked_phase="automation_planning_approval",
+                automation_plan_hash="b" * 64,
+                automation_development_diff_hash="c" * 64,
+                automation_repository_diff_hash="d" * 64,
+                automation_result_hash="e" * 64,
+            )
+
+            pending, approval = store.add_approved_automation_human_input(
+                issue.identifier,
+                run_id=run.id,
+                approver_identity="  automation-owner@example.test  ",
+                automation_plan_hash="B" * 64,
+                requirements_snapshot_hash=requirements_hash,
+                development_plan_spec_hash="a" * 64,
+                development_plan_approval_id=development_approval["id"],
+                development_workspace_diff_hash="c" * 64,
+                automation_repository_diff_hash="d" * 64,
+                question="Approve this exact AutomationPlan?",
+            )
+
+            persisted_run = store.get_run(run.id)
+            assert persisted_run is not None
+            self.assertEqual(
+                persisted_run.plan_approval_id,
+                development_approval["id"],
+            )
+            self.assertEqual(
+                persisted_run.automation_plan_approval_id,
+                approval["id"],
+            )
+            self.assertIsNone(persisted_run.automation_result_hash)
+            self.assertEqual(pending["action"], "automation_plan_approval")
+            self.assertIsNone(pending["approval_id"])
+            self.assertEqual(
+                pending["automation_plan_approval_id"],
+                approval["id"],
+            )
+            self.assertEqual(
+                approval["development_plan_approval_id"],
+                development_approval["id"],
+            )
+            self.assertEqual(
+                store.get_automation_plan_approval(approval["id"]),
+                approval,
+            )
+            self.assertEqual(
+                store.latest_automation_plan_approval_for_run(
+                    run.id,
+                    active_only=True,
+                ),
+                approval,
+            )
+            listed_input = store.list_human_inputs(run_id=run.id)[0]
+            self.assertEqual(
+                listed_input["automation_plan_hash"],
+                "b" * 64,
+            )
+            self.assertEqual(
+                listed_input["automation_plan_approval_id"],
+                approval["id"],
+            )
+            claimed = store.claim_human_input(pending["id"])
+            assert claimed is not None
+            reserved, status = store.reserve_human_resume(
+                issue,
+                root / "workspace",
+                input_id=pending["id"],
+                claim_token=claimed["claim_token"],
+                expected_predecessor_run_id=run.id,
+                branch_name=None,
+                attempt=2,
+            )
+            self.assertEqual(status, "reserved")
+            assert reserved is not None
+            self.assertEqual(
+                reserved.automation_plan_approval_id,
+                approval["id"],
+            )
+            self.assertEqual(
+                store.resolve_active_automation_plan_approval(
+                    reserved.id,
+                    automation_plan_hash="b" * 64,
+                    requirements_snapshot_hash=requirements_hash,
+                    development_plan_spec_hash="a" * 64,
+                    development_plan_approval_id=development_approval["id"],
+                    development_workspace_diff_hash="c" * 64,
+                    automation_repository_diff_hash="d" * 64,
+                ),
+                approval,
+            )
+            self.assertIsNone(
+                store.resolve_active_automation_plan_approval(
+                    reserved.id,
+                    automation_plan_hash="f" * 64,
+                    requirements_snapshot_hash=requirements_hash,
+                    development_plan_spec_hash="a" * 64,
+                    development_plan_approval_id=development_approval["id"],
+                    development_workspace_diff_hash="c" * 64,
+                    automation_repository_diff_hash="d" * 64,
+                )
+            )
+            invalidated = store.get_automation_plan_approval(approval["id"])
+            assert invalidated is not None
+            self.assertIn(
+                "AutomationPlan changed after approval",
+                invalidated["invalidation_reason"],
+            )
+
+    def test_automation_approval_rejects_the_wrong_phase_without_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            run = store.create_run(
+                make_issue(),
+                root / "workspace",
+                branch_name=None,
+            )
+            run = store.update_run(
+                run.id,
+                status="blocked",
+                blocked_phase="automation_planning",
+                plan_spec_hash="a" * 64,
+                automation_plan_hash="b" * 64,
+                automation_development_diff_hash="c" * 64,
+                automation_repository_diff_hash="d" * 64,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "not blocked for automation plan approval",
+            ):
+                store.add_approved_automation_human_input(
+                    "T-1",
+                    run_id=run.id,
+                    approver_identity="automation-owner@example.test",
+                    automation_plan_hash="b" * 64,
+                    requirements_snapshot_hash=run.issue_fingerprint or "",
+                    development_plan_spec_hash="a" * 64,
+                    development_plan_approval_id=None,
+                    development_workspace_diff_hash="c" * 64,
+                    automation_repository_diff_hash="d" * 64,
+                )
+
+            self.assertEqual(
+                store.list_automation_plan_approvals(run_id=run.id),
+                [],
+            )
+            self.assertEqual(store.list_human_inputs(run_id=run.id), [])
+            persisted_run = store.get_run(run.id)
+            assert persisted_run is not None
+            self.assertIsNone(persisted_run.automation_plan_approval_id)
 
     def test_only_latest_run_overall_is_actionable_even_if_older_run_finishes_later(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -645,6 +843,7 @@ class StoreHumanReviewTests(unittest.TestCase):
                     "automation_result_hash",
                     "automation_plan",
                     "automation_result",
+                    "automation_plan_approval_id",
                 }.issubset(columns)
             )
 

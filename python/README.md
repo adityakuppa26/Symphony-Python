@@ -287,9 +287,10 @@ approval gate:
    changes. An approved run then reports completion and performs the configured Jira
    handoff.
 
-The development PlanSpec approval remains the single human approval boundary. The
-automation plan is derived from that approved contract and the resulting development
-change; it cannot expand product behavior or silently edit a development repository.
+Development and automation have separate human approval boundaries. The automation
+plan is derived from the approved development contract and resulting development
+change; its approval cannot expand product behavior, replace development approval,
+or authorize edits to a development repository.
 An explicit no-op is a successful automation outcome, not a reason to manufacture
 tests, broad cleanup, or speculative coverage.
 
@@ -299,8 +300,21 @@ the result, but Symphony does not dispatch those model-authored command strings.
 Only trusted `hooks.verify` and configured runtime profiles are orchestrator-executed;
 in the checked-in workflow, the required hook covers automation with
 `git diff --check`, while runtime profiles remain development-only. The dashboard
-shows automation planning and implementation phases plus concise plan/result
-artifacts alongside each run.
+shows durable progress through development planning, human approval, development
+implementation, development review, automation planning, human approval, automation
+implementation, and automation review, plus concise bound plan/result artifacts
+alongside each run. A validated automation plan is persisted and approved before its
+writable pass starts, so approval resumes the exact plan without rerunning planning.
+If required verification cannot access its configured runtime, the dashboard offers
+an explicit, identity-bound override that preserves the failed evidence and continues
+to the pending review. The override never silently turns a failed test into a pass.
+
+No live automation environment is configured for the automation phase. Planning and
+implementation use only Jira, the validated development PlanSpec and diff, and
+checked-in automation sources/fixtures. Missing credentials, live fixture values, or
+an environment-only test selector are reported as unavailable verification rather
+than escalated as product questions. Plans may not make source changes depend on
+querying a deployment or derive authoritative expectations from the system under test.
 
 Automation is disabled by default for backwards compatibility. Configure it at the
 top level of `WORKFLOW.md`:
@@ -309,6 +323,7 @@ top level of `WORKFLOW.md`:
 automation:
   enabled: true
   workspace_subdir: automation
+  require_plan_approval: true
   planning_prompt: |
     Plan the smallest relevant automation update from the canonical requirements,
     approved development PlanSpec, development result, and actual development diff.
@@ -318,14 +333,19 @@ automation:
     checkout unchanged and report why.
   output_plan_file: .symphony/codex-automation-plan.md
   output_result_file: .symphony/codex-automation-final.md
+  review_after_run: true
+  max_review_iterations: 10
+  output_review_file: .symphony/codex-automation-review.md
+  output_review_history_file: .symphony/codex-automation-review-history.md
 ```
 
-`workspace_subdir`, `output_plan_file`, and `output_result_file` must be non-empty,
-safe workspace-relative POSIX paths; absolute paths, parent traversal, backslashes,
-and the workspace root itself are rejected. When automation is enabled, its plan and
-result paths must be distinct, outside the automation checkout, and different from
-every configured Codex artifact path. The checkout cannot use the reserved
-`.symphony/` tree or overlap a runtime repository. Both prompts must be nonblank.
+`workspace_subdir` and every automation output path must be a non-empty, safe
+workspace-relative POSIX path; absolute paths, parent traversal, backslashes, and the
+workspace root itself are rejected. When automation is enabled, its output paths must
+be distinct, outside the automation checkout, and different from every configured
+Codex artifact path. The checkout cannot use the reserved `.symphony/` tree or
+overlap a runtime repository. Planning, implementation, and review prompts must be
+nonblank.
 The checked-in workflow enables this phase and prepares `automation/` from
 `/home/adkuppa/CPM` at `master` on a branch named exactly for the Jira key. The clone
 copies Git objects instead of hard-linking them and removes the local source checkout

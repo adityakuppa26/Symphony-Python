@@ -396,6 +396,7 @@ class AutomationConfig(BaseModel):
 
     enabled: bool = False
     workspace_subdir: Path = Path("automation")
+    require_plan_approval: bool = False
     planning_prompt: str = (
         "After development, inspect the canonical Jira requirements, the exact "
         "approved development PlanSpec, the development result and code changes, "
@@ -413,6 +414,19 @@ class AutomationConfig(BaseModel):
     )
     output_plan_file: str = ".symphony/codex-automation-plan.md"
     output_result_file: str = ".symphony/codex-automation-final.md"
+    review_after_run: bool = False
+    review_prompt: str = (
+        "Review only the automation changes for this Jira issue against the exact "
+        "approved AutomationPlan and implemented development behavior. Return JSON "
+        "with decision 'approve', 'changes_required', "
+        "'automation_plan_changes_required', or 'plan_changes_required', a findings "
+        "array, and residual_risk."
+    )
+    max_review_iterations: int = 1
+    output_review_file: str = ".symphony/codex-automation-review.md"
+    output_review_history_file: str = (
+        ".symphony/codex-automation-review-history.md"
+    )
 
     @field_validator("workspace_subdir")
     @classmethod
@@ -421,18 +435,32 @@ class AutomationConfig(BaseModel):
             normalize_automation_relative_path(value, "workspace_subdir")
         )
 
-    @field_validator("output_plan_file", "output_result_file")
+    @field_validator(
+        "output_plan_file",
+        "output_result_file",
+        "output_review_file",
+        "output_review_history_file",
+    )
     @classmethod
     def safe_output_file(cls, value: str, info) -> str:
         return normalize_automation_relative_path(value, info.field_name)
 
-    @field_validator("planning_prompt", "implementation_prompt")
+    @field_validator("planning_prompt", "implementation_prompt", "review_prompt")
     @classmethod
     def prompt_not_blank(cls, value: str, info) -> str:
         normalized = value.strip()
         if not normalized or "\x00" in normalized:
             raise ValueError(f"automation.{info.field_name} must be non-empty")
         return normalized
+
+    @field_validator("max_review_iterations")
+    @classmethod
+    def non_negative_review_iterations(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(
+                "automation.max_review_iterations must be non-negative"
+            )
+        return value
 
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -753,18 +781,28 @@ class WorkflowConfig(BaseModel):
 
         plan_path = Path(self.automation.output_plan_file)
         result_path = Path(self.automation.output_result_file)
+        review_path = Path(self.automation.output_review_file)
+        review_history_path = Path(
+            self.automation.output_review_history_file
+        )
+        automation_artifacts = (
+            ("output_plan_file", plan_path),
+            ("output_result_file", result_path),
+            ("output_review_file", review_path),
+            ("output_review_history_file", review_history_path),
+        )
         def paths_overlap(left: Path, right: Path) -> bool:
             return left == right or left in right.parents or right in left.parents
 
-        if paths_overlap(plan_path, result_path):
-            raise ValueError(
-                "automation.output_plan_file and automation.output_result_file "
-                "must not overlap"
-            )
-        for field_name, artifact_path in (
-            ("output_plan_file", plan_path),
-            ("output_result_file", result_path),
+        for index, (field_name, artifact_path) in enumerate(
+            automation_artifacts
         ):
+            for other_name, other_path in automation_artifacts[index + 1 :]:
+                if paths_overlap(artifact_path, other_path):
+                    raise ValueError(
+                        f"automation.{field_name} and automation.{other_name} "
+                        "must not overlap"
+                    )
             if artifact_path == repository or repository in artifact_path.parents:
                 raise ValueError(
                     f"automation.{field_name} must be outside the automation checkout"
@@ -790,10 +828,7 @@ class WorkflowConfig(BaseModel):
                 ),
             )
         }
-        for field_name, artifact_path in (
-            ("output_plan_file", plan_path),
-            ("output_result_file", result_path),
-        ):
+        for field_name, artifact_path in automation_artifacts:
             for codex_path, codex_field in codex_artifacts.items():
                 if paths_overlap(artifact_path, codex_path):
                     raise ValueError(

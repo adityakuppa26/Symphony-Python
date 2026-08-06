@@ -33,6 +33,16 @@ class ConfigTests(unittest.TestCase):
             automation.output_result_file,
             ".symphony/codex-automation-final.md",
         )
+        self.assertFalse(automation.require_plan_approval)
+        self.assertFalse(automation.review_after_run)
+        self.assertEqual(
+            automation.output_review_file,
+            ".symphony/codex-automation-review.md",
+        )
+        self.assertEqual(
+            automation.output_review_history_file,
+            ".symphony/codex-automation-review-history.md",
+        )
         self.assertIn("no-op", automation.planning_prompt)
         self.assertIn("no-op", automation.implementation_prompt)
         self.assertFalse(WorkflowConfig().automation.enabled)
@@ -42,6 +52,8 @@ class ConfigTests(unittest.TestCase):
             "workspace_subdir",
             "output_plan_file",
             "output_result_file",
+            "output_review_file",
+            "output_review_history_file",
         ):
             for value in (
                 "",
@@ -61,6 +73,8 @@ class ConfigTests(unittest.TestCase):
             workspace_subdir=" ./checks/automation ",
             output_plan_file=" .symphony/./automation-plan.md ",
             output_result_file=" artifacts//automation-final.md ",
+            output_review_file=" .symphony/./automation-review.md ",
+            output_review_history_file=" .symphony/automation//history.md ",
         )
 
         self.assertEqual(automation.workspace_subdir, Path("checks/automation"))
@@ -72,13 +86,27 @@ class ConfigTests(unittest.TestCase):
             automation.output_result_file,
             "artifacts/automation-final.md",
         )
+        self.assertEqual(
+            automation.output_review_file,
+            ".symphony/automation-review.md",
+        )
+        self.assertEqual(
+            automation.output_review_history_file,
+            ".symphony/automation/history.md",
+        )
 
     def test_automation_prompts_must_be_non_blank(self) -> None:
-        for field_name in ("planning_prompt", "implementation_prompt"):
+        for field_name in (
+            "planning_prompt",
+            "implementation_prompt",
+            "review_prompt",
+        ):
             for value in ("", " ", "\x00"):
                 with self.subTest(field_name=field_name, value=value):
                     with self.assertRaises(ValueError):
                         AutomationConfig(**{field_name: value})
+        with self.assertRaises(ValueError):
+            AutomationConfig(max_review_iterations=-1)
 
     def test_enabled_automation_artifacts_must_use_a_separate_layout(self) -> None:
         with self.assertRaisesRegex(ValueError, "stored under .symphony"):
@@ -106,7 +134,12 @@ class ConfigTests(unittest.TestCase):
                 )
             )
 
-        for field_name in ("output_plan_file", "output_result_file"):
+        for field_name in (
+            "output_plan_file",
+            "output_result_file",
+            "output_review_file",
+            "output_review_history_file",
+        ):
             with self.subTest(artifact_inside_checkout=field_name):
                 with self.assertRaisesRegex(
                     ValueError,

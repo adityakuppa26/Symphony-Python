@@ -186,6 +186,49 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        elif action == "approve_automation_plan":
+            if run.blocked_phase != "automation_planning_approval":
+                raise HTTPException(
+                    status_code=409,
+                    detail="this run is not waiting for automation plan approval",
+                )
+            if not (
+                workflow.config.automation.enabled
+                and workflow.config.automation.require_plan_approval
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="automation plan approval is not enabled for this workflow",
+                )
+            if not approver_identity:
+                raise HTTPException(
+                    status_code=400,
+                    detail="approver identity is required",
+                )
+            try:
+                binding = prepare_automation_plan_approval_context(
+                    run,
+                    workflow,
+                    store,
+                )
+                record, approval = store.add_approved_automation_human_input(
+                    run.issue_identifier,
+                    run_id=run.id,
+                    question=run.error,
+                    approver_identity=approver_identity,
+                    **binding,
+                )
+            except (
+                HumanReviewContextError,
+                PlanSpecError,
+                StoreIntegrityError,
+            ) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"the automation plan cannot be approved: {exc}",
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         elif action == "bypass_verification":
             if (
                 run.blocked_phase not in VERIFICATION_BYPASS_PHASES
@@ -241,7 +284,13 @@ def create_app(
                         "approved_at",
                         "plan_spec_hash",
                         "requirements_snapshot_hash",
+                        "automation_plan_hash",
+                        "development_plan_spec_hash",
+                        "development_plan_approval_id",
+                        "development_workspace_diff_hash",
+                        "automation_repository_diff_hash",
                     )
+                    if key in approval
                 }
             )
         if orchestrator is not None:
@@ -654,6 +703,7 @@ def prepare_bound_automation_context(
     *,
     require_result: bool,
     allow_partial_scope: bool = False,
+    allow_repository_diff_drift: bool = False,
 ) -> dict[str, str | None]:
     """Read automation artifacts only when they match this run's durable binding."""
 
@@ -759,7 +809,10 @@ def prepare_bound_automation_context(
             "validated AutomationPlan does not match the completed run's "
             "development-diff hash"
         )
-    if repository_diff.content_hash != expected_repository_diff_hash:
+    if (
+        repository_diff.content_hash != expected_repository_diff_hash
+        and not allow_repository_diff_drift
+    ):
         raise HumanReviewContextError(
             "automation checkout does not match the completed run's exact "
             "repository-diff hash"
@@ -828,6 +881,102 @@ def prepare_bound_automation_context(
         "automation_plan_hash": expected_hash,
         "automation_plan": plan_content.strip(),
         "automation_result": normalized_result,
+    }
+
+
+def prepare_automation_plan_approval_context(
+    run: RunRecord,
+    workflow: WorkflowDefinition,
+    store: Store,
+) -> dict[str, str | None]:
+    """Revalidate every frozen binding used by an automation-plan approval."""
+
+    try:
+        snapshot_hash = normalize_sha256(
+            str(run.issue_fingerprint or ""),
+            "requirements snapshot hash",
+        )
+        development_plan_hash = normalize_sha256(
+            str(run.plan_spec_hash or ""),
+            "development PlanSpec hash",
+        )
+        development_diff_hash = normalize_sha256(
+            str(run.automation_development_diff_hash or ""),
+            "development workspace diff hash",
+        )
+        repository_diff_hash = normalize_sha256(
+            str(run.automation_repository_diff_hash or ""),
+            "automation repository diff hash",
+        )
+    except ValueError as exc:
+        raise HumanReviewContextError(str(exc)) from exc
+
+    snapshot = store.get_requirements_snapshot(
+        run.issue_identifier,
+        snapshot_hash,
+    )
+    if snapshot is None:
+        raise HumanReviewContextError(
+            "the immutable requirements snapshot for this automation plan is missing"
+        )
+    artifact_error = validate_frozen_snapshot_artifacts(
+        Path(run.workspace_path),
+        snapshot_hash,
+    )
+    if artifact_error:
+        raise HumanReviewContextError(artifact_error)
+
+    development_plan_content = read_frozen_text_artifact(
+        Path(run.workspace_path),
+        workflow.config.codex.output_plan_file,
+        label="automation approval development PlanSpec",
+        required=True,
+    )
+    if not development_plan_content:
+        raise HumanReviewContextError(
+            "automation approval development PlanSpec is missing or empty"
+        )
+    development_plan = parse_dashboard_plan_spec(
+        development_plan_content,
+        run=run,
+        requirements_snapshot=snapshot,
+    )
+    validate_dashboard_plan_binding(
+        development_plan,
+        run=run,
+        requirements_snapshot=snapshot,
+    )
+    if development_plan.content_hash() != development_plan_hash:
+        raise HumanReviewContextError(
+            "development PlanSpec does not match the automation approval binding"
+        )
+
+    development_approval_id = str(run.plan_approval_id or "").strip() or None
+    if workflow.config.codex.require_plan_approval and development_approval_id is None:
+        raise HumanReviewContextError(
+            "automation plan has no persisted development plan approval"
+        )
+
+    automation_context = prepare_bound_automation_context(
+        run,
+        workflow,
+        development_plan,
+        require_result=False,
+        allow_partial_scope=True,
+    )
+    automation_plan_hash = automation_context.get("automation_plan_hash")
+    if not automation_plan_hash or not automation_context.get("automation_plan"):
+        raise HumanReviewContextError(
+            "the exact validated AutomationPlan is missing"
+        )
+
+    return {
+        "automation_plan_hash": automation_plan_hash,
+        "requirements_snapshot_hash": snapshot_hash,
+        "development_plan_spec_hash": development_plan_hash,
+        "development_plan_approval_id": development_approval_id,
+        "development_workspace_diff_hash": development_diff_hash,
+        "automation_repository_diff_hash": repository_diff_hash,
     }
 
 
@@ -967,12 +1116,23 @@ def prepare_human_review_context(
 def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> dict[str, Any]:
     data = run_to_dict(run)
     events = store.list_codex_events(run.id)
+    latest_event_type = events[-1].event_type if events else None
+    current_phase = infer_phase(run, latest_event_type)
     human_inputs = store.list_human_inputs(run_id=run.id)
     plan_approvals = store.list_plan_approvals(run_id=run.id)
     active_plan_approval = store.latest_plan_approval_for_run(run.id, active_only=True)
     resolved_plan_approval = (
         store.get_plan_approval(run.plan_approval_id)
         if run.plan_approval_id
+        else None
+    )
+    automation_plan_approvals = store.list_automation_plan_approvals(run_id=run.id)
+    active_automation_plan_approval = (
+        store.latest_automation_plan_approval_for_run(run.id, active_only=True)
+    )
+    resolved_automation_plan_approval = (
+        store.get_automation_plan_approval(run.automation_plan_approval_id)
+        if run.automation_plan_approval_id
         else None
     )
     source_review_actions = store.list_human_review_actions_for_source_run(run.id)
@@ -998,7 +1158,16 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
         requirements_path is not None and requirements_path.is_file()
     )
     review_path = Path(run.workspace_path) / workflow.config.codex.output_review_file
-    review_history_path = Path(run.workspace_path) / workflow.config.codex.output_review_history_file
+    review_history_path = (
+        Path(run.workspace_path) / workflow.config.codex.output_review_history_file
+    )
+    automation_review_path = (
+        Path(run.workspace_path) / workflow.config.automation.output_review_file
+    )
+    automation_review_history_path = (
+        Path(run.workspace_path)
+        / workflow.config.automation.output_review_history_file
+    )
     automation_plan_path = (
         Path(run.workspace_path) / workflow.config.automation.output_plan_file
     )
@@ -1031,9 +1200,24 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
                 development_plan,
                 require_result=False,
                 allow_partial_scope=(
-                    run.status == "blocked"
-                    and run.blocked_phase
-                    in {"automation_planning", "automation_implementation"}
+                    (
+                        run.status == "blocked"
+                        and run.blocked_phase
+                        in {
+                            "automation_planning",
+                            "automation_planning_approval",
+                            "automation_implementation",
+                        }
+                    )
+                    or (
+                        run.status == "running"
+                        and current_phase
+                        in {"Automation Planning", "Automation Implementation"}
+                    )
+                ),
+                allow_repository_diff_drift=(
+                    run.status == "running"
+                    and current_phase == "Automation Implementation"
                 ),
             )
             automation_plan_content = automation_context["automation_plan"]
@@ -1047,10 +1231,38 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
     automation_review_context_valid = not run.automation_plan_hash or (
         automation_binding_valid and automation_result_content is not None
     )
-    latest_event_type = events[-1].event_type if events else None
+    human_input_actionable = bool(
+        run.status == "blocked"
+        and not human_inputs
+        and store.is_latest_actionable_blocked_run(run.id)
+    )
+    automation_plan_approval_enabled = bool(
+        workflow.config.automation.enabled
+        and workflow.config.automation.require_plan_approval
+    )
     data.update(
         {
-            "current_phase": infer_phase(run, latest_event_type),
+            "current_phase": current_phase,
+            "workflow_progress": automation_workflow_progress(
+                run,
+                current_phase=current_phase,
+                event_types=tuple(event.event_type for event in events),
+                automation_enabled=(
+                    workflow.config.automation.enabled
+                    or bool(run.automation_plan_hash)
+                    or bool(run.automation_development_diff_hash)
+                ),
+                development_approval_required=(
+                    workflow.config.codex.require_plan_approval
+                ),
+                development_review_required=workflow.config.codex.review_after_run,
+                automation_approval_required=(
+                    workflow.config.automation.require_plan_approval
+                ),
+                automation_review_required=(
+                    workflow.config.automation.review_after_run
+                ),
+            ),
             "elapsed_seconds": elapsed_seconds(run),
             "plan_path": str(plan_path),
             "plan_exists": plan_path.exists(),
@@ -1074,6 +1286,28 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
             "review_history_path": str(review_history_path),
             "review_history_exists": review_history_path.exists(),
             "review_history_content": read_text_if_exists(review_history_path),
+            "development_review_path": str(review_path),
+            "development_review_exists": review_path.exists(),
+            "development_review_content": read_text_if_exists(review_path),
+            "development_review_history_path": str(review_history_path),
+            "development_review_history_exists": review_history_path.exists(),
+            "development_review_history_content": read_text_if_exists(
+                review_history_path
+            ),
+            "automation_review_path": str(automation_review_path),
+            "automation_review_exists": automation_review_path.exists(),
+            "automation_review_content": read_text_if_exists(
+                automation_review_path
+            ),
+            "automation_review_history_path": str(
+                automation_review_history_path
+            ),
+            "automation_review_history_exists": (
+                automation_review_history_path.exists()
+            ),
+            "automation_review_history_content": read_text_if_exists(
+                automation_review_history_path
+            ),
             "automation_plan_path": str(automation_plan_path),
             "automation_plan_exists": automation_binding_valid,
             "automation_plan_content": automation_plan_content,
@@ -1090,9 +1324,24 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
             "plan_approvals": plan_approvals,
             "active_plan_approval": active_plan_approval,
             "resolved_plan_approval": resolved_plan_approval,
+            "automation_plan_approvals": automation_plan_approvals,
+            "active_automation_plan_approval": active_automation_plan_approval,
+            "resolved_automation_plan_approval": (
+                resolved_automation_plan_approval
+            ),
             "requirements_snapshot_hash": run.issue_fingerprint,
-            "human_input_pending": run.status == "blocked" and not human_inputs,
+            "human_input_actionable": human_input_actionable,
+            "human_input_pending": human_input_actionable,
             "human_input_submitted": any(item.get("consumed_at") is None for item in human_inputs),
+            "automation_plan_approval_enabled": (
+                automation_plan_approval_enabled
+            ),
+            "automation_plan_approval_actionable": bool(
+                human_input_actionable
+                and run.blocked_phase == "automation_planning_approval"
+                and automation_plan_approval_enabled
+                and automation_binding_valid
+            ),
             "human_review_actions": [
                 summarize_human_review_action(action)
                 for action in source_review_actions
@@ -1116,26 +1365,234 @@ def infer_phase(run: RunRecord, latest_event_type: str | None) -> str:
         return "queued"
     if run.status == "running":
         event_type = str(latest_event_type or "").strip().lower()
+        if event_type.startswith("automation_review."):
+            return "Automation Review"
         if event_type.startswith("automation_planning."):
-            return "automation planning"
+            return "Automation Planning"
         if event_type.startswith("automation_implementation."):
-            return "automation implementation"
+            return "Automation Implementation"
+        if event_type.startswith("development_review."):
+            return "Development Review"
         if event_type.startswith("plan"):
-            return "planning"
+            return "Development Planning"
+        if event_type.startswith("development_implementation."):
+            return "Development Implementation"
         if event_type.startswith(("review", "human_review.")):
-            return "review"
+            return (
+                "Automation Review"
+                if run.automation_result_hash
+                else "Development Review"
+            )
         if event_type:
-            return "implementation"
+            return "Development Implementation"
         return "setup"
     if run.status == "completed":
         return "completed"
     if run.status == "blocked":
-        if run.blocked_phase == "planning_approval":
-            return "plan completed"
-        return "blocked"
+        return {
+            "planning": "Development Planning",
+            "planning_approval": "Dev Approval",
+            "implementation": "Development Implementation",
+            "development_review": "Development Review",
+            "automation_planning": "Automation Planning",
+            "automation_planning_approval": "Automation Approval",
+            "automation_implementation": "Automation Implementation",
+            "automation_review": "Automation Review",
+        }.get(str(run.blocked_phase or ""), "blocked")
     if run.status == "cancelled":
         return "cancelled"
     return "failed"
+
+
+def automation_workflow_progress(
+    run: RunRecord,
+    *,
+    current_phase: str,
+    event_types: tuple[str, ...] = (),
+    automation_enabled: bool,
+    development_approval_required: bool = False,
+    development_review_required: bool = False,
+    automation_approval_required: bool = False,
+    automation_review_required: bool = False,
+) -> str:
+    """Show durable progress through the development and automation gates."""
+
+    if not automation_enabled:
+        return ""
+
+    active_stage = current_phase if run.status == "running" else None
+    blocked_stage = {
+        "planning": "Development Planning",
+        "planning_approval": "Dev Approval",
+        "implementation": "Development Implementation",
+        "development_review": "Development Review",
+        "automation_planning": "Automation Planning",
+        "automation_planning_approval": "Automation Approval",
+        "automation_implementation": "Automation Implementation",
+        "automation_review": "Automation Review",
+    }.get(str(run.blocked_phase or "")) if run.status == "blocked" else None
+
+    normalized_event_types = tuple(
+        str(event_type or "").strip().lower() for event_type in event_types
+    )
+
+    def event_seen(prefix: str) -> bool:
+        return any(
+            event_type.startswith(f"{prefix}.")
+            for event_type in normalized_event_types
+        )
+
+    def event_completed(prefix: str) -> bool:
+        return any(
+            event_type.startswith(f"{prefix}.")
+            and event_type.endswith(("turn.completed", "thread.completed"))
+            for event_type in normalized_event_types
+        )
+
+    development_implementation_seen = event_seen("development_implementation")
+    development_review_seen = event_seen("development_review")
+    automation_planning_seen = event_seen("automation_planning")
+    automation_implementation_seen = event_seen("automation_implementation")
+    automation_review_seen = event_seen("automation_review")
+    later_than_development = bool(
+        run.automation_development_diff_hash
+        or run.automation_plan_hash
+        or run.automation_result_hash
+        or automation_planning_seen
+        or automation_implementation_seen
+        or automation_review_seen
+        or current_phase
+        in {
+            "Automation Planning",
+            "Automation Approval",
+            "Automation Implementation",
+            "Automation Review",
+        }
+    )
+    plan_complete = bool(run.plan_spec_hash) or later_than_development or (
+        run.status == "completed"
+    )
+    development_approval_complete = bool(run.plan_approval_id) or bool(
+        development_approval_required
+        and (
+            development_implementation_seen
+            or development_review_seen
+            or later_than_development
+            or run.status == "completed"
+        )
+    )
+    development_complete = bool(
+        development_review_seen
+        or later_than_development
+        or run.status == "completed"
+    )
+    development_review_complete = bool(
+        event_completed("development_review")
+        or (
+            development_review_required
+            and (later_than_development or run.status == "completed")
+        )
+    )
+    automation_plan_complete = bool(run.automation_plan_hash) or bool(
+        run.automation_result_hash
+    ) or automation_implementation_seen or automation_review_seen or (
+        current_phase in {"Automation Approval", "Automation Implementation", "Automation Review"}
+    )
+    automation_approval_complete = bool(
+        run.automation_plan_approval_id
+        or (
+            automation_approval_required
+            and (
+                automation_implementation_seen
+                or automation_review_seen
+                or run.automation_result_hash
+            )
+        )
+    )
+    automation_implementation_complete = bool(
+        run.automation_result_hash or automation_review_seen
+    )
+    automation_review_complete = bool(
+        event_completed("automation_review")
+        or (
+            automation_review_required
+            and
+            run.status == "completed"
+            and bool(run.automation_result_hash)
+        )
+    )
+
+    def stage(
+        label: str,
+        phase: str,
+        complete: bool,
+        *,
+        required: bool = True,
+    ) -> str:
+        if active_stage == phase:
+            status = "running"
+        elif blocked_stage == phase:
+            if not required and phase in {"Dev Approval", "Automation Approval"}:
+                status = "not required"
+            else:
+                status = (
+                    "awaiting approval"
+                    if run.blocked_phase
+                    in {"planning_approval", "automation_planning_approval"}
+                    else "blocked"
+                )
+        elif complete:
+            status = "done"
+        elif not required:
+            status = "not required"
+        else:
+            status = "pending"
+        return f"{label}: {status}"
+
+    return " → ".join(
+        (
+            stage("Development Planning", "Development Planning", plan_complete),
+            stage(
+                "Dev Approval",
+                "Dev Approval",
+                development_approval_complete,
+                required=development_approval_required,
+            ),
+            stage(
+                "Development Implementation",
+                "Development Implementation",
+                development_complete,
+            ),
+            stage(
+                "Development Review",
+                "Development Review",
+                development_review_complete,
+                required=development_review_required,
+            ),
+            stage(
+                "Automation Planning",
+                "Automation Planning",
+                automation_plan_complete,
+            ),
+            stage(
+                "Automation Approval",
+                "Automation Approval",
+                automation_approval_complete,
+                required=automation_approval_required,
+            ),
+            stage(
+                "Automation Implementation",
+                "Automation Implementation",
+                automation_implementation_complete,
+            ),
+            stage(
+                "Automation Review",
+                "Automation Review",
+                automation_review_complete,
+                required=automation_review_required,
+            ),
+        )
+    )
 
 
 def elapsed_seconds(run: RunRecord) -> float:
@@ -1218,11 +1675,17 @@ def render_run_row(
     automation_cell = (
         f"<td>{render_automation_cell(run)}</td>" if automation_enabled else ""
     )
+    phase_progress = str(run.get("workflow_progress") or "")
+    phase_cell = escape(run.get("current_phase"))
+    if phase_progress:
+        phase_cell += (
+            f'<div class="muted phase-progress">{escape(phase_progress)}</div>'
+        )
     return (
         "<tr>"
         f"<td>{escape(run.get('issue_identifier'))}</td>"
         f"<td>{escape(display_status(run))}</td>"
-        f"<td>{escape(run.get('current_phase'))}</td>"
+        f"<td>{phase_cell}</td>"
         f"<td>{escape(display_blocked_phase(run))}</td>"
         f"<td>{format_elapsed(run.get('elapsed_seconds'))}</td>"
         f"<td><code>{escape(run.get('workspace_path'))}</code></td>"
@@ -1257,13 +1720,51 @@ def format_elapsed(value: Any) -> str:
 
 
 def render_review_cell(run: dict[str, Any]) -> str:
-    if not run.get("review_exists"):
-        return "none"
-    content = str(run.get("review_content") or "")
-    return (
-        f"<code>{escape(run.get('review_path'))}</code>"
-        f"{render_long_text_cell(content, 'Show review', force_details=True) if content else ''}"
-    )
+    sections: list[str] = []
+    for label, prefix in (
+        ("Development Review", "development_review"),
+        ("Automation Review", "automation_review"),
+    ):
+        artifacts: list[str] = []
+        if run.get(f"{prefix}_exists"):
+            content = str(run.get(f"{prefix}_content") or "")
+            artifacts.append(
+                "<div>Artifact: "
+                f"<code>{escape(run.get(f'{prefix}_path'))}</code>"
+                + (
+                    render_long_text_cell(
+                        content,
+                        f"Show {label.lower()}",
+                        force_details=True,
+                    )
+                    if content
+                    else ""
+                )
+                + "</div>"
+            )
+        if run.get(f"{prefix}_history_exists"):
+            history_content = str(
+                run.get(f"{prefix}_history_content") or ""
+            )
+            artifacts.append(
+                "<div>History: "
+                f"<code>{escape(run.get(f'{prefix}_history_path'))}</code>"
+                + (
+                    render_long_text_cell(
+                        history_content,
+                        f"Show {label.lower()} history",
+                        force_details=True,
+                    )
+                    if history_content
+                    else ""
+                )
+                + "</div>"
+            )
+        if artifacts:
+            sections.append(
+                f"<div><strong>{escape(label)}</strong>{''.join(artifacts)}</div>"
+            )
+    return "".join(sections) or "none"
 
 
 def render_plan_cell(run: dict[str, Any]) -> str:
@@ -1655,23 +2156,35 @@ def counted_label(count: int, singular: str, plural: str | None = None) -> str:
 
 
 def display_blocked_phase(run: dict[str, Any]) -> str:
-    if run.get("blocked_phase") == "planning_approval":
-        return "plan completed"
     phase = str(run.get("blocked_phase") or "")
     return {
-        "automation_planning": "automation planning",
-        "automation_implementation": "automation implementation",
+        "planning": "Development Planning",
+        "planning_approval": "Dev Approval",
+        "implementation": "Development Implementation",
+        "development_review": "Development Review",
+        "automation_planning": "Automation Planning",
+        "automation_planning_approval": "Automation Approval",
+        "automation_implementation": "Automation Implementation",
+        "automation_review": "Automation Review",
     }.get(phase, phase)
 
 
 def display_status(run: dict[str, Any]) -> str:
     if run.get("status") == "blocked" and run.get("blocked_phase") == "planning_approval":
         return "plan completed"
+    if (
+        run.get("status") == "blocked"
+        and run.get("blocked_phase") == "automation_planning_approval"
+    ):
+        return "automation plan completed"
     return str(run.get("status") or "")
 
 
 def display_error(run: dict[str, Any]) -> str:
-    if run.get("blocked_phase") == "planning_approval":
+    if run.get("blocked_phase") in {
+        "planning_approval",
+        "automation_planning_approval",
+    }:
         return ""
     return str(run.get("error") or "")
 
@@ -1679,6 +2192,15 @@ def display_error(run: dict[str, Any]) -> str:
 def display_final_message(run: dict[str, Any]) -> str:
     final_message = str(run.get("final_message") or "")
     plan_content = str(run.get("plan_content") or "")
+    if run.get("blocked_phase") == "automation_planning_approval":
+        if str(run.get("automation_plan_summary") or "").strip() in {
+            "",
+            AUTOMATION_PLAN_SUMMARY_UNAVAILABLE,
+        }:
+            return "Automation plan details could not be validated for this run."
+        return (
+            "Automation plan ready for approval. See the brief Automation summary."
+        )
     if run.get("blocked_phase") == "planning_approval" or (
         final_message.strip()
         and plan_content.strip()
@@ -1734,7 +2256,23 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
         latest = inputs[0]
         state = "queued for resume" if latest.get("consumed_at") is None else "consumed"
         approval_details = ""
-        if latest.get("approval_id"):
+        if latest.get("automation_plan_approval_id"):
+            approval_details = (
+                f"<div>Automation plan approved by "
+                f"{escape(latest.get('approver_identity'))} "
+                f"at {escape(latest.get('automation_approved_at'))}</div>"
+                f"<div class=\"muted\">AutomationPlan: "
+                f"<code>{escape(latest.get('automation_plan_hash'))}</code><br>"
+                "Development PlanSpec: "
+                f"<code>{escape(latest.get('development_plan_spec_hash'))}</code><br>"
+                "Requirements snapshot: "
+                f"<code>{escape(latest.get('automation_requirements_snapshot_hash'))}</code><br>"
+                "Development diff: "
+                f"<code>{escape(latest.get('development_workspace_diff_hash'))}</code><br>"
+                "Automation repository diff: "
+                f"<code>{escape(latest.get('automation_repository_diff_hash'))}</code></div>"
+            )
+        elif latest.get("approval_id"):
             approval_details = (
                 f"<div>Approved by {escape(latest.get('approver_identity'))} "
                 f"at {escape(latest.get('approved_at'))}</div>"
@@ -1744,11 +2282,15 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
             )
         elif latest.get("action") == "verification_bypass":
             approval_details = (
-                f"<div>Verification override approved by "
+                f"<div>Test/runtime verification override approved by "
                 f"{escape(latest.get('approver_identity'))}</div>"
-                f"<div class=\"muted\">Workspace diff: "
+                f"<div class=\"muted\">Original verification status: "
+                f"<code>{escape(run.get('verification_status'))}</code><br>"
+                "Original verification evidence: "
+                f"<code>{escape(run.get('verification_output_path'))}</code><br>"
+                "Workspace diff: "
                 f"<code>{escape(latest.get('workspace_diff_hash'))}</code><br>"
-                "Verification evidence: "
+                "Verification evidence hash: "
                 f"<code>{escape(latest.get('verification_evidence_sha256'))}</code></div>"
             )
         return (
@@ -1756,6 +2298,8 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
             + f"<strong>{escape(state)}</strong>{approval_details}"
             f"<pre>{escape((latest.get('response') or '')[:500])}</pre>"
         )
+    if not run.get("human_input_actionable"):
+        return review_lineage or "none"
     action_url = f"/api/v1/runs/{escape(run.get('id'))}/human-input"
     if run.get("blocked_phase") == "planning_approval":
         snapshot_hash = escape(run.get("requirements_snapshot_hash"))
@@ -1774,6 +2318,48 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
             "<button type=\"submit\">Request Adjustments</button>"
             "</form></div>"
         )
+    if run.get("blocked_phase") == "automation_planning_approval":
+        adjustment_form = (
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input type=\"hidden\" name=\"action\" value=\"feedback\">"
+            "<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
+            "placeholder=\"Describe requested automation-plan adjustments\"></textarea><br>"
+            "<button type=\"submit\">Request Automation Plan Adjustments</button>"
+            "</form>"
+        )
+        if not run.get("automation_plan_approval_actionable"):
+            reason = (
+                "The automation approval gate is disabled in the active workflow."
+                if not run.get("automation_plan_approval_enabled")
+                else "The exact AutomationPlan binding could not be validated."
+            )
+            return review_lineage + (
+                "<div><strong>Automation plan approval unavailable</strong>"
+                f"<div class=\"muted\">{escape(reason)} Request adjustments "
+                "to return the run to automation planning.</div>"
+                f"{adjustment_form}</div>"
+            )
+        return review_lineage + (
+            "<div><strong>Approve the exact validated AutomationPlan</strong>"
+            f"<div class=\"muted\">AutomationPlan: "
+            f"<code>{escape(run.get('automation_plan_hash'))}</code><br>"
+            "Requirements snapshot: "
+            f"<code>{escape(run.get('requirements_snapshot_hash'))}</code><br>"
+            "Development PlanSpec: "
+            f"<code>{escape(run.get('plan_spec_hash'))}</code><br>"
+            "Development diff: "
+            f"<code>{escape(run.get('automation_development_diff_hash'))}</code><br>"
+            "Automation repository diff: "
+            f"<code>{escape(run.get('automation_repository_diff_hash'))}</code></div>"
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input type=\"hidden\" name=\"action\" "
+            "value=\"approve_automation_plan\">"
+            "<input name=\"approver_identity\" required "
+            "placeholder=\"Authenticated reviewer identity\">"
+            "<button type=\"submit\">Approve Exact Automation Plan</button>"
+            "</form>"
+            f"{adjustment_form}</div>"
+        )
     if (
         run.get("blocked_phase") in VERIFICATION_BYPASS_PHASES
         and run.get("verification_status") not in {None, "passed", "not_configured"}
@@ -1791,20 +2377,30 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
             and is_sha256(run.get("verification_evidence_sha256"))
         ):
             return review_lineage + (
-                "<div><strong>Verification did not pass</strong>"
-                "<div class=\"muted\">This run predates verification-time "
+                "<div><strong>Required test/runtime verification did not pass</strong>"
+                f"<div class=\"muted\">Original status: "
+                f"<code>{escape(run.get('verification_status'))}</code><br>"
+                "Evidence: "
+                f"<code>{escape(run.get('verification_output_path'))}</code><br>"
+                "This run predates verification-time "
                 "integrity binding and cannot be safely bypassed. Retry Verification "
                 "to establish the code and evidence binding first.</div>"
                 f"{retry_form}</div>"
             )
         return review_lineage + (
-            "<div><strong>Verification did not pass</strong>"
-            "<div class=\"muted\">An explicit human override can hand off the "
-            "existing changes. The failed verification result stays in run history.</div>"
+            "<div><strong>Required test/runtime verification did not pass</strong>"
+            f"<div class=\"muted\">Original status: "
+            f"<code>{escape(run.get('verification_status'))}</code><br>"
+            "Evidence: "
+            f"<code>{escape(run.get('verification_output_path'))}</code><br>"
+            "An explicit human approval records a test/runtime override and "
+            "continues to the configured review. It does not mark verification "
+            "as passed; the original status and evidence remain visible.</div>"
             f"<form method=\"post\" action=\"{action_url}\">"
             "<input type=\"hidden\" name=\"action\" value=\"bypass_verification\">"
-            "<input name=\"approver_identity\" required placeholder=\"Approver identity\">"
-            "<button type=\"submit\">Bypass Verification and Hand Off</button>"
+            "<input name=\"approver_identity\" required "
+            "placeholder=\"Authenticated reviewer identity\">"
+            "<button type=\"submit\">Approve Test/Runtime Override and Continue to Review</button>"
             "</form>"
             f"{retry_form}</div>"
         )
