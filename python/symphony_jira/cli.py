@@ -7,11 +7,11 @@ import os
 import sys
 from pathlib import Path
 
-from .attachment_analysis import build_attachment_analyzer
 from .config import resolve_configured_secret, validate_preflight
 from .dashboard import create_app
 from .jira import JiraClient
 from .orchestrator import PollingOrchestrator, SingleIssueOrchestrator, assert_issue_eligible
+from .runtime import RuntimeManager
 from .store import Store
 from .workflow import WorkflowError, load_workflow, render_prompt
 
@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(command_run(args))
         if args.command == "dashboard":
             return command_dashboard(args)
+        if args.command == "runtime":
+            return asyncio.run(command_runtime(args))
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -56,6 +58,37 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("workflow")
     dashboard.add_argument("--port", type=int, default=3333)
     dashboard.add_argument("--host", default="127.0.0.1")
+
+    runtime = subparsers.add_parser(
+        "runtime", help="verify, preview, or shut down a configured local runtime"
+    )
+    runtime.add_argument("workflow")
+    runtime.add_argument("action", choices=("verify", "start", "stop", "shutdown"))
+    runtime.add_argument("--workspace", required=True)
+    runtime.add_argument(
+        "--repository",
+        action="append",
+        required=True,
+        help=(
+            "target repository; repeat for shutdown (verify/start/stop require "
+            "exactly one)"
+        ),
+    )
+    runtime.add_argument(
+        "--source-repository",
+        action="append",
+        default=[],
+        help="workspace repository to bind (repeatable; defaults to all configured repositories)",
+    )
+    runtime.add_argument(
+        "--target-arg",
+        action="append",
+        default=[],
+        help=(
+            "verification argument appended to the fixed profile command; supplied "
+            "values replace profile default_args (repeatable)"
+        ),
+    )
     return parser
 
 
@@ -76,10 +109,7 @@ async def command_once(args: argparse.Namespace) -> int:
         workflow.path,
         workflow.config,
         check_jira_credentials=True,
-        check_codex=(
-            not args.dry_run
-            or workflow.config.tracker.requirements.attachment_analyzer == "codex"
-        ),
+        check_codex=not args.dry_run,
     )
     if preflight:
         for issue in preflight:
@@ -87,11 +117,9 @@ async def command_once(args: argparse.Namespace) -> int:
         return 1
 
     store = Store(workflow.path.parent / ".symphony" / "symphony.sqlite3")
-    attachment_analyzer = build_attachment_analyzer(workflow)
     async with JiraClient(
         workflow.config.tracker,
         environ=os.environ,
-        attachment_analyzer=attachment_analyzer,
     ) as jira:
         if not args.issue:
             if not args.dry_run:
@@ -169,11 +197,9 @@ async def command_run(args: argparse.Namespace) -> int:
         return 1
 
     store = Store(workflow.path.parent / ".symphony" / "symphony.sqlite3")
-    attachment_analyzer = build_attachment_analyzer(workflow)
     async with JiraClient(
         workflow.config.tracker,
         environ=os.environ,
-        attachment_analyzer=attachment_analyzer,
     ) as jira:
         orchestrator = PollingOrchestrator(workflow, jira, store, secret_values=secret_values_for(workflow))
         if args.poll_once:
@@ -196,6 +222,84 @@ def command_dashboard(args: argparse.Namespace) -> int:
         raise RuntimeError("uvicorn is not installed. Install package dependencies first.") from exc
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
+
+
+async def command_runtime(args: argparse.Namespace) -> int:
+    """Run an operator runtime action without Jira or Codex preflight."""
+
+    if args.action != "verify" and args.target_arg:
+        raise ValueError("--target-arg is valid only for the runtime verify action")
+    if args.action != "shutdown" and len(args.repository) != 1:
+        raise ValueError(
+            "runtime verify, start, and stop require exactly one --repository"
+        )
+
+    workflow = load_workflow(args.workflow)
+    runtime = RuntimeManager(
+        workflow.config.runtime,
+        environ=os.environ,
+        excluded_environment_names={
+            workflow.config.tracker.auth.token_env,
+            workflow.config.tracker.auth.email_env,
+        },
+    )
+    workspace = Path(args.workspace).expanduser().resolve()
+    repositories = list(dict.fromkeys(args.repository))
+    source_repositories = args.source_repository or list(
+        workflow.config.runtime.repositories
+    )
+
+    if args.action == "verify":
+        result = await runtime.verify(
+            workspace,
+            repositories[0],
+            target_args=args.target_arg,
+            source_repositories=source_repositories,
+        )
+    elif args.action == "start":
+        result = await runtime.start_preview(
+            workspace,
+            repositories[0],
+            source_repositories=source_repositories,
+        )
+    elif args.action == "stop":
+        result = await runtime.stop_preview(
+            workspace,
+            repositories[0],
+            source_repositories=source_repositories,
+        )
+    else:
+        result = await runtime.shutdown(
+            workspace,
+            repositories,
+            source_repositories=source_repositories,
+        )
+
+    payload = {
+        "status": result.status,
+        "argv": list(result.argv),
+        "returncode": result.returncode,
+        "log_path": str(result.log_path) if result.log_path is not None else None,
+        "message": result.message,
+    }
+    repository = getattr(result, "repository", None)
+    if repository:
+        payload["repository"] = repository
+    shutdown_repositories = getattr(result, "repositories", None)
+    if shutdown_repositories is not None:
+        payload["repositories"] = list(shutdown_repositories)
+        payload["services"] = list(result.services)
+    profile = getattr(result, "profile", None)
+    if profile:
+        payload["profile"] = profile
+    print(json.dumps(payload, sort_keys=True))
+    expected_status = {
+        "verify": "passed",
+        "start": "started",
+        "stop": "stopped",
+        "shutdown": "stopped",
+    }[args.action]
+    return 0 if result.status == expected_status else 1
 
 
 def secret_values_for(workflow) -> list[str | None]:

@@ -13,13 +13,8 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
-
 from .jira import BasicAttachmentAnalyzer
 from .models import AttachmentAnalysis, IssueAttachment
-
-if TYPE_CHECKING:
-    from .workflow import WorkflowDefinition
 
 
 ANALYZER_CONTRACT_VERSION = "symphony-codex-attachment/v2"
@@ -197,7 +192,9 @@ class CodexAttachmentAnalyzer:
             ]
             for image in images:
                 args.extend(["--image", str(image)])
-            args.append(_VISION_PROMPT)
+            # Codex treats --image as variadic, so terminate option parsing before
+            # the positional prompt rather than letting it be consumed as a path.
+            args.extend(["--", _VISION_PROMPT])
 
             process = await self._run_process(args, cwd=temp_dir)
             if process.timed_out:
@@ -436,22 +433,6 @@ class CodexAttachmentAnalyzer:
                     pass
             if directory_fd is not None:
                 os.close(directory_fd)
-
-
-def build_attachment_analyzer(workflow: WorkflowDefinition):
-    requirements = workflow.config.tracker.requirements
-    if requirements.attachment_analyzer == "basic":
-        return BasicAttachmentAnalyzer(
-            max_summary_characters=requirements.attachment_analysis_max_output_characters
-        )
-    return CodexAttachmentAnalyzer(
-        codex_command=workflow.config.codex.command,
-        cache_dir=workflow.path.parent / ".symphony" / "attachment-analysis-cache",
-        timeout_seconds=requirements.attachment_analysis_timeout_seconds,
-        pdf_max_pages=requirements.attachment_pdf_max_pages,
-        max_output_characters=requirements.attachment_analysis_max_output_characters,
-        max_concurrency=requirements.attachment_analysis_max_concurrency,
-    )
 
 
 def _resolve_executable(command: str) -> Path | None:

@@ -73,6 +73,7 @@ class RequirementArtifact(BaseModel):
     value: Any = None
     source: RequirementSource
     kind: RequirementKind = "requirement"
+    planning_eligible: bool = True
 
 
 class RelatedIssue(BaseModel):
@@ -120,7 +121,7 @@ class RequirementDecision(BaseModel):
 class RequirementsSnapshot(BaseModel):
     """Canonical, versioned Jira input used for planning and completed-work identity."""
 
-    schema_version: str = "jira-requirements/v2"
+    schema_version: str = "jira-requirements/v4"
     issue_id: str
     issue_identifier: str
     issue_url: str
@@ -140,6 +141,7 @@ class RequirementsSnapshot(BaseModel):
     inferred_behavior: list[RequirementDecision] = Field(default_factory=list)
     unresolved_contradictions: list[RequirementDecision] = Field(default_factory=list)
     incomplete_reasons: list[str] = Field(default_factory=list)
+    context_warnings: list[str] = Field(default_factory=list)
     content_hash: str = ""
 
     @property
@@ -152,6 +154,44 @@ class RequirementsSnapshot(BaseModel):
         payload = self.model_dump(mode="json", exclude={"captured_at", "content_hash"})
         if self.schema_version == "jira-requirements/v1":
             _remove_absent_v2_source_locations(payload)
+        if self.schema_version in {
+            "jira-requirements/v1",
+            "jira-requirements/v2",
+            "jira-requirements/v3",
+        }:
+            # Preserve hashes for stored snapshots created before contextual
+            # artifacts and warnings were explicitly represented.
+            payload.pop("context_warnings", None)
+            _remove_absent_v3_artifact_eligibility(payload)
+        elif self.schema_version == "jira-requirements/v4":
+            # Context remains in the serialized snapshot for inspection but
+            # does not invalidate an approved plan. Only root Jira product
+            # evidence and its classified decisions are material in v4.
+            for key in (
+                "attachments",
+                "parent",
+                "children",
+                "linked_issues",
+                "dependencies",
+                "components",
+                "versions",
+                "context_warnings",
+            ):
+                payload.pop(key, None)
+            payload["custom_fields"] = [
+                artifact
+                for artifact in payload.get("custom_fields", [])
+                if artifact.get("planning_eligible") is True
+            ]
+            # Jira base URLs, field display names, and rendered unit locations
+            # are derived presentation metadata. Stable issue/source IDs retain
+            # provenance without letting those display-only values invalidate an
+            # approval or completed-work identity.
+            # ``canonical_content`` is also persisted as a round-trippable
+            # RequirementsSnapshot document, so retain this required field with
+            # a deterministic non-authoritative value.
+            payload["issue_url"] = ""
+            _remove_v4_source_presentation_metadata(payload)
         for attachment in payload.get("attachments", []):
             analysis = attachment.get("analysis") or {}
             analysis.pop("generated_at", None)
@@ -213,6 +253,7 @@ class Issue(BaseModel):
     components: list[JiraNamedValue] = Field(default_factory=list)
     versions: list[JiraNamedValue] = Field(default_factory=list)
     provenance_incomplete_reasons: list[str] = Field(default_factory=list)
+    context_warnings: list[str] = Field(default_factory=list)
     requirements_snapshot: RequirementsSnapshot | None = None
     raw: dict[str, Any] | None = None
 
@@ -227,6 +268,10 @@ class RunRecord(BaseModel):
     attempt: int
     started_at: datetime
     plan_spec_hash: str | None = None
+    automation_plan_hash: str | None = None
+    automation_development_diff_hash: str | None = None
+    automation_repository_diff_hash: str | None = None
+    automation_result_hash: str | None = None
     plan_approval_id: str | None = None
     finished_at: datetime | None = None
     final_message: str | None = None
@@ -235,6 +280,8 @@ class RunRecord(BaseModel):
     branch_name: str | None = None
     verification_status: str | None = None
     verification_output_path: str | None = None
+    verification_workspace_diff_hash: str | None = None
+    verification_evidence_sha256: str | None = None
 
 
 class CodexEvent(BaseModel):
@@ -273,13 +320,6 @@ def issue_requirements_fingerprint(issue: Issue) -> str:
             )
         ],
         "custom_fields": issue.custom_fields,
-        "attachments": [attachment.model_dump(mode="json") for attachment in issue.attachments],
-        "parent": issue.parent.model_dump(mode="json") if issue.parent else None,
-        "children": [related.model_dump(mode="json") for related in issue.children],
-        "linked_issues": [related.model_dump(mode="json") for related in issue.linked_issues],
-        "dependencies": [related.model_dump(mode="json") for related in issue.dependencies],
-        "components": [value.model_dump(mode="json") for value in issue.components],
-        "versions": [value.model_dump(mode="json") for value in issue.versions],
     }
     encoded = json.dumps(fallback, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -289,6 +329,167 @@ def issue_description_fingerprint(issue: Issue) -> str:
     """Backward-compatible name; completed-work identity now covers the full bundle."""
 
     return issue_requirements_fingerprint(issue)
+
+
+def requirements_planning_authority_projection(
+    snapshot: RequirementsSnapshot,
+) -> dict[str, Any]:
+    """Project any snapshot version onto the v4 root planning boundary.
+
+    The projection is intentionally narrower than ``canonical_content``.  It is
+    used only to bridge a frozen pre-v4 approval across the schema migration,
+    so attachment and relationship context must disappear while every material
+    root Description, configured Acceptance Criteria, comment, decision, and
+    source-provenance change remains visible.
+    """
+
+    root_issue = snapshot.issue_identifier
+
+    def source_is_root(source: RequirementSource, source_type: str) -> bool:
+        return (
+            source.issue_identifier == root_issue
+            and source.source_type == source_type
+        )
+
+    description = (
+        snapshot.description
+        if snapshot.description is not None
+        and snapshot.description.planning_eligible
+        and source_is_root(snapshot.description.source, "description")
+        else None
+    )
+    acceptance_criteria = [
+        artifact
+        for artifact in snapshot.custom_fields
+        if artifact.planning_eligible
+        and artifact.kind == "acceptance_criterion"
+        and artifact.source_type == "custom_field"
+        and source_is_root(artifact.source, "custom_field")
+    ]
+    comments = [
+        artifact
+        for artifact in snapshot.comments
+        if artifact.planning_eligible
+        and artifact.source_type == "comment"
+        and source_is_root(artifact.source, "comment")
+    ]
+    artifacts = (
+        ([description] if description is not None else [])
+        + acceptance_criteria
+        + comments
+    )
+    source_bases = {
+        (artifact.source.source_type, artifact.source.source_id)
+        for artifact in artifacts
+    }
+
+    def source_is_authoritative(source: RequirementSource) -> bool:
+        return source.issue_identifier == root_issue and any(
+            source.source_type == source_type
+            and (
+                source.source_id == source_id
+                or source.source_id.startswith(f"{source_id}#unit:")
+            )
+            for source_type, source_id in source_bases
+        )
+
+    def source_payload(source: RequirementSource) -> dict[str, Any]:
+        # URL, display name, and location are derived presentation metadata.
+        # The stable source identity and its provenance remain material.
+        return {
+            "issue_identifier": source.issue_identifier,
+            "source_type": source.source_type,
+            "source_id": source.source_id,
+            "field_id": source.field_id,
+            "author": source.author,
+            "timestamp": (
+                source.timestamp.isoformat() if source.timestamp else None
+            ),
+            "authority": source.authority,
+        }
+
+    def artifact_payload(artifact: RequirementArtifact) -> dict[str, Any]:
+        return {
+            "artifact_id": artifact.artifact_id,
+            "source_type": artifact.source_type,
+            "text": artifact.text,
+            "value": artifact.value,
+            "source": source_payload(artifact.source),
+            "kind": artifact.kind,
+        }
+
+    def decision_payload(decision: RequirementDecision) -> dict[str, Any] | None:
+        sources = [
+            source_payload(source)
+            for source in decision.sources
+            if source_is_authoritative(source)
+        ]
+        if not sources:
+            return None
+        sources.sort(
+            key=lambda source: (
+                str(source["issue_identifier"]),
+                str(source["source_type"]),
+                str(source["source_id"]),
+            )
+        )
+        return {
+            "id": decision.id,
+            "text": decision.text,
+            "kind": decision.kind,
+            "classification": decision.classification,
+            "sources": sources,
+            "supersedes": sorted(decision.supersedes),
+            "superseded_by": sorted(decision.superseded_by),
+        }
+
+    def decisions_payload(
+        decisions: list[RequirementDecision],
+    ) -> list[dict[str, Any]]:
+        projected = [decision_payload(decision) for decision in decisions]
+        return sorted(
+            (decision for decision in projected if decision is not None),
+            key=lambda decision: str(decision["id"]),
+        )
+
+    return {
+        "schema_version": "jira-planning-authority/v4",
+        "issue_id": snapshot.issue_id,
+        "issue_identifier": root_issue,
+        "description": (
+            artifact_payload(description) if description is not None else None
+        ),
+        "acceptance_criteria": sorted(
+            (artifact_payload(artifact) for artifact in acceptance_criteria),
+            key=lambda artifact: str(artifact["artifact_id"]),
+        ),
+        "comments": sorted(
+            (artifact_payload(artifact) for artifact in comments),
+            key=lambda artifact: str(artifact["artifact_id"]),
+        ),
+        "current_requirements": decisions_payload(
+            snapshot.current_requirements
+        ),
+        "superseded_requirements": decisions_payload(
+            snapshot.superseded_requirements
+        ),
+        "inferred_behavior": decisions_payload(snapshot.inferred_behavior),
+        "unresolved_contradictions": decisions_payload(
+            snapshot.unresolved_contradictions
+        ),
+    }
+
+
+def requirements_planning_authority_equivalent(
+    previous: RequirementsSnapshot,
+    current: RequirementsSnapshot,
+) -> bool:
+    """Return true only when both snapshots have identical v4 planning meaning."""
+
+    return (
+        requirements_planning_authority_projection(previous)
+        == requirements_planning_authority_projection(current)
+    )
 
 
 def _remove_absent_v2_source_locations(value: Any) -> None:
@@ -302,6 +503,33 @@ def _remove_absent_v2_source_locations(value: Any) -> None:
     elif isinstance(value, list):
         for child in value:
             _remove_absent_v2_source_locations(child)
+
+
+def _remove_absent_v3_artifact_eligibility(value: Any) -> None:
+    """Keep pre-v4 canonical JSON free of fields introduced in v4."""
+
+    if isinstance(value, dict):
+        value.pop("planning_eligible", None)
+        for child in value.values():
+            _remove_absent_v3_artifact_eligibility(child)
+    elif isinstance(value, list):
+        for child in value:
+            _remove_absent_v3_artifact_eligibility(child)
+
+
+def _remove_v4_source_presentation_metadata(value: Any) -> None:
+    """Remove derived display fields from v4 requirement-source payloads."""
+
+    if isinstance(value, dict):
+        if {"issue_identifier", "source_type", "source_id"}.issubset(value):
+            value.pop("field_name", None)
+            value.pop("url", None)
+            value.pop("location", None)
+        for child in value.values():
+            _remove_v4_source_presentation_metadata(child)
+    elif isinstance(value, list):
+        for child in value:
+            _remove_v4_source_presentation_metadata(child)
 
 
 def diff_requirements_snapshots(
@@ -380,6 +608,8 @@ def _sort_snapshot_lists(payload: dict[str, Any]) -> None:
     if parent:
         sort_related(parent)
     payload["incomplete_reasons"] = sorted(payload.get("incomplete_reasons") or [])
+    if "context_warnings" in payload:
+        payload["context_warnings"] = sorted(payload.get("context_warnings") or [])
     for section in (
         "current_requirements",
         "superseded_requirements",

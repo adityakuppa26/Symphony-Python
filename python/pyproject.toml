@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["httpx2>=2.0", "pytest>=8.0"]
 
 [project.scripts]
 symphony-jira = "symphony_jira.cli:main"

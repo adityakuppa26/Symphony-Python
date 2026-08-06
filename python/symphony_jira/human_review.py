@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from .requirements_artifacts import (
 WORKSPACE_DIFF_TIMEOUT_SECONDS = 15.0
 MAX_FROZEN_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_WORKSPACE_DIFF_BYTES = 16 * 1024 * 1024
+MAX_VERIFICATION_EVIDENCE_BYTES = 16 * 1024 * 1024
 
 
 class HumanReviewContextError(RuntimeError):
@@ -38,6 +40,8 @@ def capture_workspace_diff(
     workspace_path: Path,
     plan_spec: PlanSpec,
     *,
+    managed_repositories: tuple[str | Path, ...] = (),
+    include_plan_repositories: bool = True,
     timeout_seconds: float = WORKSPACE_DIFF_TIMEOUT_SECONDS,
 ) -> WorkspaceDiffSnapshot:
     """Capture a deterministic multi-repository diff and untracked-file digest."""
@@ -45,12 +49,20 @@ def capture_workspace_diff(
     workspace_root = workspace_path.resolve()
     digest = hashlib.sha256()
     sections: list[str] = []
-    baselines = sorted(
-        plan_spec.baseline_repository_shas,
-        key=lambda baseline: baseline.repository,
+    baseline_shas = (
+        {
+            baseline.repository.strip(): baseline.sha
+            for baseline in plan_spec.baseline_repository_shas
+        }
+        if include_plan_repositories
+        else {}
     )
-    for baseline in baselines:
-        repository_name = baseline.repository.strip()
+    repository_names = set(baseline_shas)
+    repository_names.update(
+        Path(repository).as_posix()
+        for repository in managed_repositories
+    )
+    for repository_name in sorted(repository_names):
         repository_path = (workspace_root / repository_name).resolve()
         try:
             repository_path.relative_to(workspace_root)
@@ -73,10 +85,11 @@ def capture_workspace_diff(
             f"Git HEAD for review repository {repository_name!r}",
         )
         actual_head = actual_head_output.decode("ascii", errors="strict").strip()
-        if actual_head != baseline.sha:
+        baseline_sha = baseline_shas.get(repository_name)
+        if baseline_sha is not None and actual_head != baseline_sha:
             raise HumanReviewContextError(
                 f"review repository {repository_name!r} moved from approved HEAD "
-                f"{baseline.sha} to {actual_head or 'unknown'}"
+                f"{baseline_sha} to {actual_head or 'unknown'}"
             )
 
         status_output = _run_git_bytes(
@@ -291,6 +304,148 @@ def read_frozen_text_artifact(
 ) -> str | None:
     """Read a retained text artifact without following links or special files."""
 
+    content = read_frozen_artifact_bytes(
+        workspace_path,
+        artifact_path,
+        label=label,
+        required=required,
+        max_bytes=max_bytes,
+    )
+    if content is None:
+        return None
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HumanReviewContextError(f"{label} is not valid UTF-8") from exc
+
+
+def write_frozen_text_artifact(
+    workspace_path: Path,
+    artifact_path: str | Path,
+    content: str,
+    *,
+    label: str,
+    max_bytes: int = MAX_FROZEN_ARTIFACT_BYTES,
+) -> None:
+    """Atomically write a workspace artifact without following links."""
+
+    relative_path = Path(artifact_path)
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+    ):
+        raise HumanReviewContextError(
+            f"{label} path must be a safe workspace-relative path: {artifact_path}"
+        )
+    encoded = content.encode("utf-8")
+    if max_bytes <= 0:
+        raise ValueError("frozen artifact byte limit must be positive")
+    if len(encoded) > max_bytes:
+        raise HumanReviewContextError(
+            f"{label} exceeds the {max_bytes}-byte retained-artifact limit"
+        )
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise HumanReviewContextError(
+            "secure retained-artifact writes are unavailable on this platform"
+        )
+
+    opened_fds: list[int] = []
+    temporary_name: str | None = None
+    parent_fd: int | None = None
+    try:
+        root_fd = os.open(
+            os.path.abspath(os.fspath(workspace_path)),
+            os.O_RDONLY | directory | nofollow,
+        )
+        opened_fds.append(root_fd)
+        parent_fd = root_fd
+        for part in relative_path.parts[:-1]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            parent_fd = os.open(
+                part,
+                os.O_RDONLY | directory | nofollow,
+                dir_fd=parent_fd,
+            )
+            opened_fds.append(parent_fd)
+            metadata = os.fstat(parent_fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise HumanReviewContextError(
+                    f"{label} parent is not a directory"
+                )
+            if metadata.st_uid != os.geteuid():
+                raise HumanReviewContextError(
+                    f"{label} parent is not owned by the current user"
+                )
+
+        leaf_name = relative_path.parts[-1]
+        temporary_name = f".{leaf_name}.tmp-{secrets.token_hex(12)}"
+        artifact_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        opened_fds.append(artifact_fd)
+        remaining = memoryview(encoded)
+        while remaining:
+            written = os.write(artifact_fd, remaining)
+            if written <= 0:
+                raise HumanReviewContextError(f"could not safely write {label}")
+            remaining = remaining[written:]
+        os.fsync(artifact_fd)
+        metadata = os.fstat(artifact_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise HumanReviewContextError(
+                f"temporary {label} is not a private regular file"
+            )
+        os.replace(
+            temporary_name,
+            leaf_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_name = None
+        os.fsync(parent_fd)
+    except HumanReviewContextError:
+        raise
+    except OSError as exc:
+        raise HumanReviewContextError(f"could not safely write {label}: {exc}") from exc
+    finally:
+        if temporary_name is not None and parent_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        for descriptor in reversed(opened_fds):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def read_frozen_artifact_bytes(
+    workspace_path: Path,
+    artifact_path: str | Path,
+    *,
+    label: str,
+    required: bool = False,
+    max_bytes: int = MAX_FROZEN_ARTIFACT_BYTES,
+) -> bytes | None:
+    """Read retained artifact bytes without following links or special files."""
+
     relative_path = Path(artifact_path)
     if (
         relative_path.is_absolute()
@@ -356,10 +511,15 @@ def read_frozen_text_artifact(
                 raise HumanReviewContextError(
                     f"{label} exceeds the {max_bytes}-byte retained-artifact limit"
                 )
-        try:
-            return b"".join(chunks).decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise HumanReviewContextError(f"{label} is not valid UTF-8") from exc
+        final_metadata = os.fstat(artifact_fd)
+        if (
+            total != metadata.st_size
+            or final_metadata.st_size != metadata.st_size
+            or final_metadata.st_mtime_ns != metadata.st_mtime_ns
+            or final_metadata.st_ctime_ns != metadata.st_ctime_ns
+        ):
+            raise HumanReviewContextError(f"{label} changed while it was read")
+        return b"".join(chunks)
     except FileNotFoundError as exc:
         if required:
             raise HumanReviewContextError(f"{label} is missing") from exc
@@ -374,6 +534,199 @@ def read_frozen_text_artifact(
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def hash_verification_evidence(
+    workspace_path: Path,
+    evidence_path: str | Path | None,
+) -> str:
+    """Hash retained verification evidence and validate referenced runtime logs."""
+
+    workspace_root, relative_path = _workspace_artifact_path(
+        workspace_path,
+        evidence_path,
+        label="verification evidence",
+    )
+    content = read_frozen_artifact_bytes(
+        workspace_root,
+        relative_path,
+        label="verification evidence",
+        required=True,
+        max_bytes=MAX_VERIFICATION_EVIDENCE_BYTES,
+    )
+    if content is None:
+        raise HumanReviewContextError("verification evidence is missing")
+    try:
+        evidence_text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HumanReviewContextError(
+            "verification evidence is not valid UTF-8"
+        ) from exc
+    _validate_runtime_verification_logs(workspace_root, evidence_text)
+    return hashlib.sha256(content).hexdigest()
+
+
+def hash_runtime_verification_log(
+    workspace_path: Path,
+    log_path: str | Path | None,
+) -> str:
+    """Hash a runtime verification log's exact retained bytes."""
+
+    return _hash_verification_log(
+        workspace_path,
+        log_path,
+        label="runtime verification log",
+    )
+
+
+def _hash_verification_log(
+    workspace_path: Path,
+    log_path: str | Path | None,
+    *,
+    label: str,
+) -> str:
+    """Hash a retained verification log's exact bytes."""
+
+    workspace_root, relative_path = _workspace_artifact_path(
+        workspace_path,
+        log_path,
+        label=label,
+    )
+    content = read_frozen_artifact_bytes(
+        workspace_root,
+        relative_path,
+        label=label,
+        required=True,
+        max_bytes=MAX_VERIFICATION_EVIDENCE_BYTES,
+    )
+    if content is None:
+        raise HumanReviewContextError(f"{label} is missing")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _workspace_artifact_path(
+    workspace_path: Path,
+    artifact_path: str | Path | None,
+    *,
+    label: str,
+) -> tuple[Path, Path]:
+    if artifact_path is None or not str(artifact_path).strip():
+        raise HumanReviewContextError(f"{label} path is missing")
+    workspace_root = Path(os.path.abspath(os.fspath(workspace_path)))
+    candidate = Path(artifact_path)
+    if not candidate.is_absolute():
+        candidate = workspace_root / candidate
+    normalized = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative_path = normalized.relative_to(workspace_root)
+    except ValueError as exc:
+        raise HumanReviewContextError(
+            f"{label} must be retained inside the workspace"
+        ) from exc
+    if not relative_path.parts:
+        raise HumanReviewContextError(f"{label} path must identify a file")
+    return workspace_root, relative_path
+
+
+def _validate_runtime_verification_logs(
+    workspace_path: Path,
+    evidence_text: str,
+) -> None:
+    try:
+        manifest = json.loads(evidence_text)
+    except json.JSONDecodeError:
+        return
+    if not _is_runtime_verification_manifest(manifest):
+        return
+
+    hook = manifest.get("hook")
+    if hook is not None:
+        if not isinstance(hook, dict):
+            raise HumanReviewContextError(
+                "runtime verification manifest hook is invalid"
+            )
+        output_path = hook.get("output_path")
+        expected_output_hash = str(
+            hook.get("output_sha256") or ""
+        ).strip().lower()
+        if output_path is None:
+            if expected_output_hash:
+                raise HumanReviewContextError(
+                    "runtime verification manifest hook has a log hash without "
+                    "an output path"
+                )
+        else:
+            if not isinstance(output_path, str) or not output_path.strip():
+                raise HumanReviewContextError(
+                    "runtime verification manifest hook has an invalid output path"
+                )
+            if len(expected_output_hash) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in expected_output_hash
+            ):
+                raise HumanReviewContextError(
+                    "runtime verification manifest hook has no valid output SHA-256"
+                )
+            actual_output_hash = _hash_verification_log(
+                workspace_path,
+                output_path,
+                label="verification hook log",
+            )
+            if actual_output_hash != expected_output_hash:
+                raise HumanReviewContextError(
+                    "verification hook log changed after its manifest was written: "
+                    f"{output_path}"
+                )
+
+    checks = manifest["runtime"]["checks"]
+    if not isinstance(checks, list):
+        raise HumanReviewContextError(
+            "runtime verification manifest checks are invalid"
+        )
+    for index, check in enumerate(checks):
+        if not isinstance(check, dict):
+            raise HumanReviewContextError(
+                f"runtime verification manifest check {index} is invalid"
+            )
+        log_path = check.get("log_path")
+        expected_hash = str(check.get("log_sha256") or "").strip().lower()
+        if log_path is None:
+            if expected_hash:
+                raise HumanReviewContextError(
+                    f"runtime verification manifest check {index} has a log hash "
+                    "without a log path"
+                )
+            continue
+        if not isinstance(log_path, str) or not log_path.strip():
+            raise HumanReviewContextError(
+                f"runtime verification manifest check {index} has an invalid log path"
+            )
+        if len(expected_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_hash
+        ):
+            raise HumanReviewContextError(
+                f"runtime verification manifest check {index} has no valid log SHA-256"
+            )
+        actual_hash = hash_runtime_verification_log(workspace_path, log_path)
+        if actual_hash != expected_hash:
+            raise HumanReviewContextError(
+                "runtime verification log changed after its manifest was written: "
+                f"{log_path}"
+            )
+
+
+def _is_runtime_verification_manifest(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    runtime = value.get("runtime")
+    return (
+        value.get("schema_version") == "1.0"
+        and isinstance(value.get("issue_identifier"), str)
+        and "plan_spec_hash" in value
+        and isinstance(value.get("affected_repositories"), list)
+        and isinstance(runtime, dict)
+        and "checks" in runtime
+    )
 
 
 def build_human_review_triage_prompt(
@@ -410,6 +763,15 @@ Exact validated PlanSpec hash:
 Exact validated PlanSpec:
 {action.get("plan_spec") or "No PlanSpec was configured."}
 
+Exact frozen AutomationPlan hash:
+{action.get("automation_plan_hash") or "none"}
+
+Exact frozen AutomationPlan:
+{action.get("automation_plan") or "No automation phase was bound to this run."}
+
+Frozen automation result:
+{action.get("automation_result") or "No automation result was bound to this run."}
+
 Exact frozen approval:
 {json.dumps(action.get("approval"), ensure_ascii=False, indent=2, sort_keys=True)}
 
@@ -427,7 +789,9 @@ Submission-time workspace diff:
 
 Inspect the live workspace diff as needed and compare it with the frozen context above.
 Return exactly one JSON object:
-- {{"decision":"code_changes","reason":"..."}} when the comments are code-only and fit the exact PlanSpec.
+- {{"decision":"code_changes","reason":"..."}} when the comments are code-only and fit the exact PlanSpec and, for automation code, the exact AutomationPlan.
+- {{"decision":"automation_plan_changes_required","reason":"..."}} when only the
+  derived AutomationPlan must change while the approved development PlanSpec remains exact.
 - {{"decision":"plan_changes_required","reason":"..."}} when behavior, scope, architecture,
   acceptance criteria, affected surfaces, compatibility, or non-goals must change.
 - {{"decision":"needs_human","question":"..."}} only when the boundary cannot be determined safely.
@@ -447,7 +811,7 @@ def build_human_review_implementation_prompt(
 
 Symphony is addressing a human review of completed run {action["source_run_id"]}.
 This is not a Jira requirements update. The exact frozen requirements snapshot,
-PlanSpec, and approval remain authoritative.
+PlanSpec, AutomationPlan when present, and approval remain authoritative.
 
 Human review action: {action["id"]}
 Reviewer: {action["reviewer_identity"]}
@@ -465,9 +829,26 @@ Exact validated PlanSpec hash:
 Exact validated PlanSpec:
 {action.get("plan_spec") or "No PlanSpec was configured."}
 
+Exact frozen AutomationPlan hash:
+{action.get("automation_plan_hash") or "none"}
+
+Exact frozen AutomationPlan:
+{action.get("automation_plan") or "No automation phase was bound to this run."}
+
+Frozen automation result:
+{action.get("automation_result") or "No automation result was bound to this run."}
+
+Do not edit the configured automation checkout in this development pass. If the
+feedback affects automation, return automation_plan_changes_required so Symphony
+can route it through the isolated automation planning and implementation lane.
+
 If any requested change would alter behavior, scope, architecture, acceptance criteria,
-affected surfaces, compatibility, or non-goals, do not edit for that request. Return:
+affected surfaces, compatibility, non-goals, or the development PlanSpec, do not edit
+for that request. Return:
 {{"decision":"plan_changes_required","reason":"<why the approved plan must change>"}}
+
+If only the derived automation plan must change, do not edit for that request. Return:
+{{"decision":"automation_plan_changes_required","reason":"<why automation must be replanned>"}}
 
 Otherwise leave a concise final report with files changed, verification, how each pasted
 comment was addressed, and residual risk."""
@@ -494,6 +875,13 @@ def classify_human_review_triage(message: str) -> tuple[str, str]:
         "code_only",
     }:
         return "code_changes", reason
+    if normalized in {
+        "automation_plan_changes_required",
+        "automation_plan_change_required",
+        "automation_replan",
+        "automation_replanning_required",
+    }:
+        return "automation_plan_changes_required", reason
     if normalized in {
         "plan_changes_required",
         "plan_change_required",

@@ -96,7 +96,13 @@ class WorkspaceManager:
         hook_dir.mkdir(parents=True, exist_ok=True)
         log_path = hook_dir / f"{name}.log"
         rendered_script = render_hook_script(script, hook_context) if hook_context else script
-        return self._run_hook_blocking(name, rendered_script, workspace_path, log_path)
+        return await asyncio.to_thread(
+            self._run_hook_blocking,
+            name,
+            rendered_script,
+            workspace_path,
+            log_path,
+        )
 
     def _hook_context(self, hook_context: dict[str, Any] | None, workspace: WorkspaceInfo) -> dict[str, Any]:
         context = dict(hook_context or {})

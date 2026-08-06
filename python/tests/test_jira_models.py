@@ -24,10 +24,13 @@ from symphony_jira.models import (
     AttachmentAnalysis,
     IssueAttachment,
     RelatedIssue,
+    RequirementArtifact,
+    RequirementDecision,
     RequirementSource,
     RequirementsSnapshot,
     diff_requirements_snapshots,
     issue_requirements_fingerprint,
+    requirements_planning_authority_equivalent,
 )
 
 
@@ -129,7 +132,7 @@ class JiraModelTests(unittest.TestCase):
         self.assertEqual(issue.url, "https://jira.example.test/browse/T-1")
         self.assertIsNotNone(issue.requirements_snapshot)
         assert issue.requirements_snapshot is not None
-        self.assertEqual(issue.requirements_snapshot.schema_version, "jira-requirements/v2")
+        self.assertEqual(issue.requirements_snapshot.schema_version, "jira-requirements/v4")
         self.assertEqual(len(issue.requirements_snapshot.content_hash), 64)
 
     def test_stored_v1_snapshot_remains_readable(self) -> None:
@@ -144,6 +147,38 @@ class JiraModelTests(unittest.TestCase):
 
         self.assertEqual(snapshot.schema_version, "jira-requirements/v1")
         self.assertEqual(snapshot.issue_identifier, "T-1")
+
+    def test_pre_v4_snapshots_keep_historical_context_hash_semantics(self) -> None:
+        original = RequirementsSnapshot.model_validate(
+            {
+                "schema_version": "jira-requirements/v3",
+                "issue_id": "10001",
+                "issue_identifier": "T-1",
+                "issue_url": "https://jira.example.test/browse/T-1",
+                "components": [{"id": "1", "name": "Reports", "kind": "component"}],
+            }
+        )
+        changed = original.model_copy(
+            update={
+                "components": [
+                    original.components[0].model_copy(update={"name": "Projects"})
+                ]
+            }
+        )
+
+        self.assertNotEqual(
+            original.calculate_content_hash(),
+            changed.calculate_content_hash(),
+        )
+        changed_url = original.model_copy(
+            update={"issue_url": "https://moved-jira.example.test/browse/T-1"}
+        )
+        self.assertNotEqual(
+            original.calculate_content_hash(),
+            changed_url.calculate_content_hash(),
+        )
+        historical_content = original.canonical_content()
+        self.assertNotIn("context_warnings", historical_content)
 
     def test_jira_client_search_get_and_comment_with_fake_server(self) -> None:
         posted_comments: list[dict] = []
@@ -661,7 +696,7 @@ class JiraModelTests(unittest.TestCase):
             with self.subTest(label=label):
                 asyncio.run(run_case(returned_start, expected_detail))
 
-    def test_unavailable_declared_changelog_page_blocks_planning_canonically(self) -> None:
+    def test_unavailable_declared_changelog_page_is_context_warning(self) -> None:
         payload = sample_issue_payload()
         payload["changelog"] = {
             "startAt": 0,
@@ -701,11 +736,12 @@ class JiraModelTests(unittest.TestCase):
                 "Jira changelog for T-1 declared 2 histories but only 1 were available; "
                 "field provenance is incomplete."
             )
-            self.assertEqual(issue.provenance_incomplete_reasons, [expected])
+            self.assertEqual(issue.provenance_incomplete_reasons, [])
+            self.assertIn(expected, issue.context_warnings)
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
-            self.assertFalse(snapshot.complete)
-            self.assertIn(expected, snapshot.incomplete_reasons)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
+            self.assertIn(expected, snapshot.context_warnings)
             assert snapshot.description is not None
             self.assertEqual(snapshot.description.source.author, "Product Owner")
 
@@ -1012,7 +1048,7 @@ class JiraModelTests(unittest.TestCase):
         )
         self.assertEqual(first.content_hash, second.content_hash)
 
-    def test_clear_polarity_and_order_reversals_become_cross_source_conflicts(self) -> None:
+    def test_lexical_polarity_and_order_reversals_do_not_manufacture_conflicts(self) -> None:
         cases = {
             "polarity": (
                 "GC sees the Cost column.",
@@ -1046,27 +1082,16 @@ class JiraModelTests(unittest.TestCase):
                 ).requirements_snapshot
                 assert snapshot is not None
 
-                conflicts = [
-                    decision
-                    for decision in snapshot.unresolved_contradictions
-                    if decision.id.startswith("jira:conflict:")
-                ]
-                self.assertEqual(len(conflicts), 1)
-                self.assertEqual(
-                    {source.source_id for source in conflicts[0].sources},
-                    {"comment:301", "comment:302"},
-                )
-                self.assertFalse(snapshot.complete)
+                self.assertEqual(snapshot.unresolved_contradictions, [])
+                self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
                 current_sources = {
                     source.source_id
                     for decision in snapshot.current_requirements
                     for source in decision.sources
                 }
-                self.assertTrue(
-                    {"comment:301", "comment:302"}.isdisjoint(current_sources)
-                )
+                self.assertTrue({"comment:301", "comment:302"} <= current_sources)
 
-    def test_opposing_current_units_in_same_comment_are_unresolved(self) -> None:
+    def test_opposing_current_units_require_explicit_contradiction_marker(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["comment"]["comments"] = [
             {
@@ -1085,19 +1110,14 @@ class JiraModelTests(unittest.TestCase):
         ).requirements_snapshot
         assert snapshot is not None
 
-        conflict = next(
+        self.assertEqual(snapshot.unresolved_contradictions, [])
+        units = [
             decision
-            for decision in snapshot.unresolved_contradictions
-            if decision.id.startswith("jira:conflict:")
-        )
-        self.assertEqual(len(conflict.sources), 2)
-        self.assertTrue(
-            all(
-                source.source_id.startswith("comment:303#unit:")
-                for source in conflict.sources
-            )
-        )
-        self.assertFalse(snapshot.complete)
+            for decision in snapshot.current_requirements
+            if decision.sources[0].source_id.startswith("comment:303#unit:")
+        ]
+        self.assertEqual(len(units), 2)
+        self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
 
     def test_exact_supersession_resolves_otherwise_clear_conflict(self) -> None:
         payload = sample_issue_payload()
@@ -1322,7 +1342,7 @@ class JiraModelTests(unittest.TestCase):
         )
         self.assertTrue(any(item.id == "jira:T-1:description" for item in snapshot.current_requirements))
 
-    def test_related_issue_decision_participates_in_conflict_reconciliation(self) -> None:
+    def test_related_issue_content_is_context_not_conflict_input(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["comment"]["comments"] = [
             {
@@ -1378,19 +1398,25 @@ class JiraModelTests(unittest.TestCase):
             payload,
             JiraRequirementsConfig(),
         )
-        conflict = next(
-            decision
-            for decision in snapshot.unresolved_contradictions
-            if decision.id.startswith("jira:conflict:")
+        self.assertEqual(snapshot.unresolved_contradictions, [])
+        self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
+        self.assertTrue(
+            any(
+                decision.id == "jira:T-1:comment:420"
+                for decision in snapshot.current_requirements
+            )
+        )
+        self.assertFalse(
+            any(
+                source.issue_identifier == "T-PHASE2"
+                for decision in snapshot.current_requirements
+                for source in decision.sources
+            )
         )
         self.assertEqual(
-            {
-                (source.issue_identifier, source.source_id)
-                for source in conflict.sources
-            },
-            {("T-1", "comment:420"), ("T-PHASE2", "description")},
+            snapshot.linked_issues[0].requirements[0].text,
+            "GC does not see the Cost column.",
         )
-        self.assertFalse(snapshot.complete)
 
     def test_linked_issue_requirement_context_is_hydrated_once_without_recursion(self) -> None:
         payload = sample_issue_payload()
@@ -1561,7 +1587,6 @@ class JiraModelTests(unittest.TestCase):
                     "field:customfield_100",
                     "comment:310",
                     "comment:312",
-                    "attachment:550",
                 ],
             )
             self.assertEqual(linked.requirements[1].kind, "acceptance_criterion")
@@ -1571,8 +1596,7 @@ class JiraModelTests(unittest.TestCase):
             )
             self.assertEqual(linked.provenance_incomplete_reasons, [])
             self.assertEqual(len(linked.attachments), 1)
-            self.assertEqual(linked.attachments[0].analysis.status, "complete")
-            self.assertIn("role-specific columns", linked.attachments[0].analysis.summary)
+            self.assertEqual(linked.attachments[0].analysis.status, "not_configured")
             self.assertEqual(
                 linked.attachments[0].source.issue_identifier,
                 "T-PHASE2",
@@ -1591,28 +1615,13 @@ class JiraModelTests(unittest.TestCase):
                 for decision in issue.requirements_snapshot.current_requirements
                 if decision.sources[0].issue_identifier == "T-PHASE2"
             ]
-            self.assertEqual(
-                related_decision_ids,
-                [
-                    "jira:T-PHASE2:description",
-                    "jira:T-PHASE2:field:customfield_100",
-                    "jira:T-PHASE2:comment:312",
-                    "jira:T-PHASE2:attachment:550",
-                ],
+            self.assertEqual(related_decision_ids, [])
+            self.assertFalse(
+                any(
+                    decision.sources[0].issue_identifier == "T-PHASE2"
+                    for decision in issue.requirements_snapshot.superseded_requirements
+                )
             )
-            superseded = next(
-                decision
-                for decision in issue.requirements_snapshot.superseded_requirements
-                if decision.id == "jira:T-PHASE2:comment:310"
-            )
-            replacement = next(
-                decision
-                for decision in issue.requirements_snapshot.current_requirements
-                if decision.id == "jira:T-PHASE2:comment:312"
-            )
-            self.assertEqual(replacement.supersedes, [superseded.id])
-            self.assertEqual(replacement.sources[0].author, "Product Lead")
-            self.assertEqual(replacement.sources[0].issue_identifier, "T-PHASE2")
             self.assertTrue(
                 issue.requirements_snapshot.complete,
                 issue.requirements_snapshot.incomplete_reasons,
@@ -1629,12 +1638,15 @@ class JiraModelTests(unittest.TestCase):
                 payload,
                 client.config.requirements,
             )
-            self.assertFalse(incomplete_snapshot.complete)
-            self.assertTrue(any("on related Jira issue T-PHASE2 analysis is skipped" in reason for reason in incomplete_snapshot.incomplete_reasons))
+            self.assertTrue(
+                incomplete_snapshot.complete,
+                incomplete_snapshot.incomplete_reasons,
+            )
+            self.assertEqual(incomplete_snapshot.incomplete_reasons, [])
 
         asyncio.run(run())
 
-    def test_related_missing_configured_field_blocks_but_present_null_does_not(self) -> None:
+    def test_related_missing_configured_field_warns_but_does_not_block(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["customfield_200"] = None
         payload["fields"]["issuelinks"] = [
@@ -1731,12 +1743,13 @@ class JiraModelTests(unittest.TestCase):
             self.assertEqual(linked["T-NULL"].provenance_incomplete_reasons, [])
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
-            self.assertFalse(snapshot.complete)
-            self.assertIn(expected, snapshot.incomplete_reasons)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
+            self.assertNotIn(expected, snapshot.incomplete_reasons)
+            self.assertIn(expected, snapshot.context_warnings)
 
         asyncio.run(run())
 
-    def test_related_comment_fetch_failure_blocks_without_losing_context(self) -> None:
+    def test_related_comment_fetch_failure_warns_without_losing_context(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["issuelinks"] = [
             {
@@ -1802,8 +1815,9 @@ class JiraModelTests(unittest.TestCase):
             self.assertEqual(linked.provenance_incomplete_reasons, [expected])
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
-            self.assertFalse(snapshot.complete)
-            self.assertIn(expected, snapshot.incomplete_reasons)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
+            self.assertNotIn(expected, snapshot.incomplete_reasons)
+            self.assertIn(expected, snapshot.context_warnings)
 
         asyncio.run(run())
 
@@ -1891,18 +1905,18 @@ class JiraModelTests(unittest.TestCase):
             self.assertEqual(related["T-3"].title, "Related T-3")
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
-            self.assertFalse(snapshot.complete)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
             self.assertIn(
                 related["T-3"].hydration_error,
-                snapshot.incomplete_reasons,
+                snapshot.context_warnings,
             )
-            self.assertTrue(
+            self.assertFalse(
                 any(
                     decision.id == "jira:T-2:description"
                     for decision in snapshot.current_requirements
                 )
             )
-            self.assertTrue(
+            self.assertFalse(
                 any(
                     decision.id == "jira:T-4:description"
                     for decision in snapshot.current_requirements
@@ -1936,7 +1950,8 @@ class JiraModelTests(unittest.TestCase):
         ):
             JiraRequirementsConfig(attachment_download_max_concurrency=33)
 
-    def test_requested_root_field_presence_distinguishes_missing_from_empty(self) -> None:
+    def test_only_root_planning_evidence_fields_are_completeness_checked(self) -> None:
+        evidence_fields = {"description", "comment"}
         for field_id in BASE_ISSUE_FIELDS:
             with self.subTest(field_id=field_id, state="missing"):
                 payload = sample_issue_payload()
@@ -1946,12 +1961,20 @@ class JiraModelTests(unittest.TestCase):
                     "https://jira.example.test",
                 ).requirements_snapshot
                 assert snapshot is not None
-                expected = (
-                    f"Jira issue T-1 did not return requested field {field_id}; "
-                    "requirement context is incomplete."
-                )
-                self.assertIn(expected, snapshot.incomplete_reasons)
-                self.assertFalse(snapshot.complete)
+                if field_id in evidence_fields:
+                    expected = (
+                        f"Jira issue T-1 did not return requested field {field_id}; "
+                        "requirement context is incomplete."
+                    )
+                    self.assertIn(expected, snapshot.incomplete_reasons)
+                    self.assertFalse(snapshot.complete)
+                else:
+                    warning = (
+                        f"Jira issue T-1 did not return contextual field {field_id}; "
+                        "planning evidence is unaffected."
+                    )
+                    self.assertNotIn(warning, snapshot.incomplete_reasons)
+                    self.assertIn(warning, snapshot.context_warnings)
 
             with self.subTest(field_id=field_id, state="present-null"):
                 payload = sample_issue_payload()
@@ -1968,7 +1991,71 @@ class JiraModelTests(unittest.TestCase):
                     )
                 )
 
-    def test_missing_epic_issue_type_blocks_snapshot_when_child_discovery_is_skipped(self) -> None:
+    def test_paginated_comments_do_not_depend_on_redundant_embedded_comment_field(self) -> None:
+        payload = sample_issue_payload()
+        payload["fields"].pop("comment")
+
+        snapshot = normalize_issue(
+            payload,
+            "https://jira.example.test",
+            comments=[],
+        ).requirements_snapshot
+
+        assert snapshot is not None
+        self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
+        self.assertFalse(
+            any("requested field comment" in reason for reason in snapshot.incomplete_reasons)
+        )
+        self.assertFalse(
+            any("contextual field comment" in warning for warning in snapshot.context_warnings)
+        )
+
+    def test_missing_parent_is_allowed_for_explicit_non_subtask_issue(self) -> None:
+        payload = sample_issue_payload()
+        payload["fields"]["issuetype"] = {"name": "Epic", "subtask": False}
+        payload["fields"].pop("parent")
+
+        snapshot = normalize_issue(
+            payload,
+            "https://jira.example.test",
+        ).requirements_snapshot
+
+        assert snapshot is not None
+        self.assertFalse(
+            any(
+                "requested field parent" in reason
+                for reason in snapshot.incomplete_reasons
+            )
+        )
+        self.assertTrue(snapshot.complete)
+
+    def test_missing_parent_never_blocks_planning_evidence(self) -> None:
+        cases = {
+            "subtask": {"name": "Sub-task", "subtask": True},
+            "missing-subtask-marker": {"name": "Epic"},
+        }
+        expected = (
+            "Jira issue T-1 did not return contextual field parent; "
+            "planning evidence is unaffected."
+        )
+
+        for label, issue_type in cases.items():
+            with self.subTest(label=label):
+                payload = sample_issue_payload()
+                payload["fields"]["issuetype"] = issue_type
+                payload["fields"].pop("parent")
+
+                snapshot = normalize_issue(
+                    payload,
+                    "https://jira.example.test",
+                ).requirements_snapshot
+
+                assert snapshot is not None
+                self.assertNotIn(expected, snapshot.incomplete_reasons)
+                self.assertIn(expected, snapshot.context_warnings)
+                self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
+
+    def test_missing_epic_issue_type_warns_when_child_discovery_is_skipped(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["summary"] = "Epic: role-aware reporting"
         payload["fields"]["issuetype"] = {"name": "Epic"}
@@ -2007,11 +2094,11 @@ class JiraModelTests(unittest.TestCase):
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
             expected = (
-                "Jira issue T-1 did not return requested field issuetype; "
-                "requirement context is incomplete."
+                "Jira issue T-1 did not return contextual field issuetype; "
+                "planning evidence is unaffected."
             )
-            self.assertIn(expected, snapshot.incomplete_reasons)
-            self.assertFalse(snapshot.complete)
+            self.assertIn(expected, snapshot.context_warnings)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
 
         asyncio.run(run())
 
@@ -2059,8 +2146,8 @@ class JiraModelTests(unittest.TestCase):
                     attachments=[],
                 )
                 expected = (
-                    f"Jira issue T-2 did not return requested field {field_id}; "
-                    "requirement context is incomplete."
+                    f"Jira issue T-2 did not return contextual field {field_id}; "
+                    "planning evidence is unaffected."
                 )
                 self.assertIn(expected, hydrated.provenance_incomplete_reasons)
 
@@ -2087,7 +2174,7 @@ class JiraModelTests(unittest.TestCase):
                     )
                 )
 
-    def test_missing_or_invalid_changelog_metadata_is_incomplete(self) -> None:
+    def test_missing_or_invalid_changelog_metadata_is_context_only(self) -> None:
         cases = {
             "absent": None,
             "not-an-object": [],
@@ -2106,9 +2193,9 @@ class JiraModelTests(unittest.TestCase):
                     "https://jira.example.test",
                 ).requirements_snapshot
                 assert snapshot is not None
-                self.assertFalse(snapshot.complete)
+                self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
                 self.assertTrue(
-                    any("field provenance is incomplete" in reason for reason in snapshot.incomplete_reasons)
+                    any("field provenance is incomplete" in reason for reason in snapshot.context_warnings)
                 )
 
     def test_initial_provenance_uses_creator_not_reporter(self) -> None:
@@ -2120,7 +2207,7 @@ class JiraModelTests(unittest.TestCase):
         assert snapshot is not None and snapshot.description is not None
         self.assertEqual(snapshot.description.source.author, "Original Creator")
 
-    def test_matching_changelog_edit_requires_exact_author_and_timestamp(self) -> None:
+    def test_matching_changelog_edit_preserves_missing_provenance_as_warning(self) -> None:
         cases = {
             "missing-author": {
                 "created": "2025-06-25T09:00:00.000+0000",
@@ -2149,14 +2236,22 @@ class JiraModelTests(unittest.TestCase):
                     "https://jira.example.test",
                 ).requirements_snapshot
                 assert snapshot is not None and snapshot.description is not None
-                self.assertFalse(snapshot.complete)
+                self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
                 source = snapshot.description.source
                 if label == "missing-author":
                     self.assertEqual(source.author, "unknown")
+                    self.assertIn(
+                        "Decision jira:T-1:description has no known source author.",
+                        snapshot.context_warnings,
+                    )
                 else:
                     self.assertIsNone(source.timestamp)
+                    self.assertIn(
+                        "Decision jira:T-1:description has no known source timestamp.",
+                        snapshot.context_warnings,
+                    )
 
-    def test_equal_timestamp_conflicting_provenance_is_order_independent_and_incomplete(self) -> None:
+    def test_equal_timestamp_conflicting_provenance_is_order_independent_warning(self) -> None:
         timestamp = "2025-06-25T09:00:00.000+0000"
         cases = {
             "authors": [
@@ -2232,14 +2327,14 @@ class JiraModelTests(unittest.TestCase):
                     snapshots.append(snapshot)
                     self.assertEqual(snapshot.description.source.author, "unknown")
                     self.assertIsNone(snapshot.description.source.timestamp)
-                    self.assertFalse(snapshot.complete)
+                    self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
                     self.assertIn(
                         "Decision jira:T-1:description has no known source author.",
-                        snapshot.incomplete_reasons,
+                        snapshot.context_warnings,
                     )
                     self.assertIn(
                         "Decision jira:T-1:description has no known source timestamp.",
-                        snapshot.incomplete_reasons,
+                        snapshot.context_warnings,
                     )
 
                 self.assertEqual(snapshots[0].content_hash, snapshots[1].content_hash)
@@ -2303,7 +2398,7 @@ class JiraModelTests(unittest.TestCase):
         ):
             JiraRequirementsConfig(hydrate_search_results=False)
 
-    def test_attachment_hash_and_injectable_vision_summary_are_canonical(self) -> None:
+    def test_issue_ingestion_keeps_attachment_metadata_without_analysis(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["attachment"] = [
             {
@@ -2318,6 +2413,7 @@ class JiraModelTests(unittest.TestCase):
             }
         ]
         image_content = b"mock-png"
+        attachment_fetches: list[str] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/rest/api/2/issue/T-1":
@@ -2325,6 +2421,7 @@ class JiraModelTests(unittest.TestCase):
             if request.url.path == "/rest/api/2/issue/T-1/comment":
                 return httpx.Response(200, json={"startAt": 0, "total": 0, "comments": []})
             if request.url.path == "/secure/attachment/500/role-matrix.png":
+                attachment_fetches.append(request.url.path)
                 return httpx.Response(200, content=image_content)
             return httpx.Response(404)
 
@@ -2341,22 +2438,29 @@ class JiraModelTests(unittest.TestCase):
                 await client.close()
 
             attachment = issue.attachments[0]
-            self.assertEqual(attachment.content_sha256, hashlib.sha256(image_content).hexdigest())
-            self.assertEqual(attachment.analysis.status, "complete")
-            self.assertEqual(attachment.analysis.modality, "vision")
-            self.assertIn("role-specific columns", attachment.analysis.summary)
+            self.assertIsNone(attachment.content_sha256)
+            self.assertEqual(attachment.analysis.status, "not_configured")
+            self.assertEqual(attachment.analysis.modality, "metadata")
             self.assertEqual(attachment.source.author, "Designer")
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
             self.assertTrue(snapshot.complete)
 
-            recaptured = snapshot.model_copy(deep=True)
-            recaptured.attachments[0].analysis.generated_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
-            self.assertEqual(snapshot.calculate_content_hash(), recaptured.calculate_content_hash())
+            changed_context = snapshot.model_copy(deep=True)
+            changed_context.attachments[0].analysis = AttachmentAnalysis(
+                status="complete",
+                modality="vision",
+                summary="Different attachment analysis that is not planning evidence.",
+            )
+            self.assertEqual(
+                snapshot.calculate_content_hash(),
+                changed_context.calculate_content_hash(),
+            )
 
         asyncio.run(run())
+        self.assertEqual(attachment_fetches, [])
 
-    def test_complete_screenshot_summary_enters_current_evidence_taxonomy(self) -> None:
+    def test_complete_screenshot_summary_is_not_planning_evidence(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["description"] = None
         payload["fields"]["comment"]["comments"] = []
@@ -2383,35 +2487,10 @@ class JiraModelTests(unittest.TestCase):
 
         self.assertIsNone(snapshot.description)
         self.assertEqual(snapshot.comments, [])
-        self.assertEqual(len(snapshot.current_requirements), 3)
+        self.assertEqual(snapshot.current_requirements, [])
         self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
-        self.assertTrue(
-            all(decision.kind == "supporting_evidence" for decision in snapshot.current_requirements)
-        )
-        self.assertEqual(
-            {
-                decision.sources[0].issue_identifier
-                for decision in snapshot.current_requirements
-            },
-            {"T-1"},
-        )
-        self.assertTrue(
-            all(
-                decision.sources[0].source_type == "attachment"
-                and decision.sources[0].source_id.startswith(
-                    "attachment:role-columns#unit:"
-                )
-                for decision in snapshot.current_requirements
-            )
-        )
-        evidence_text = " ".join(
-            decision.text for decision in snapshot.current_requirements
-        )
-        self.assertIn("GC: Cost appears immediately after Budget", evidence_text)
-        self.assertIn("Sub: Cost is not shown", evidence_text)
-        self.assertIn("GC acting as Sub: Cost is not shown", evidence_text)
 
-    def test_attachment_markers_preserve_inference_and_within_image_contradiction(self) -> None:
+    def test_attachment_markers_cannot_create_inference_or_contradiction(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["description"] = None
         payload["fields"]["comment"]["comments"] = []
@@ -2435,15 +2514,10 @@ class JiraModelTests(unittest.TestCase):
             JiraRequirementsConfig(),
         )
 
-        self.assertEqual(len(snapshot.inferred_behavior), 1)
-        self.assertEqual(len(snapshot.unresolved_contradictions), 1)
+        self.assertEqual(snapshot.inferred_behavior, [])
+        self.assertEqual(snapshot.unresolved_contradictions, [])
         self.assertEqual(snapshot.current_requirements, [])
-        self.assertEqual(snapshot.inferred_behavior[0].kind, "supporting_evidence")
-        self.assertEqual(
-            snapshot.inferred_behavior[0].sources[0].source_type,
-            "attachment",
-        )
-        self.assertFalse(snapshot.complete)
+        self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
 
     def test_noncomplete_or_blank_attachment_analysis_is_not_promoted(self) -> None:
         payload = sample_issue_payload()
@@ -2499,14 +2573,10 @@ class JiraModelTests(unittest.TestCase):
         self.assertEqual(snapshot.inferred_behavior, [])
         self.assertEqual(snapshot.superseded_requirements, [])
         self.assertEqual(snapshot.unresolved_contradictions, [])
-        self.assertTrue(
-            any("Attachment error" in reason for reason in snapshot.incomplete_reasons)
-        )
-        self.assertTrue(
-            any("Attachment blank" in reason for reason in snapshot.incomplete_reasons)
-        )
+        self.assertEqual(snapshot.incomplete_reasons, [])
+        self.assertTrue(snapshot.complete)
 
-    def test_related_attachment_decision_preserves_identity_and_timestamp_stable_hash(self) -> None:
+    def test_related_attachment_remains_context_with_timestamp_stable_hash(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["description"] = None
         payload["fields"]["comment"]["comments"] = []
@@ -2573,33 +2643,13 @@ class JiraModelTests(unittest.TestCase):
             JiraRequirementsConfig(),
         )
 
-        self.assertEqual(len(first_related.requirements), 1)
-        artifact = first_related.requirements[0]
-        self.assertEqual(artifact.source_type, "attachment")
-        self.assertEqual(artifact.source.issue_identifier, "T-PHASE2")
-        self.assertEqual(artifact.source.source_id, "attachment:shared")
-        decision = next(
-            item
-            for item in first.current_requirements
-            if item.sources[0].source_type == "attachment"
-        )
-        self.assertEqual(decision.id, "jira:T-PHASE2:attachment:shared")
-        self.assertEqual(decision.kind, "supporting_evidence")
+        self.assertEqual(first_related.requirements, [])
+        self.assertEqual(len(first_related.attachments), 1)
+        self.assertEqual(first.current_requirements, [])
+        self.assertEqual(first.incomplete_reasons, [])
         self.assertEqual(first.content_hash, second.content_hash)
 
-        collision_a = first.model_copy(deep=True)
-        collision_b = first.model_copy(deep=True)
-        root_source = decision.sources[0].model_copy(
-            update={"issue_identifier": "T-1"}
-        )
-        collision_a.current_requirements[0].sources = [root_source, decision.sources[0]]
-        collision_b.current_requirements[0].sources = [decision.sources[0], root_source]
-        self.assertEqual(
-            collision_a.calculate_content_hash(),
-            collision_b.calculate_content_hash(),
-        )
-
-    def test_attachment_evidence_conflicts_with_textual_requirement_across_kinds(self) -> None:
+    def test_attachment_and_text_reversal_remain_current_without_explicit_conflict(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["description"] = (
             "The Cost column appears before the Budget column."
@@ -2620,14 +2670,12 @@ class JiraModelTests(unittest.TestCase):
             JiraRequirementsConfig(),
         )
 
-        self.assertEqual(len(snapshot.unresolved_contradictions), 1)
-        conflict = snapshot.unresolved_contradictions[0]
-        self.assertEqual(conflict.kind, "requirement")
+        self.assertEqual(snapshot.unresolved_contradictions, [])
         self.assertEqual(
-            {source.source_type for source in conflict.sources},
-            {"description", "attachment"},
+            {decision.kind for decision in snapshot.current_requirements},
+            {"requirement"},
         )
-        self.assertFalse(snapshot.complete)
+        self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
 
     def test_off_origin_attachment_is_rejected_without_leaking_auth(self) -> None:
         payload = sample_issue_payload()
@@ -2651,7 +2699,10 @@ class JiraModelTests(unittest.TestCase):
             config = TrackerConfig(
                 base_url="https://jira.example.test",
                 jql="project = T",
-                requirements={"require_attachment_analysis": False},
+                requirements={
+                    "download_attachments": True,
+                    "require_attachment_analysis": False,
+                },
             )
             issue = normalize_issue(
                 payload,
@@ -2672,7 +2723,7 @@ class JiraModelTests(unittest.TestCase):
             self.assertEqual(attachment.analysis.status, "error")
             self.assertIn("exact configured Jira origin", attachment.analysis.summary)
             snapshot = build_requirements_snapshot(issue, payload, config.requirements)
-            self.assertFalse(snapshot.complete)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
 
         asyncio.run(run())
         self.assertEqual(seen_requests, [])
@@ -2710,7 +2761,10 @@ class JiraModelTests(unittest.TestCase):
             config = TrackerConfig(
                 base_url="https://jira.example.test",
                 jql="project = T",
-                requirements={"max_attachment_bytes": 5},
+                requirements={
+                    "download_attachments": True,
+                    "max_attachment_bytes": 5,
+                },
             )
             attachment = normalize_issue(
                 payload,
@@ -2816,7 +2870,10 @@ class JiraModelTests(unittest.TestCase):
             config = TrackerConfig(
                 base_url="https://jira.example.test",
                 jql="project = T",
-                requirements={"attachment_download_max_concurrency": 2},
+                requirements={
+                    "download_attachments": True,
+                    "attachment_download_max_concurrency": 2,
+                },
             )
             attachments = normalize_issue(
                 payload,
@@ -2892,6 +2949,239 @@ class JiraModelTests(unittest.TestCase):
         self.assertIn("comments", diff.changed_sections)
         self.assertNotEqual(issue_requirements_fingerprint(original), issue_requirements_fingerprint(changed))
 
+    def test_v4_hash_excludes_context_and_generic_custom_fields(self) -> None:
+        config = JiraRequirementsConfig(
+            custom_fields=["customfield_200"],
+            acceptance_criteria_fields=["customfield_100"],
+        )
+        payload = sample_issue_payload()
+        payload["names"] = {
+            "customfield_100": "Acceptance Criteria",
+            "customfield_200": "Engineering context",
+        }
+        payload["fields"]["customfield_100"] = "AC-1: Show the Created Date."
+        payload["fields"]["customfield_200"] = "Use the legacy helper."
+        original = normalize_issue(
+            payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).requirements_snapshot
+        assert original is not None
+
+        artifacts = {artifact.source.field_id: artifact for artifact in original.custom_fields}
+        self.assertTrue(artifacts["customfield_100"].planning_eligible)
+        self.assertFalse(artifacts["customfield_200"].planning_eligible)
+        canonical = original.canonical_content()
+        for context_key in (
+            "attachments",
+            "parent",
+            "children",
+            "linked_issues",
+            "dependencies",
+            "components",
+            "versions",
+            "context_warnings",
+        ):
+            self.assertNotIn(context_key, canonical)
+        self.assertEqual(
+            [artifact["source"]["field_id"] for artifact in canonical["custom_fields"]],
+            ["customfield_100"],
+        )
+        self.assertFalse(
+            any(
+                decision.sources[0].field_id == "customfield_200"
+                for decision in original.current_requirements
+            )
+        )
+
+        context_changed_payload = json.loads(json.dumps(payload))
+        context_changed_payload["fields"]["customfield_200"] = "Different context."
+        context_changed_payload["fields"]["attachment"] = [
+            {
+                "id": "context-only",
+                "filename": "mockup.png",
+                "mimeType": "image/png",
+            }
+        ]
+        context_changed_payload["fields"]["components"] = [
+            {"id": "10", "name": "Reporting"}
+        ]
+        context_changed_payload["fields"]["versions"] = [
+            {"id": "11", "name": "2026.3"}
+        ]
+        context_changed_payload["fields"]["issuelinks"] = [
+            {
+                "id": "77",
+                "type": {"outward": "relates to"},
+                "outwardIssue": {
+                    "id": "900",
+                    "key": "T-2",
+                    "fields": {"summary": "Context issue"},
+                },
+            }
+        ]
+        context_changed = normalize_issue(
+            context_changed_payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).requirements_snapshot
+        assert context_changed is not None
+        self.assertEqual(original.content_hash, context_changed.content_hash)
+        self.assertFalse(diff_requirements_snapshots(original, context_changed).material)
+
+        warning_changed = original.model_copy(
+            update={"context_warnings": ["Context changed."]}
+        )
+        self.assertEqual(
+            original.calculate_content_hash(),
+            warning_changed.calculate_content_hash(),
+        )
+
+        acceptance_changed_payload = json.loads(json.dumps(payload))
+        acceptance_changed_payload["fields"]["customfield_100"] = (
+            "AC-1: Hide the Created Date."
+        )
+        acceptance_changed = normalize_issue(
+            acceptance_changed_payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).requirements_snapshot
+        assert acceptance_changed is not None
+        self.assertNotEqual(original.content_hash, acceptance_changed.content_hash)
+
+        fallback_context_payload = json.loads(json.dumps(context_changed_payload))
+        fallback_context_payload["fields"]["customfield_200"] = (
+            payload["fields"]["customfield_200"]
+        )
+        fallback_original = normalize_issue(
+            payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).model_copy(update={"requirements_snapshot": None})
+        fallback_context = normalize_issue(
+            fallback_context_payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).model_copy(update={"requirements_snapshot": None})
+        self.assertEqual(
+            issue_requirements_fingerprint(fallback_original),
+            issue_requirements_fingerprint(fallback_context),
+        )
+
+    def test_v4_hash_excludes_derived_source_presentation_metadata(self) -> None:
+        source = RequirementSource(
+            issue_identifier="T-1",
+            source_type="custom_field",
+            source_id="field:customfield_100#unit:stable",
+            field_id="customfield_100",
+            field_name="Acceptance Criteria",
+            url="https://jira.example.test/browse/T-1",
+            location="decision-unit:1",
+            author="Product Owner",
+            authority="product",
+        )
+        snapshot = RequirementsSnapshot(
+            issue_id="10001",
+            issue_identifier="T-1",
+            issue_url="https://jira.example.test/browse/T-1",
+            custom_fields=[
+                RequirementArtifact(
+                    artifact_id="field:customfield_100",
+                    source_type="custom_field",
+                    text="Show the Created Date.",
+                    source=source,
+                    kind="acceptance_criterion",
+                )
+            ],
+            current_requirements=[
+                RequirementDecision(
+                    id="decision:created-date",
+                    text="Show the Created Date.",
+                    kind="acceptance_criterion",
+                    classification="current",
+                    sources=[source],
+                )
+            ],
+        )
+
+        presentation_changed = snapshot.model_copy(deep=True)
+        presentation_changed.issue_url = (
+            "https://moved-jira.example.test/browse/T-1"
+        )
+        presentation_sources = [
+            presentation_changed.custom_fields[0].source,
+            *presentation_changed.current_requirements[0].sources,
+        ]
+        for changed_source in presentation_sources:
+            changed_source.field_name = "Renamed Acceptance Criteria"
+            changed_source.url = "https://moved-jira.example.test/browse/T-1"
+            changed_source.location = "rendered-unit:99"
+
+        self.assertEqual(
+            snapshot.calculate_content_hash(),
+            presentation_changed.calculate_content_hash(),
+        )
+        canonical = snapshot.canonical_content()
+        self.assertEqual(canonical["issue_url"], "")
+        canonical_json = json.dumps(canonical, sort_keys=True)
+        for excluded_key in ("field_name", "url", "location"):
+            self.assertNotIn(f'"{excluded_key}"', canonical_json)
+
+        identity_changed = snapshot.model_copy(deep=True)
+        identity_changed.current_requirements[0].sources[0].source_id = (
+            "field:customfield_100#unit:different"
+        )
+        self.assertNotEqual(
+            snapshot.calculate_content_hash(),
+            identity_changed.calculate_content_hash(),
+        )
+
+        text_changed = snapshot.model_copy(deep=True)
+        text_changed.custom_fields[0].text = "Hide the Created Date."
+        self.assertNotEqual(
+            snapshot.calculate_content_hash(),
+            text_changed.calculate_content_hash(),
+        )
+
+        classification_changed = snapshot.model_copy(deep=True)
+        classification_changed.current_requirements[0].classification = "superseded"
+        self.assertNotEqual(
+            snapshot.calculate_content_hash(),
+            classification_changed.calculate_content_hash(),
+        )
+
+    def test_only_missing_root_acceptance_custom_field_blocks(self) -> None:
+        payload = sample_issue_payload()
+        config = JiraRequirementsConfig(
+            custom_fields=["customfield_context"],
+            acceptance_criteria_fields=["customfield_acceptance"],
+        )
+
+        missing_both = normalize_issue(
+            payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).requirements_snapshot
+        assert missing_both is not None
+        self.assertIn(
+            "Configured Jira field customfield_acceptance was not returned.",
+            missing_both.incomplete_reasons,
+        )
+        self.assertIn(
+            "Configured Jira field customfield_context was not returned.",
+            missing_both.context_warnings,
+        )
+
+        generic_missing_payload = sample_issue_payload()
+        generic_missing_payload["fields"]["customfield_acceptance"] = "AC-1: Works."
+        generic_missing = normalize_issue(
+            generic_missing_payload,
+            "https://jira.example.test",
+            requirements_config=config,
+        ).requirements_snapshot
+        assert generic_missing is not None
+        self.assertTrue(generic_missing.complete, generic_missing.incomplete_reasons)
+
     def test_link_relation_hash_ignores_root_global_updated_timestamp(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["issuelinks"] = [
@@ -2923,7 +3213,7 @@ class JiraModelTests(unittest.TestCase):
         self.assertIsNone(updated_snapshot.linked_issues[0].source.timestamp)
         self.assertEqual(original_snapshot.content_hash, updated_snapshot.content_hash)
 
-    def test_default_epic_child_discovery_is_safe_and_failure_is_incomplete(self) -> None:
+    def test_default_epic_child_discovery_failure_is_context_only(self) -> None:
         payload = sample_issue_payload()
         payload["fields"]["issuetype"] = {"name": "Epic"}
         child_jql: list[str] = []
@@ -2964,11 +3254,11 @@ class JiraModelTests(unittest.TestCase):
 
             snapshot = issue.requirements_snapshot
             assert snapshot is not None
-            self.assertFalse(snapshot.complete)
+            self.assertTrue(snapshot.complete, snapshot.incomplete_reasons)
             self.assertTrue(
                 any(
                     "Jira child discovery for T-1 is incomplete" in reason
-                    for reason in snapshot.incomplete_reasons
+                    for reason in snapshot.context_warnings
                 )
             )
 
@@ -3211,6 +3501,57 @@ class JiraModelTests(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(seen_auth, ["Bearer file-token"])
+
+    def test_pre_v4_projection_ignores_context_but_not_root_decisions(self) -> None:
+        description_source = RequirementSource(
+            issue_identifier="T-1",
+            source_type="description",
+            source_id="description",
+            field_id="description",
+            author="Product Owner",
+            authority="product",
+        )
+        description = RequirementArtifact(
+            artifact_id="T-1:description",
+            source_type="description",
+            text="Display the project creation date.",
+            source=description_source,
+        )
+        decision_source = description_source.model_copy(
+            update={"source_id": "description#unit:date"}
+        )
+        decision = RequirementDecision(
+            id="T-1-R1",
+            text="Display the project creation date.",
+            classification="current",
+            sources=[decision_source],
+        )
+        legacy = RequirementsSnapshot(
+            schema_version="jira-requirements/v2",
+            issue_id="1",
+            issue_identifier="T-1",
+            issue_url="https://jira.example.test/browse/T-1",
+            description=description,
+            current_requirements=[decision],
+            components=[{"id": "10", "name": "Home", "kind": "component"}],
+        )
+        current = legacy.model_copy(
+            deep=True,
+            update={
+                "schema_version": "jira-requirements/v4",
+                "components": [],
+                "context_warnings": ["Context lookup failed."],
+            },
+        )
+        self.assertTrue(
+            requirements_planning_authority_equivalent(legacy, current)
+        )
+
+        changed = current.model_copy(deep=True)
+        changed.current_requirements[0].classification = "superseded"
+        self.assertFalse(
+            requirements_planning_authority_equivalent(legacy, changed)
+        )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import pytest
 from symphony_jira.models import (
     AttachmentAnalysis,
     IssueAttachment,
-    JiraNamedValue,
+    IssueComment,
     RelatedIssue,
     RequirementArtifact,
     RequirementDecision,
@@ -16,6 +16,7 @@ from symphony_jira.models import (
 )
 from symphony_jira.plan_spec import (
     PlanSpecError,
+    parse_frozen_legacy_plan_spec,
     parse_plan_spec,
     validate_plan_precedent_paths,
 )
@@ -40,12 +41,32 @@ def test_fenced_plan_spec_parses_and_hash_is_canonical() -> None:
     assert json.loads(first.canonical_json())["schema_version"] == "1.0"
 
 
-def test_test_cases_must_map_one_to_one_to_acceptance_criteria() -> None:
+def test_test_cases_must_cover_known_acceptance_criteria() -> None:
     payload = plan_payload()
     payload["test_cases"][0]["acceptance_criterion_id"] = "AC-unknown"
 
-    with pytest.raises(PlanSpecError, match="one-to-one"):
+    with pytest.raises(PlanSpecError, match="cover every acceptance criterion"):
         parse_plan_spec(json.dumps(payload))
+
+
+def test_multiple_test_cases_can_cover_one_acceptance_criterion() -> None:
+    payload = plan_payload()
+    payload["test_cases"].append(
+        {
+            "id": "TC-gc-integration",
+            "acceptance_criterion_id": "AC-gc",
+            "level": "integration",
+            "description": "Load the table with the GC API response.",
+            "expected_result": "The GC-specific value is visible.",
+        }
+    )
+
+    plan = parse_plan_spec(json.dumps(payload))
+
+    assert [test.acceptance_criterion_id for test in plan.test_cases] == [
+        "AC-gc",
+        "AC-gc",
+    ]
 
 
 def test_all_jira_sources_must_exist_in_current_snapshot() -> None:
@@ -79,43 +100,115 @@ def test_jira_source_type_must_match_snapshot_catalog() -> None:
     assert "ICPM-67703:comment:description" in str(error.value)
 
 
-def test_component_and_version_sources_use_declared_catalog_types() -> None:
-    snapshot = requirements_snapshot()
-    snapshot.components = [
-        JiraNamedValue(id="component-7", name="Reporting", kind="component")
-    ]
-    snapshot.versions = [
-        JiraNamedValue(id="version-9", name="2026.3", kind="fix_version")
-    ]
-    snapshot = snapshot.with_content_hash()
-    payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["requirements"][0]["jira_sources"].extend(
-        [
-            {
-                "issue_key": "ICPM-67703",
-                "source_type": "component",
-                "source_id": "component-7",
-            },
-            {
-                "issue_key": "ICPM-67703",
-                "source_type": "version",
-                "source_id": "version-9",
-            },
-        ]
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        "attachment",
+        "parent",
+        "child",
+        "linked_issue",
+        "dependency",
+        "component",
+        "version",
+    ],
+)
+def test_plan_sources_are_limited_to_jira_requirement_content(
+    source_type: str,
+) -> None:
+    payload = plan_payload()
+    payload["requirements"][0]["jira_sources"].append(
+        {
+            "issue_key": "ICPM-67703",
+            "source_type": source_type,
+            "source_id": f"context:{source_type}",
+        }
     )
 
-    plan = parse_plan_spec(
+    with pytest.raises(PlanSpecError, match="description.*custom_field.*comment"):
+        parse_plan_spec(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        "attachment",
+        "parent",
+        "child",
+        "linked_issue",
+        "dependency",
+        "component",
+        "version",
+    ],
+)
+def test_frozen_legacy_plan_parses_context_only_source_types(
+    source_type: str,
+) -> None:
+    snapshot = requirements_snapshot().model_copy(
+        update={"schema_version": "jira-requirements/v3"}
+    )
+    snapshot_hash = snapshot.calculate_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot_hash)
+    legacy_source = {
+        "issue_key": "ICPM-67703",
+        "source_type": source_type,
+        "source_id": f"context:{source_type}",
+    }
+    payload["requirements"][0]["jira_sources"].append(legacy_source)
+    payload["requirements"][0]["acceptance_criteria"][0]["jira_sources"].append(
+        legacy_source
+    )
+
+    plan = parse_frozen_legacy_plan_spec(
         json.dumps(payload),
         expected_issue_key="ICPM-67703",
-        expected_snapshot_hash=snapshot.content_hash,
+        expected_snapshot_hash=snapshot_hash,
+        issue_type=None,
         requirements_snapshot=snapshot,
     )
 
-    assert {source.source_type for source in plan.requirements[0].jira_sources} == {
-        "component",
-        "description",
-        "version",
-    }
+    assert plan.requirements[0].jira_sources[-1].source_type == source_type
+
+    with pytest.raises(PlanSpecError, match="unsupported source type"):
+        parse_plan_spec(json.dumps(payload))
+
+
+def test_generic_custom_field_cannot_be_active_plan_evidence() -> None:
+    snapshot = requirements_snapshot()
+    generic_source = RequirementSource(
+        issue_identifier="ICPM-67703",
+        source_type="custom_field",
+        source_id="field:customfield_context",
+        field_id="customfield_context",
+        field_name="Context",
+        author="product-owner",
+        authority="product",
+    )
+    snapshot.custom_fields = [
+        RequirementArtifact(
+            artifact_id=generic_source.source_id,
+            source_type="custom_field",
+            text="Context that is not configured as Acceptance Criteria.",
+            source=generic_source,
+            planning_eligible=False,
+        )
+    ]
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot.content_hash)
+    payload["requirements"][0]["jira_sources"].append(
+        {
+            "issue_key": "ICPM-67703",
+            "source_type": "custom_field",
+            "source_id": generic_source.source_id,
+        }
+    )
+
+    with pytest.raises(PlanSpecError, match="absent from the current snapshot"):
+        parse_plan_spec(
+            json.dumps(payload),
+            expected_issue_key="ICPM-67703",
+            expected_snapshot_hash=snapshot.content_hash,
+            requirements_snapshot=snapshot,
+        )
 
 
 def test_plan_must_cover_every_current_requirement_and_acceptance_decision() -> None:
@@ -139,6 +232,37 @@ def test_plan_must_cover_every_current_requirement_and_acceptance_decision() -> 
 
     assert "decision:requirement-comment" in str(error.value)
     assert "decision:acceptance-comment" in str(error.value)
+
+
+def test_one_matching_source_covers_a_decision_with_duplicate_evidence() -> None:
+    snapshot = requirements_snapshot()
+    assert snapshot.description is not None
+    duplicate_source = RequirementSource(
+        issue_identifier="ICPM-67703",
+        source_type="comment",
+        source_id="comment:duplicate-requirement",
+        author="product-owner",
+        authority="product",
+    )
+    snapshot.comments = [
+        RequirementArtifact(
+            artifact_id=duplicate_source.source_id,
+            source_type="comment",
+            text=snapshot.current_requirements[0].text,
+            source=duplicate_source,
+        )
+    ]
+    snapshot.current_requirements[0].sources.append(duplicate_source)
+    snapshot = snapshot.with_content_hash()
+
+    plan = parse_plan_spec(
+        json.dumps(plan_payload(snapshot_hash=snapshot.content_hash)),
+        expected_issue_key="ICPM-67703",
+        expected_snapshot_hash=snapshot.content_hash,
+        requirements_snapshot=snapshot,
+    )
+
+    assert plan.requirements[0].jira_sources[0].source_type == "description"
 
 
 def test_current_supporting_evidence_does_not_require_plan_coverage() -> None:
@@ -239,26 +363,42 @@ def test_non_current_decision_sources_cannot_be_promoted_to_active_scope(
         )
 
 
-def test_role_state_matrix_must_reference_every_requirement() -> None:
+def test_role_state_matrix_may_cover_only_role_sensitive_requirements() -> None:
     payload = plan_payload_with_two_requirements()
     payload["role_state_matrix"][0]["acceptance_criterion_ids"].append("AC-sub")
 
-    with pytest.raises(PlanSpecError, match="matrix must reference every requirement"):
-        parse_plan_spec(json.dumps(payload))
+    plan = parse_plan_spec(json.dumps(payload))
+
+    assert plan.role_state_matrix[0].requirement_ids == ["R-role-visibility"]
 
 
-def test_role_state_matrix_must_reference_every_acceptance_criterion() -> None:
+def test_role_state_matrix_may_cover_only_role_sensitive_acceptance_criteria() -> None:
     payload = plan_payload_with_two_requirements()
     payload["role_state_matrix"][0]["requirement_ids"].append("R-sub-visibility")
 
-    with pytest.raises(
-        PlanSpecError,
-        match="matrix must reference every acceptance criterion",
-    ):
+    plan = parse_plan_spec(json.dumps(payload))
+
+    assert plan.role_state_matrix[0].acceptance_criterion_ids == ["AC-gc"]
+
+
+def test_role_neutral_plan_may_use_an_empty_role_state_matrix() -> None:
+    payload = plan_payload()
+    payload["role_state_matrix"] = []
+
+    plan = parse_plan_spec(json.dumps(payload))
+
+    assert plan.role_state_matrix == []
+
+
+def test_role_state_matrix_still_rejects_unknown_plan_ids() -> None:
+    payload = plan_payload()
+    payload["role_state_matrix"][0]["acceptance_criterion_ids"] = ["AC-unknown"]
+
+    with pytest.raises(PlanSpecError, match="unknown role/state acceptance criterion"):
         parse_plan_spec(json.dumps(payload))
 
 
-def test_plan_can_cite_requirement_source_from_linked_issue_context() -> None:
+def test_linked_issue_description_cannot_be_active_plan_evidence() -> None:
     snapshot = requirements_snapshot()
     relation_source = RequirementSource(
         issue_identifier="ICPM-67703",
@@ -318,14 +458,15 @@ def test_plan_can_cite_requirement_source_from_linked_issue_context() -> None:
         linked_source
     ]
 
-    plan = parse_plan_spec(
-        json.dumps(payload),
-        expected_issue_key="ICPM-67703",
-        expected_snapshot_hash=snapshot.content_hash,
-        requirements_snapshot=snapshot,
-    )
+    with pytest.raises(PlanSpecError, match="absent from the current snapshot") as error:
+        parse_plan_spec(
+            json.dumps(payload),
+            expected_issue_key="ICPM-67703",
+            expected_snapshot_hash=snapshot.content_hash,
+            requirements_snapshot=snapshot,
+        )
 
-    assert plan.requirements[0].jira_sources[0].issue_key == "ICPM-68000"
+    assert "ICPM-68000:description:description" in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -337,7 +478,7 @@ def test_plan_can_cite_requirement_source_from_linked_issue_context() -> None:
         ("dependencies", "dependency", "outward"),
     ],
 )
-def test_plan_can_cite_related_issue_relationship_and_attachment(
+def test_related_issue_content_cannot_become_active_plan_evidence(
     snapshot_field: str,
     relationship_type: str,
     direction: str,
@@ -350,29 +491,23 @@ def test_plan_can_cite_related_issue_relationship_and_attachment(
         source_id=f"relation:{relationship_type}",
         authority="context",
     )
-    attachment_source = RequirementSource(
+    comment_source = RequirementSource(
         issue_identifier=related_key,
-        source_type="attachment",
-        source_id=f"attachment:{relationship_type}",
-        author="designer",
-        authority="supporting_evidence",
+        source_type="comment",
+        source_id=f"comment:{relationship_type}",
+        author="product-owner",
+        authority="product",
     )
     related = RelatedIssue(
         identifier=related_key,
         relation=relationship_type,
         direction=direction,
         source=relation_source,
-        attachments=[
-            IssueAttachment(
-                id=f"image-{relationship_type}",
-                filename=f"{relationship_type}.png",
-                mime_type="image/png",
-                source=attachment_source,
-                analysis=AttachmentAnalysis(
-                    status="complete",
-                    modality="vision",
-                    summary="Role-specific column placement.",
-                ),
+        comments=[
+            IssueComment(
+                id=f"comment:{relationship_type}",
+                body="Use the existing column placement.",
+                source=comment_source,
             )
         ],
     )
@@ -387,90 +522,33 @@ def test_plan_can_cite_related_issue_relationship_and_attachment(
         "source_type": "description",
         "source_id": "description",
     }
-    relationship_source = {
-        "issue_key": "ICPM-67703",
-        "source_type": relationship_type,
-        "source_id": relation_source.source_id,
-    }
-    screenshot_source = {
+    related_comment_source = {
         "issue_key": related_key,
-        "source_type": "attachment",
-        "source_id": attachment_source.source_id,
+        "source_type": "comment",
+        "source_id": comment_source.source_id,
     }
     payload = plan_payload(snapshot_hash=snapshot.content_hash)
     payload["requirements"][0]["jira_sources"] = [
         anchor_source,
-        relationship_source,
-        screenshot_source,
+        related_comment_source,
     ]
     payload["requirements"][0]["acceptance_criteria"][0]["jira_sources"] = [
         anchor_source,
-        screenshot_source,
+        related_comment_source,
     ]
 
-    plan = parse_plan_spec(
-        json.dumps(payload),
-        expected_issue_key="ICPM-67703",
-        expected_snapshot_hash=snapshot.content_hash,
-        requirements_snapshot=snapshot,
-    )
+    with pytest.raises(PlanSpecError, match="absent from the current snapshot") as error:
+        parse_plan_spec(
+            json.dumps(payload),
+            expected_issue_key="ICPM-67703",
+            expected_snapshot_hash=snapshot.content_hash,
+            requirements_snapshot=snapshot,
+        )
 
-    assert {source.source_type for source in plan.requirements[0].jira_sources} == {
-        relationship_type,
-        "attachment",
-        "description",
-    }
+    assert f"{related_key}:comment:{comment_source.source_id}" in str(error.value)
 
 
-def test_dependency_also_linked_catalogs_both_relationship_types() -> None:
-    snapshot = requirements_snapshot()
-    relation_source = RequirementSource(
-        issue_identifier="ICPM-67703",
-        source_type="relation",
-        source_id="link:shared:blocker",
-        authority="context",
-    )
-    related = RelatedIssue(
-        identifier="ICPM-BLOCKER",
-        relation="blocks",
-        direction="outward",
-        is_dependency=True,
-        source=relation_source,
-    )
-    snapshot.linked_issues = [related]
-    snapshot.dependencies = [related]
-    snapshot = snapshot.with_content_hash()
-    payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["requirements"][0]["jira_sources"].extend(
-        [
-            {
-                "issue_key": "ICPM-67703",
-                "source_type": "linked_issue",
-                "source_id": relation_source.source_id,
-            },
-            {
-                "issue_key": "ICPM-67703",
-                "source_type": "dependency",
-                "source_id": relation_source.source_id,
-            },
-        ]
-    )
-
-    plan = parse_plan_spec(
-        json.dumps(payload),
-        expected_issue_key="ICPM-67703",
-        expected_snapshot_hash=snapshot.content_hash,
-        requirements_snapshot=snapshot,
-    )
-
-    assert {source.source_type for source in plan.requirements[0].jira_sources} == {
-        "dependency",
-        "description",
-        "linked_issue",
-    }
-
-
-def test_complete_root_and_related_attachments_require_active_citations() -> None:
+def test_complete_attachments_do_not_require_active_citations() -> None:
     snapshot = requirements_snapshot()
     root_attachment = complete_attachment(
         "ICPM-67703",
@@ -499,60 +577,29 @@ def test_complete_root_and_related_attachments_require_active_citations() -> Non
     ]
     snapshot = snapshot.with_content_hash()
     payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["open_questions"] = [
-        {
-            "id": "Q-mockup",
-            "question": "Does the root mockup resolve the placement?",
-            "blocks_implementation": False,
-            "jira_sources": [
-                {
-                    "issue_key": "ICPM-67703",
-                    "source_type": "attachment",
-                    "source_id": root_attachment.source.source_id,
-                }
-            ],
-        }
-    ]
 
-    with pytest.raises(PlanSpecError, match="completely analyzed attachment") as error:
-        parse_plan_spec(
-            json.dumps(payload),
-            expected_issue_key="ICPM-67703",
-            expected_snapshot_hash=snapshot.content_hash,
-            requirements_snapshot=snapshot,
-        )
+    plan = parse_plan_spec(
+        json.dumps(payload),
+        expected_issue_key="ICPM-67703",
+        expected_snapshot_hash=snapshot.content_hash,
+        requirements_snapshot=snapshot,
+    )
 
-    assert "ICPM-67703:attachment:attachment:root-mockup" in str(error.value)
-    assert "ICPM-68000:attachment:attachment:phase-two-mockup" in str(error.value)
+    assert plan.issue_key == "ICPM-67703"
 
 
-def test_combined_or_generic_role_rows_do_not_cover_distinct_jira_roles() -> None:
-    snapshot = requirements_snapshot()
-    assert snapshot.description is not None
-    snapshot.current_requirements = [
-        RequirementDecision(
-            id="decision:role-matrix",
-            text="GC, Sub, and GC acting-as-Sub require distinct behavior.",
-            classification="current",
-            sources=[snapshot.description.source],
-        )
-    ]
-    snapshot = snapshot.with_content_hash()
-    payload = plan_payload(snapshot_hash=snapshot.content_hash)
+def test_canonical_role_is_authoritative_over_human_readable_label() -> None:
+    payload = plan_payload()
     payload["role_state_matrix"][0]["role"] = (
         "All users: GC / Sub / GC acting-as-Sub"
     )
     payload["role_state_matrix"][0]["canonical_role"] = "all"
 
-    with pytest.raises(PlanSpecError, match="all/other matrix row"):
-        parse_plan_spec(
-            json.dumps(payload),
-            expected_issue_key="ICPM-67703",
-            expected_snapshot_hash=snapshot.content_hash,
-            requirements_snapshot=snapshot,
-        )
+    plan = parse_plan_spec(json.dumps(payload))
 
-def test_distinct_role_rows_cover_decisions_and_complete_attachment_summary() -> None:
+    assert plan.role_state_matrix[0].canonical_role == "all"
+
+def test_distinct_role_rows_are_structurally_valid() -> None:
     snapshot = requirements_snapshot()
     assert snapshot.description is not None
     snapshot.current_requirements = [
@@ -578,13 +625,6 @@ def test_distinct_role_rows_cover_decisions_and_complete_attachment_summary() ->
     snapshot.attachments = [role_mockup]
     snapshot = snapshot.with_content_hash()
     payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["requirements"][0]["acceptance_criteria"][0]["jira_sources"].append(
-        {
-            "issue_key": "ICPM-67703",
-            "source_type": "attachment",
-            "source_id": role_mockup.source.source_id,
-        }
-    )
     payload["role_state_matrix"] = [
         {
             "canonical_role": "gc",
@@ -655,7 +695,7 @@ def test_role_neutral_technical_requirement_allows_generic_matrix_row() -> None:
     assert plan.role_state_matrix[0].role == "All users"
 
 
-def test_absent_roles_in_complete_attachment_summary_do_not_require_rows() -> None:
+def test_attachment_role_summary_does_not_influence_matrix() -> None:
     snapshot = requirements_snapshot()
     neutral_mockup = complete_attachment(
         "ICPM-67703",
@@ -665,13 +705,6 @@ def test_absent_roles_in_complete_attachment_summary_do_not_require_rows() -> No
     snapshot.attachments = [neutral_mockup]
     snapshot = snapshot.with_content_hash()
     payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["requirements"][0]["jira_sources"].append(
-        {
-            "issue_key": "ICPM-67703",
-            "source_type": "attachment",
-            "source_id": neutral_mockup.source.source_id,
-        }
-    )
     payload["role_state_matrix"][0]["role"] = "All users"
     payload["role_state_matrix"][0]["canonical_role"] = "all"
 
@@ -685,7 +718,7 @@ def test_absent_roles_in_complete_attachment_summary_do_not_require_rows() -> No
     assert plan.role_state_matrix[0].role == "All users"
 
 
-def test_not_applicable_jira_role_still_requires_its_own_state_row() -> None:
+def test_role_wording_does_not_manufacture_a_required_matrix_row() -> None:
     snapshot = requirements_snapshot()
     assert snapshot.description is not None
     snapshot.current_requirements = [
@@ -708,22 +741,6 @@ def test_not_applicable_jira_role_still_requires_its_own_state_row() -> None:
     payload["role_state_matrix"][0]["role"] = "All users"
     payload["role_state_matrix"][0]["canonical_role"] = "all"
 
-    with pytest.raises(PlanSpecError, match="canonical Jira role: Sub"):
-        parse_plan_spec(
-            json.dumps(payload),
-            expected_issue_key="ICPM-67703",
-            expected_snapshot_hash=snapshot.content_hash,
-            requirements_snapshot=snapshot,
-        )
-
-    payload["role_state_matrix"][0].update(
-        {
-            "canonical_role": "sub",
-            "role": "Sub",
-            "state": "archived project",
-            "expected_behavior": "The behavior is explicitly not applicable.",
-        }
-    )
     plan = parse_plan_spec(
         json.dumps(payload),
         expected_issue_key="ICPM-67703",
@@ -731,7 +748,7 @@ def test_not_applicable_jira_role_still_requires_its_own_state_row() -> None:
         requirements_snapshot=snapshot,
     )
 
-    assert plan.role_state_matrix[0].state == "archived project"
+    assert plan.role_state_matrix[0].canonical_role == "all"
 
 
 def test_current_decision_coverage_distinguishes_colliding_source_types() -> None:
@@ -751,13 +768,24 @@ def test_current_decision_coverage_distinguishes_colliding_source_types() -> Non
             source=comment_source,
         )
     ]
-    attachment = complete_attachment(
-        "ICPM-67703",
-        "collision",
-        "Placement evidence without role tokens.",
+    custom_field_source = RequirementSource(
+        issue_identifier="ICPM-67703",
+        source_type="custom_field",
+        source_id="shared-id",
+        field_id="customfield_context",
+        field_name="Context",
+        author="product-owner",
+        authority="product",
     )
-    attachment.source.source_id = "shared-id"
-    snapshot.attachments = [attachment]
+    snapshot.custom_fields = [
+        RequirementArtifact(
+            artifact_id="shared-id",
+            source_type="custom_field",
+            text="Placement evidence without a current decision.",
+            source=custom_field_source,
+            kind="acceptance_criterion",
+        )
+    ]
     snapshot.current_requirements = [
         RequirementDecision(
             id="decision:comment-collision",
@@ -771,7 +799,7 @@ def test_current_decision_coverage_distinguishes_colliding_source_types() -> Non
     payload["requirements"][0]["jira_sources"] = [
         {
             "issue_key": "ICPM-67703",
-            "source_type": "attachment",
+            "source_type": "custom_field",
             "source_id": "shared-id",
         }
     ]
@@ -792,7 +820,7 @@ def test_current_decision_coverage_distinguishes_colliding_source_types() -> Non
     "source_issue",
     ["ICPM-67703", "ICPM-68000"],
 )
-def test_current_attachment_unit_can_anchor_plan_requirement(
+def test_attachment_unit_cannot_anchor_plan_requirement(
     source_issue: str,
 ) -> None:
     snapshot = requirements_snapshot()
@@ -850,21 +878,11 @@ def test_current_attachment_unit_can_anchor_plan_requirement(
         }
     ]
 
-    plan = parse_plan_spec(
-        json.dumps(payload),
-        expected_issue_key="ICPM-67703",
-        expected_snapshot_hash=snapshot.content_hash,
-        requirements_snapshot=snapshot,
-    )
-
-    assert plan.requirements[0].jira_sources[0].issue_key == source_issue
-    assert (
-        plan.requirements[0].jira_sources[0].source_id
-        == "attachment:column-placement#unit:placement"
-    )
+    with pytest.raises(PlanSpecError, match="description.*custom_field.*comment"):
+        parse_plan_spec(json.dumps(payload))
 
 
-def test_current_attachment_evidence_does_not_manufacture_acceptance_criterion_kind() -> None:
+def test_attachment_cannot_be_active_acceptance_evidence() -> None:
     snapshot = RequirementsSnapshot(
         issue_id="67703",
         issue_identifier="ICPM-67703",
@@ -897,13 +915,8 @@ def test_current_attachment_evidence_does_not_manufacture_acceptance_criterion_k
         attachment_source
     ]
 
-    with pytest.raises(PlanSpecError, match="AcceptanceCriterion.*current Jira decision source"):
-        parse_plan_spec(
-            json.dumps(payload),
-            expected_issue_key="ICPM-67703",
-            expected_snapshot_hash=snapshot.content_hash,
-            requirements_snapshot=snapshot,
-        )
+    with pytest.raises(PlanSpecError, match="description.*custom_field.*comment"):
+        parse_plan_spec(json.dumps(payload))
 
 
 @pytest.mark.parametrize(
@@ -918,12 +931,22 @@ def test_each_active_scope_item_requires_a_current_decision_source(
     unanchored_id: str,
 ) -> None:
     snapshot = requirements_snapshot()
-    auxiliary = complete_attachment(
-        "ICPM-67703",
-        f"auxiliary-{target}",
-        "Supporting placement evidence.",
+    auxiliary_source_model = RequirementSource(
+        issue_identifier="ICPM-67703",
+        source_type="comment",
+        source_id=f"comment:auxiliary-{target}",
+        author="designer",
+        authority="supporting_evidence",
     )
-    snapshot.attachments = [auxiliary]
+    snapshot.comments = [
+        RequirementArtifact(
+            artifact_id=auxiliary_source_model.source_id,
+            source_type="comment",
+            text="Supporting placement evidence.",
+            source=auxiliary_source_model,
+            kind="supporting_evidence",
+        )
+    ]
     snapshot = snapshot.with_content_hash()
     payload = plan_payload_with_two_requirements()
     payload["requirements_snapshot_hash"] = snapshot.content_hash
@@ -933,8 +956,8 @@ def test_each_active_scope_item_requires_a_current_decision_source(
     payload["role_state_matrix"][0]["acceptance_criterion_ids"].append("AC-sub")
     auxiliary_source = {
         "issue_key": "ICPM-67703",
-        "source_type": "attachment",
-        "source_id": auxiliary.source.source_id,
+        "source_type": "comment",
+        "source_id": auxiliary_source_model.source_id,
     }
     if target == "requirement":
         payload["requirements"][1]["jira_sources"] = [auxiliary_source]
@@ -943,7 +966,7 @@ def test_each_active_scope_item_requires_a_current_decision_source(
             auxiliary_source
         ]
 
-    with pytest.raises(PlanSpecError, match="current Jira decision source") as error:
+    with pytest.raises(PlanSpecError, match="current authoritative Jira decision source") as error:
         parse_plan_spec(
             json.dumps(payload),
             expected_issue_key="ICPM-67703",
@@ -1008,19 +1031,48 @@ def test_each_active_scope_item_requires_a_matching_decision_kind() -> None:
     assert "acceptance criteria AC-sub" in str(error.value)
 
 
-def test_plural_jira_roles_require_typed_distinct_matrix_rows() -> None:
+def test_v4_requires_exact_current_unit_citation() -> None:
     snapshot = requirements_snapshot()
-    assert snapshot.description is not None
-    snapshot.current_requirements[0].text = (
-        "GCs, Subs, and GCs acting as Subs have distinct behavior."
+    base_source = RequirementSource(
+        issue_identifier="ICPM-67703",
+        source_type="custom_field",
+        source_id="field:customfield_acceptance",
+        field_id="customfield_acceptance",
+        field_name="Acceptance Criteria",
+        author="product-owner",
+        authority="product",
+    )
+    unit_source = base_source.model_copy(
+        update={"source_id": "field:customfield_acceptance#unit:ac01"}
+    )
+    snapshot.custom_fields = [
+        RequirementArtifact(
+            artifact_id=base_source.source_id,
+            source_type="custom_field",
+            text="The role-aware behavior is visible.",
+            source=base_source,
+            kind="acceptance_criterion",
+        )
+    ]
+    snapshot.current_requirements.append(
+        RequirementDecision(
+            id="decision:acceptance-unit",
+            text="The role-aware behavior is visible.",
+            kind="acceptance_criterion",
+            classification="current",
+            sources=[unit_source],
+        )
     )
     snapshot = snapshot.with_content_hash()
     payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["role_state_matrix"][0].update(
-        {"canonical_role": "all", "role": "All users"}
+    payload["requirements"][0]["acceptance_criteria"][0]["jira_sources"].append(
+        {
+            "issue_key": "ICPM-67703",
+            "source_type": "custom_field",
+            "source_id": base_source.source_id,
+        }
     )
-
-    with pytest.raises(PlanSpecError, match="distinct entries"):
+    with pytest.raises(PlanSpecError, match="does not cover every current") as error:
         parse_plan_spec(
             json.dumps(payload),
             expected_issue_key="ICPM-67703",
@@ -1028,61 +1080,102 @@ def test_plural_jira_roles_require_typed_distinct_matrix_rows() -> None:
             requirements_snapshot=snapshot,
         )
 
-    payload["role_state_matrix"] = [
-        {
-            "canonical_role": canonical_role,
-            "role": label,
-            "state": "active",
-            "expected_behavior": "Apply the role-specific behavior.",
-            "requirement_ids": ["R-role-visibility"],
-            "acceptance_criterion_ids": ["AC-gc"],
-        }
-        for canonical_role, label in (
-            ("gc", "GCs"),
-            ("sub", "Subs"),
-            ("gc_as_sub", "GCs acting as Subs"),
-        )
-    ]
+    assert unit_source.source_id in str(error.value)
+
+    payload["requirements"][0]["acceptance_criteria"][0]["jira_sources"][-1][
+        "source_id"
+    ] = unit_source.source_id
     plan = parse_plan_spec(
         json.dumps(payload),
         expected_issue_key="ICPM-67703",
         expected_snapshot_hash=snapshot.content_hash,
         requirements_snapshot=snapshot,
     )
-
-    assert [entry.canonical_role for entry in plan.role_state_matrix] == [
-        "gc",
-        "sub",
-        "gc_as_sub",
-    ]
-
-
-@pytest.mark.parametrize("role", ["Non-GC users", "All except GC"])
-def test_negated_role_label_cannot_satisfy_canonical_gc(role: str) -> None:
-    payload = plan_payload()
-    payload["role_state_matrix"][0]["role"] = role
-
-    with pytest.raises(PlanSpecError, match="negated|only its canonical_role"):
-        parse_plan_spec(json.dumps(payload))
-
-
-def test_grouped_absent_attachment_roles_do_not_require_rows() -> None:
-    snapshot = requirements_snapshot()
-    attachment = complete_attachment(
-        "ICPM-67703",
-        "grouped-absent-roles",
-        "GC and Sub are not shown; GC acting as Sub is absent.",
+    assert plan.requirements[0].acceptance_criteria[0].jira_sources[-1].source_id == (
+        unit_source.source_id
     )
-    snapshot.attachments = [attachment]
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        "jira-requirements/v1",
+        "jira-requirements/v2",
+        "jira-requirements/v3",
+    ],
+)
+def test_frozen_pre_v4_plan_retains_base_artifact_unit_coverage(
+    schema_version: str,
+) -> None:
+    snapshot = requirements_snapshot().model_copy(
+        update={"schema_version": schema_version}
+    )
+    base_source = RequirementSource(
+        issue_identifier="ICPM-67703",
+        source_type="custom_field",
+        source_id="field:customfield_acceptance",
+        field_id="customfield_acceptance",
+        field_name="Acceptance Criteria",
+        author="product-owner",
+        authority="product",
+    )
+    unit_source = base_source.model_copy(
+        update={"source_id": "field:customfield_acceptance#unit:ac01"}
+    )
+    snapshot.custom_fields = [
+        RequirementArtifact(
+            artifact_id=base_source.source_id,
+            source_type="custom_field",
+            text="The role-aware behavior is visible.",
+            source=base_source,
+            kind="acceptance_criterion",
+        )
+    ]
+    snapshot.current_requirements.append(
+        RequirementDecision(
+            id="decision:acceptance-unit",
+            text="The role-aware behavior is visible.",
+            kind="acceptance_criterion",
+            classification="current",
+            sources=[unit_source],
+        )
+    )
     snapshot = snapshot.with_content_hash()
     payload = plan_payload(snapshot_hash=snapshot.content_hash)
-    payload["requirements"][0]["jira_sources"].append(
+    payload["requirements"][0]["acceptance_criteria"][0]["jira_sources"].append(
         {
             "issue_key": "ICPM-67703",
-            "source_type": "attachment",
-            "source_id": attachment.source.source_id,
+            "source_type": "custom_field",
+            "source_id": base_source.source_id,
         }
     )
+    payload["affected_surface"]["repositories"] = ["./foyr2"]
+    payload["baseline_repository_shas"][0]["repository"] = "./foyr2"
+    payload["affected_surface"]["files"][0]["repository"] = "./foyr2"
+    payload["existing_precedents"][0]["repository"] = "./foyr2"
+
+    plan = parse_frozen_legacy_plan_spec(
+        json.dumps(payload),
+        expected_issue_key="ICPM-67703",
+        expected_snapshot_hash=snapshot.content_hash,
+        issue_type=None,
+        requirements_snapshot=snapshot,
+    )
+
+    assert plan.requirements[0].acceptance_criteria[0].jira_sources[-1].source_id == (
+        base_source.source_id
+    )
+    assert plan.affected_surface.repositories == ["./foyr2"]
+
+
+def test_jira_role_words_do_not_impose_derived_matrix_rows() -> None:
+    snapshot = requirements_snapshot()
+    assert snapshot.description is not None
+    snapshot.current_requirements[0].text = (
+        "GCs, Subs, and GCs acting as Subs have distinct behavior."
+    )
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot.content_hash)
     payload["role_state_matrix"][0].update(
         {"canonical_role": "all", "role": "All users"}
     )
@@ -1097,7 +1190,68 @@ def test_grouped_absent_attachment_roles_do_not_require_rows() -> None:
     assert plan.role_state_matrix[0].canonical_role == "all"
 
 
-def test_role_matrix_rejects_swapped_ids_for_exact_jira_sources() -> None:
+@pytest.mark.parametrize("role", ["Non-GC users", "All except GC"])
+def test_human_readable_role_label_is_not_lexically_validated(role: str) -> None:
+    payload = plan_payload()
+    payload["role_state_matrix"][0]["role"] = role
+
+    plan = parse_plan_spec(json.dumps(payload))
+
+    assert plan.role_state_matrix[0].canonical_role == "gc"
+
+
+def test_gc_acting_as_subcontractor_wording_does_not_block_plan() -> None:
+    snapshot = requirements_snapshot()
+    snapshot.current_requirements[1].text = (
+        "Given a General Contractor is acting as a Subcontractor on a project, "
+        "the Project Created Date cell is blank."
+    )
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot.content_hash)
+    payload["role_state_matrix"][0].update(
+        {
+            "canonical_role": "gc_as_sub",
+            "role": "General Contractor is acting as a Subcontractor",
+            "state": "project role",
+            "expected_behavior": "Leave Project Created Date blank.",
+        }
+    )
+
+    plan = parse_plan_spec(
+        json.dumps(payload),
+        expected_issue_key="ICPM-67703",
+        expected_snapshot_hash=snapshot.content_hash,
+        requirements_snapshot=snapshot,
+    )
+
+    assert plan.role_state_matrix[0].canonical_role == "gc_as_sub"
+
+
+def test_grouped_attachment_role_words_do_not_require_rows() -> None:
+    snapshot = requirements_snapshot()
+    attachment = complete_attachment(
+        "ICPM-67703",
+        "grouped-absent-roles",
+        "GC and Sub are not shown; GC acting as Sub is absent.",
+    )
+    snapshot.attachments = [attachment]
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot.content_hash)
+    payload["role_state_matrix"][0].update(
+        {"canonical_role": "all", "role": "All users"}
+    )
+
+    plan = parse_plan_spec(
+        json.dumps(payload),
+        expected_issue_key="ICPM-67703",
+        expected_snapshot_hash=snapshot.content_hash,
+        requirements_snapshot=snapshot,
+    )
+
+    assert plan.role_state_matrix[0].canonical_role == "all"
+
+
+def test_role_matrix_ids_are_not_bound_by_lexical_source_roles() -> None:
     snapshot = requirements_snapshot()
     assert snapshot.description is not None
     sub_source = RequirementSource(
@@ -1174,23 +1328,6 @@ def test_role_matrix_rejects_swapped_ids_for_exact_jira_sources() -> None:
         },
     ]
 
-    with pytest.raises(PlanSpecError, match="source-citing ID") as error:
-        parse_plan_spec(
-            json.dumps(payload),
-            expected_issue_key="ICPM-67703",
-            expected_snapshot_hash=snapshot.content_hash,
-            requirements_snapshot=snapshot,
-        )
-
-    assert "description requires GC requirement ID(s) R-role-visibility" in str(
-        error.value
-    )
-    assert "comment:sub-requirement requires Sub requirement ID(s) R-sub-visibility" in str(
-        error.value
-    )
-
-    payload["role_state_matrix"][0]["requirement_ids"] = ["R-role-visibility"]
-    payload["role_state_matrix"][1]["requirement_ids"] = ["R-sub-visibility"]
     plan = parse_plan_spec(
         json.dumps(payload),
         expected_issue_key="ICPM-67703",
@@ -1198,10 +1335,10 @@ def test_role_matrix_rejects_swapped_ids_for_exact_jira_sources() -> None:
         requirements_snapshot=snapshot,
     )
 
-    assert plan.role_state_matrix[0].requirement_ids == ["R-role-visibility"]
+    assert plan.role_state_matrix[0].requirement_ids == ["R-sub-visibility"]
 
 
-def test_attachment_role_evidence_binds_the_acceptance_id_that_cites_it() -> None:
+def test_uncited_attachment_role_words_do_not_bind_matrix_ids() -> None:
     snapshot = requirements_snapshot()
     gc_mockup = complete_attachment(
         "ICPM-67703",
@@ -1212,13 +1349,6 @@ def test_attachment_role_evidence_binds_the_acceptance_id_that_cites_it() -> Non
     snapshot = snapshot.with_content_hash()
     payload = plan_payload_with_two_requirements()
     payload["requirements_snapshot_hash"] = snapshot.content_hash
-    payload["requirements"][1]["acceptance_criteria"][0]["jira_sources"].append(
-        {
-            "issue_key": "ICPM-67703",
-            "source_type": "attachment",
-            "source_id": gc_mockup.source.source_id,
-        }
-    )
     payload["role_state_matrix"] = [
         {
             "canonical_role": "gc",
@@ -1238,13 +1368,14 @@ def test_attachment_role_evidence_binds_the_acceptance_id_that_cites_it() -> Non
         },
     ]
 
-    with pytest.raises(PlanSpecError, match="GC acceptance_criterion ID.*AC-sub"):
-        parse_plan_spec(
-            json.dumps(payload),
-            expected_issue_key="ICPM-67703",
-            expected_snapshot_hash=snapshot.content_hash,
-            requirements_snapshot=snapshot,
-        )
+    plan = parse_plan_spec(
+        json.dumps(payload),
+        expected_issue_key="ICPM-67703",
+        expected_snapshot_hash=snapshot.content_hash,
+        requirements_snapshot=snapshot,
+    )
+
+    assert plan.role_state_matrix[1].acceptance_criterion_ids == ["AC-sub"]
 
 
 @pytest.mark.parametrize(
@@ -1386,6 +1517,47 @@ def test_precedent_repository_and_path_must_be_statically_bounded() -> None:
     payload = plan_payload()
     payload["existing_precedents"][0]["path"] = "../outside.py"
     with pytest.raises(PlanSpecError, match="must stay within"):
+        parse_plan_spec(json.dumps(payload))
+
+
+def test_repository_paths_are_normalized_across_the_current_plan() -> None:
+    payload = plan_payload()
+    payload["affected_surface"]["repositories"] = ["./services/./api/"]
+    payload["baseline_repository_shas"][0]["repository"] = "services/api"
+    payload["affected_surface"]["files"][0]["repository"] = "services//api"
+    payload["existing_precedents"][0]["repository"] = "services\\api"
+
+    plan = parse_plan_spec(json.dumps(payload))
+
+    assert plan.affected_surface.repositories == ["services/api"]
+    assert plan.baseline_repository_shas[0].repository == "services/api"
+    assert plan.affected_surface.files[0].repository == "services/api"
+    assert plan.existing_precedents[0].repository == "services/api"
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [
+        ["services/api", "services/./api"],
+        [".", "./"],
+    ],
+)
+def test_current_plan_rejects_duplicate_repository_aliases(
+    aliases: list[str],
+) -> None:
+    payload = plan_payload()
+    payload["affected_surface"]["repositories"] = aliases
+    payload["baseline_repository_shas"] = [
+        {
+            "repository": repository,
+            "sha": "1234567890abcdef1234567890abcdef12345678",
+        }
+        for repository in aliases
+    ]
+    payload["affected_surface"]["files"][0]["repository"] = aliases[0]
+    payload["existing_precedents"][0]["repository"] = aliases[0]
+
+    with pytest.raises(PlanSpecError, match="aliases.*same workspace-relative"):
         parse_plan_spec(json.dumps(payload))
 
 

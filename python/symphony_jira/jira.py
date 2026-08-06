@@ -50,7 +50,13 @@ BASE_ISSUE_FIELDS = (
     "fixVersions",
 )
 
-ROOT_REQUIREMENT_PRESENCE_FIELDS = BASE_ISSUE_FIELDS
+# Only fields that can supply authoritative planning evidence are completeness
+# checked. The remaining base fields are useful orchestration or relationship
+# context, but their absence must not manufacture a PlanSpec obligation.
+ROOT_REQUIREMENT_PRESENCE_FIELDS = (
+    "description",
+    "comment",
+)
 
 RELATED_ISSUE_FIELDS = (
     "summary",
@@ -62,7 +68,7 @@ RELATED_ISSUE_FIELDS = (
     "attachment",
 )
 
-RELATED_REQUIREMENT_PRESENCE_FIELDS = RELATED_ISSUE_FIELDS
+RELATED_CONTEXT_PRESENCE_FIELDS = RELATED_ISSUE_FIELDS
 
 _SAFE_JIRA_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]*-\d+")
 
@@ -323,18 +329,15 @@ class JiraClient:
         response = await self._client.get(f"/rest/api/2/issue/{key}", params=params)
         response.raise_for_status()
         payload = response.json()
-        payload, provenance_incomplete_reasons = await self._complete_changelog(
+        payload, changelog_context_warnings = await self._complete_changelog(
             key, payload
         )
 
         comments: list[IssueComment] | None = None
+        evidence_incomplete_reasons: list[str] = []
         if include_comments:
             comments, comment_incomplete_reasons = await self._get_all_comments(key)
-            provenance_incomplete_reasons = list(
-                dict.fromkeys(
-                    provenance_incomplete_reasons + comment_incomplete_reasons
-                )
-            )
+            evidence_incomplete_reasons.extend(comment_incomplete_reasons)
 
         issue = normalize_issue(
             payload,
@@ -342,10 +345,10 @@ class JiraClient:
             requirements_config=self.config.requirements,
             comments=comments,
             requirement_classifier=self.requirement_classifier,
-            provenance_incomplete_reasons=provenance_incomplete_reasons,
+            provenance_incomplete_reasons=evidence_incomplete_reasons,
+            context_warnings=changelog_context_warnings,
         )
         if include_comments:
-            issue.attachments = await self._analyze_attachments(issue.attachments)
             if self._child_discovery_enabled(issue):
                 configured_children, child_incomplete_reasons = (
                     await self._get_configured_children(issue)
@@ -353,9 +356,9 @@ class JiraClient:
                 issue.children = _deduplicate_related_issues(
                     issue.children + configured_children
                 )
-                issue.provenance_incomplete_reasons = list(
+                issue.context_warnings = list(
                     dict.fromkeys(
-                        issue.provenance_incomplete_reasons + child_incomplete_reasons
+                        issue.context_warnings + child_incomplete_reasons
                     )
                 )
             await self._hydrate_related_issue_context(issue)
@@ -928,11 +931,8 @@ class JiraClient:
                         issue_url=issue_url,
                         authority=self.config.requirements.attachment_authority,
                     )
-                    comment_result, attachments = await asyncio.gather(
-                        self._get_all_comments(identifier),
-                        self._analyze_attachments(raw_attachments),
-                    )
-                    comments, comment_reasons = comment_result
+                    comments, comment_reasons = await self._get_all_comments(identifier)
+                    attachments = raw_attachments
                     provenance_reasons = list(
                         dict.fromkeys(
                             provenance_reasons + comment_reasons
@@ -1056,9 +1056,11 @@ def normalize_issue(
     comments: list[IssueComment] | None = None,
     requirement_classifier: RequirementClassifier | None = None,
     provenance_incomplete_reasons: list[str] | None = None,
+    context_warnings: list[str] | None = None,
 ) -> Issue:
     config = requirements_config or JiraRequirementsConfig()
     classifier = requirement_classifier or MarkerRequirementClassifier()
+    comments_were_supplied = comments is not None
     raw_fields = payload.get("fields")
     fields = raw_fields if isinstance(raw_fields, Mapping) else {}
     status = fields.get("status") or {}
@@ -1072,11 +1074,14 @@ def normalize_issue(
     provenance_reasons = list(
         dict.fromkeys(
             (provenance_incomplete_reasons or [])
-            + _declared_changelog_incomplete_reasons(payload, key)
             + _missing_requested_field_reasons(
                 fields,
                 key,
-                ROOT_REQUIREMENT_PRESENCE_FIELDS,
+                tuple(
+                    field_id
+                    for field_id in ROOT_REQUIREMENT_PRESENCE_FIELDS
+                    if field_id != "comment" or not comments_were_supplied
+                ),
             )
         )
     )
@@ -1183,6 +1188,21 @@ def normalize_issue(
         components=components,
         versions=versions,
         provenance_incomplete_reasons=provenance_reasons,
+        context_warnings=list(
+            dict.fromkeys(
+                (context_warnings or [])
+                + _declared_changelog_incomplete_reasons(payload, key)
+                + _missing_requested_context_field_warnings(
+                    fields,
+                    key,
+                    tuple(
+                        field_id
+                        for field_id in BASE_ISSUE_FIELDS
+                        if field_id not in ROOT_REQUIREMENT_PRESENCE_FIELDS
+                    ),
+                )
+            )
+        ),
         raw=dict(payload),
     )
     issue.requirements_snapshot = build_requirements_snapshot(
@@ -1194,42 +1214,12 @@ def normalize_issue(
     return issue
 
 
-def _attachment_analysis_artifact(
-    attachment: IssueAttachment,
-) -> RequirementArtifact | None:
-    summary = attachment.analysis.summary.strip()
-    if attachment.analysis.status != "complete" or not summary:
-        return None
-    return RequirementArtifact(
-        artifact_id=attachment.source.source_id,
-        source_type="attachment",
-        text=summary,
-        value={
-            "attachment_id": attachment.id,
-            "filename": attachment.filename,
-            "mime_type": attachment.mime_type,
-            "analysis": {
-                "status": attachment.analysis.status,
-                "modality": attachment.analysis.modality,
-                "analyzer": attachment.analysis.analyzer,
-            },
-        },
-        source=attachment.source,
-        kind="supporting_evidence",
-    )
-
-
-def _refresh_related_attachment_artifacts(related: RelatedIssue) -> RelatedIssue:
+def _contextualize_related_requirements(related: RelatedIssue) -> RelatedIssue:
     requirements = [
-        artifact
+        artifact.model_copy(update={"planning_eligible": False})
         for artifact in related.requirements
         if artifact.source_type != "attachment"
     ]
-    requirements.extend(
-        artifact
-        for attachment in related.attachments
-        if (artifact := _attachment_analysis_artifact(attachment)) is not None
-    )
     return related.model_copy(update={"requirements": requirements})
 
 
@@ -1278,9 +1268,14 @@ def build_requirements_snapshot(
     acceptance_fields = set(config.acceptance_criteria_fields)
     custom_artifacts: list[RequirementArtifact] = []
     incomplete_reasons: list[str] = list(issue.provenance_incomplete_reasons)
+    context_warnings: list[str] = list(issue.context_warnings)
     for field_id in dict.fromkeys(config.custom_fields + config.acceptance_criteria_fields):
         if field_id not in fields:
-            incomplete_reasons.append(f"Configured Jira field {field_id} was not returned.")
+            message = f"Configured Jira field {field_id} was not returned."
+            if field_id in acceptance_fields:
+                incomplete_reasons.append(message)
+            else:
+                context_warnings.append(message)
             continue
         value = fields.get(field_id)
         if value is None:
@@ -1314,6 +1309,7 @@ def build_requirements_snapshot(
                 value=value,
                 source=source,
                 kind="acceptance_criterion" if field_id in acceptance_fields else "requirement",
+                planning_eligible=field_id in acceptance_fields,
             )
         )
 
@@ -1341,27 +1337,20 @@ def build_requirements_snapshot(
         for comment in issue.comments
         if comment.body
     ]
-    attachment_artifacts = [
-        artifact
-        for attachment in issue.attachments
-        if (artifact := _attachment_analysis_artifact(attachment)) is not None
-    ]
-
     snapshot_parent = (
-        _refresh_related_attachment_artifacts(issue.parent)
+        _contextualize_related_requirements(issue.parent)
         if issue.parent is not None
         else None
     )
     snapshot_children = [
-        _refresh_related_attachment_artifacts(related) for related in issue.children
+        _contextualize_related_requirements(related) for related in issue.children
     ]
     snapshot_linked_issues = [
-        _refresh_related_attachment_artifacts(related) for related in issue.linked_issues
+        _contextualize_related_requirements(related) for related in issue.linked_issues
     ]
     snapshot_dependencies = [
-        _refresh_related_attachment_artifacts(related) for related in issue.dependencies
+        _contextualize_related_requirements(related) for related in issue.dependencies
     ]
-    related_artifacts_by_source: dict[tuple[str, str, str], RequirementArtifact] = {}
     related_issues = (
         ([snapshot_parent] if snapshot_parent is not None else [])
         + snapshot_children
@@ -1370,66 +1359,39 @@ def build_requirements_snapshot(
     )
     for related in related_issues:
         if related.hydration_error:
-            incomplete_reasons.append(related.hydration_error)
-        incomplete_reasons.extend(related.provenance_incomplete_reasons)
-        for artifact in related.requirements:
-            key = (
-                artifact.source.issue_identifier,
-                artifact.source.source_id,
-                artifact.artifact_id,
-            )
-            related_artifacts_by_source[key] = artifact
+            context_warnings.append(related.hydration_error)
+        context_warnings.extend(related.provenance_incomplete_reasons)
 
+    # Product scope is intentionally closed over the root issue's Description,
+    # configured Acceptance Criteria fields, and comments. Generic custom
+    # fields, attachments, and related issue artifacts remain context only and
+    # cannot create mandatory PlanSpec coverage obligations.
+    acceptance_artifacts = [
+        artifact
+        for artifact in custom_artifacts
+        if artifact.kind == "acceptance_criterion"
+    ]
     decisions, decision_incomplete = _classify_decisions(
         issue.identifier,
         [artifact for artifact in [description] if artifact is not None]
-        + custom_artifacts
-        + comment_artifacts
-        + attachment_artifacts
-        + list(related_artifacts_by_source.values()),
+        + acceptance_artifacts
+        + comment_artifacts,
         classifier,
         config.authority_rank,
     )
     incomplete_reasons.extend(decision_incomplete)
     ranked_authorities = {authority.strip().casefold() for authority in config.authority_rank}
-    for attachment in issue.attachments:
-        if attachment.analysis.status == "complete" and not attachment.analysis.summary.strip():
-            incomplete_reasons.append(
-                f"Attachment {attachment.id} ({attachment.filename}) analysis summary is blank."
-            )
-        elif attachment.analysis.status == "error" or (
-            config.require_attachment_analysis and attachment.analysis.status != "complete"
-        ):
-            incomplete_reasons.append(
-                f"Attachment {attachment.id} ({attachment.filename}) analysis is {attachment.analysis.status}."
-            )
-    seen_related_attachments: set[tuple[str, str]] = set()
-    for related in related_issues:
-        for attachment in related.attachments:
-            attachment_key = (related.identifier, attachment.id)
-            if attachment_key in seen_related_attachments:
-                continue
-            seen_related_attachments.add(attachment_key)
-            if attachment.analysis.status == "complete" and not attachment.analysis.summary.strip():
-                incomplete_reasons.append(
-                    f"Attachment {attachment.id} ({attachment.filename}) on related Jira issue "
-                    f"{related.identifier} analysis summary is blank."
-                )
-            elif attachment.analysis.status == "error" or (
-                config.require_attachment_analysis and attachment.analysis.status != "complete"
-            ):
-                incomplete_reasons.append(
-                    f"Attachment {attachment.id} ({attachment.filename}) on related Jira issue "
-                    f"{related.identifier} analysis is {attachment.analysis.status}."
-                )
-
     for decision in decisions:
         for source in decision.sources:
             author = source.author.strip().casefold()
             if not author or author == "unknown":
-                incomplete_reasons.append(f"Decision {decision.id} has no known source author.")
+                context_warnings.append(
+                    f"Decision {decision.id} has no known source author."
+                )
             if source.timestamp is None:
-                incomplete_reasons.append(f"Decision {decision.id} has no known source timestamp.")
+                context_warnings.append(
+                    f"Decision {decision.id} has no known source timestamp."
+                )
             authority = source.authority.strip().casefold()
             if not authority or authority == "unknown":
                 incomplete_reasons.append(
@@ -1472,6 +1434,7 @@ def build_requirements_snapshot(
             if item.classification == "unresolved_contradiction"
         ],
         incomplete_reasons=list(dict.fromkeys(incomplete_reasons)),
+        context_warnings=list(dict.fromkeys(context_warnings)),
     )
     return snapshot.with_content_hash()
 
@@ -1481,15 +1444,6 @@ _BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)(.+?)\s*$")
 _CLAUSE_BOUNDARY = re.compile(
     r"(?<=[.!?;])\s+(?=(?:\[[^\]]+\]\s*)?[A-Z0-9])"
 )
-_DECISION_MARKER = re.compile(
-    r"\[(?:classification\s*:\s*[^\]]+|supersedes\s*:[^\]]+|"
-    r"inferred|assumption|superseded|obsolete|contradiction|"
-    r"unresolved[_ -]?contradiction)\]",
-    re.IGNORECASE,
-)
-_ORDER_TOKEN = re.compile(r"\b(before|after)\b", re.IGNORECASE)
-
-
 def _decision_text_units(text: str) -> list[str]:
     """Split explicit bullets/paragraph clauses without pretending to understand prose."""
 
@@ -1621,130 +1575,6 @@ def _supersession_cycle_nodes(
         if state.get(node, 0) == 0:
             visit(node)
     return cycle_nodes
-
-
-def _conflict_text(text: str) -> str:
-    without_markers = _DECISION_MARKER.sub(" ", text)
-    return re.sub(r"[^a-z0-9]+", " ", without_markers.casefold()).strip()
-
-
-def _polarity_signature(text: str) -> tuple[str, bool] | None:
-    normalized = _conflict_text(text)
-    if not normalized:
-        return None
-    normalized = normalized.replace("doesn t", "does not").replace("don t", "do not")
-    normalized = normalized.replace("isn t", "is not").replace("aren t", "are not")
-    normalized = normalized.replace("can t", "cannot")
-    negative = False
-    replacements = (
-        (r"\b(?:does|do|did) not\b", ""),
-        (r"\b(is|are|was|were|will|must|should|can) not\b", r"\1"),
-        (r"\bcannot\b", "can"),
-    )
-    for pattern, replacement in replacements:
-        revised, count = re.subn(pattern, replacement, normalized)
-        if count:
-            negative = True
-            normalized = revised
-    words = normalized.split()
-    lemma = {
-        "sees": "see",
-        "shows": "show",
-        "displays": "display",
-        "includes": "include",
-        "uses": "use",
-        "allows": "allow",
-        "requires": "require",
-        "has": "have",
-    }
-    signature = " ".join(lemma.get(word, word) for word in words)
-    return (signature, negative) if signature else None
-
-
-def _order_signature(text: str) -> tuple[str, str] | None:
-    clean = _DECISION_MARKER.sub(" ", text)
-    matches = [match.casefold() for match in _ORDER_TOKEN.findall(clean)]
-    if not matches or len(set(matches)) != 1:
-        return None
-    relation = matches[0]
-    signature = _conflict_text(_ORDER_TOKEN.sub(" order ", clean))
-    return (signature, relation) if signature else None
-
-
-def _reconcile_clear_conflicts(
-    decisions: list[RequirementDecision],
-) -> list[RequirementDecision]:
-    current = [decision for decision in decisions if decision.classification == "current"]
-    groups: dict[tuple[str, str, str], dict[str, list[RequirementDecision]]] = {}
-    for decision in current:
-        conflict_layer = (
-            "requirement"
-            if decision.kind in {"requirement", "supporting_evidence"}
-            else decision.kind
-        )
-        polarity = _polarity_signature(decision.text)
-        if polarity is not None:
-            signature, negative = polarity
-            groups.setdefault((conflict_layer, "polarity", signature), {}).setdefault(
-                "negative" if negative else "positive", []
-            ).append(decision)
-        order = _order_signature(decision.text)
-        if order is not None:
-            signature, relation = order
-            groups.setdefault((conflict_layer, "order", signature), {}).setdefault(
-                relation, []
-            ).append(decision)
-
-    conflict_edges: set[tuple[str, str]] = set()
-    for (_, conflict_kind, _), values in groups.items():
-        opposing = (
-            (values.get("positive", []), values.get("negative", []))
-            if conflict_kind == "polarity"
-            else (values.get("before", []), values.get("after", []))
-        )
-        for left in opposing[0]:
-            for right in opposing[1]:
-                conflict_edges.add(tuple(sorted((left.id, right.id))))
-
-    if not conflict_edges:
-        return decisions
-    by_id = {decision.id: decision for decision in decisions}
-    adjacency: dict[str, set[str]] = {}
-    for left, right in conflict_edges:
-        adjacency.setdefault(left, set()).add(right)
-        adjacency.setdefault(right, set()).add(left)
-
-    conflicted: set[str] = set()
-    replacements: list[RequirementDecision] = []
-    for start in sorted(adjacency):
-        if start in conflicted:
-            continue
-        stack = [start]
-        component: set[str] = set()
-        while stack:
-            node = stack.pop()
-            if node in component:
-                continue
-            component.add(node)
-            stack.extend(adjacency.get(node, set()) - component)
-        conflicted.update(component)
-        members = [by_id[decision_id] for decision_id in sorted(component)]
-        digest = hashlib.sha256("\n".join(sorted(component)).encode("utf-8")).hexdigest()[:16]
-        replacements.append(
-            RequirementDecision(
-                id=f"jira:conflict:{digest}",
-                text="Unresolved conflict: "
-                + " | ".join(f"{member.id}: {member.text}" for member in members),
-                kind=(
-                    "requirement"
-                    if any(member.kind == "requirement" for member in members)
-                    else members[0].kind
-                ),
-                classification="unresolved_contradiction",
-                sources=_merge_sources(*(member.sources for member in members)),
-            )
-        )
-    return [decision for decision in decisions if decision.id not in conflicted] + replacements
 
 
 def _classify_decisions(
@@ -1898,7 +1728,11 @@ def _classify_decisions(
         target.superseded_by.append(source.id)
         target.classification = "superseded"
 
-    return _reconcile_clear_conflicts(decisions), incomplete
+    # Do not infer a hard contradiction from lexical polarity or ordering alone.
+    # Roles, states, and conditions are easily lost in terse Jira prose, so only
+    # an explicit contradiction marker or an invalid supersession graph blocks
+    # the evidence bundle.
+    return decisions, incomplete
 
 
 def normalize_comment(
@@ -2095,10 +1929,10 @@ def hydrate_related_issue_context(
         dict.fromkeys(
             (provenance_incomplete_reasons or [])
             + _declared_changelog_incomplete_reasons(payload, related.identifier)
-            + _missing_requested_field_reasons(
+            + _missing_requested_context_field_warnings(
                 fields,
                 related.identifier,
-                RELATED_REQUIREMENT_PRESENCE_FIELDS,
+                RELATED_CONTEXT_PRESENCE_FIELDS,
             )
         )
     )
@@ -2230,14 +2064,6 @@ def hydrate_related_issue_context(
         for comment in comments
         if comment.body
     )
-    artifacts.extend(
-        artifact
-        for attachment in attachments
-        if (artifact := _attachment_analysis_artifact(attachment)) is not None
-    )
-
-
-
     status = fields.get("status") or {}
     issue_type = fields.get("issuetype") or {}
     return related.model_copy(
@@ -2250,7 +2076,10 @@ def hydrate_related_issue_context(
             "custom_fields": custom_fields,
             "comments": comments,
             "attachments": attachments,
-            "requirements": artifacts,
+            "requirements": [
+                artifact.model_copy(update={"planning_eligible": False})
+                for artifact in artifacts
+            ],
             "hydration_error": None,
             "provenance_incomplete_reasons": list(dict.fromkeys(provenance_reasons)),
             "source": related.source.model_copy(update={"url": url}),
@@ -2522,7 +2351,32 @@ def _missing_requested_field_reasons(
         "requirement context is incomplete."
         for field_id in requested_fields
         if field_id not in fields
+        and not _requested_field_is_explicitly_not_applicable(fields, field_id)
     ]
+
+
+def _missing_requested_context_field_warnings(
+    fields: Mapping[str, Any],
+    issue_identifier: str,
+    requested_fields: tuple[str, ...],
+) -> list[str]:
+    return [
+        f"Jira issue {issue_identifier} did not return contextual field {field_id}; "
+        "planning evidence is unaffected."
+        for field_id in requested_fields
+        if field_id not in fields
+        and not _requested_field_is_explicitly_not_applicable(fields, field_id)
+    ]
+
+
+def _requested_field_is_explicitly_not_applicable(
+    fields: Mapping[str, Any],
+    field_id: str,
+) -> bool:
+    if field_id != "parent":
+        return False
+    issue_type = fields.get("issuetype")
+    return isinstance(issue_type, Mapping) and issue_type.get("subtask") is False
 
 
 def _same_origin_attachment_url(base_url: str, content_url: str) -> str:

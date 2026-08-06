@@ -7,12 +7,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .automation_plan import AutomationPlan, automation_result_content_hash
 from .models import (
     CodexEvent,
     Issue,
     RequirementsSnapshot,
     RunRecord,
     issue_description_fingerprint,
+    requirements_planning_authority_equivalent,
     utc_now,
 )
 
@@ -45,6 +47,10 @@ class Store:
                   attempt INTEGER NOT NULL,
                   started_at TEXT NOT NULL,
                   plan_spec_hash TEXT,
+                  automation_plan_hash TEXT,
+                  automation_development_diff_hash TEXT,
+                  automation_repository_diff_hash TEXT,
+                  automation_result_hash TEXT,
                   plan_approval_id TEXT,
                   finished_at TEXT,
                   final_message TEXT,
@@ -52,7 +58,9 @@ class Store:
                   blocked_phase TEXT,
                   branch_name TEXT,
                   verification_status TEXT,
-                  verification_output_path TEXT
+                  verification_output_path TEXT,
+                  verification_workspace_diff_hash TEXT,
+                  verification_evidence_sha256 TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS codex_events (
@@ -91,6 +99,10 @@ class Store:
                   question TEXT,
                   response TEXT NOT NULL,
                   approval_id TEXT,
+                  action TEXT NOT NULL DEFAULT 'response',
+                  approver_identity TEXT,
+                  workspace_diff_hash TEXT,
+                  verification_evidence_sha256 TEXT,
                   claimed_at TEXT,
                   claim_token TEXT,
                   consumed_at TEXT,
@@ -141,6 +153,12 @@ class Store:
                   requirements_snapshot_hash TEXT NOT NULL,
                   plan_spec_hash TEXT,
                   plan_spec TEXT,
+                  automation_plan_hash TEXT,
+                  automation_development_diff_hash TEXT,
+                  automation_repository_diff_hash TEXT,
+                  automation_result_hash TEXT,
+                  automation_plan TEXT,
+                  automation_result TEXT,
                   plan_approval_id TEXT,
                   approval_json TEXT,
                   source_final_message TEXT,
@@ -176,9 +194,85 @@ class Store:
             self._ensure_column(conn, "human_inputs", "approval_id", "TEXT")
             self._ensure_column(conn, "human_inputs", "claimed_at", "TEXT")
             self._ensure_column(conn, "human_inputs", "claim_token", "TEXT")
+            self._ensure_column(
+                conn,
+                "human_inputs",
+                "action",
+                "TEXT NOT NULL DEFAULT 'response'",
+            )
+            self._ensure_column(conn, "human_inputs", "approver_identity", "TEXT")
+            self._ensure_column(conn, "human_inputs", "workspace_diff_hash", "TEXT")
+            self._ensure_column(
+                conn,
+                "human_inputs",
+                "verification_evidence_sha256",
+                "TEXT",
+            )
             self._ensure_column(conn, "runs", "plan_spec_hash", "TEXT")
+            self._ensure_column(conn, "runs", "automation_plan_hash", "TEXT")
+            self._ensure_column(
+                conn,
+                "runs",
+                "automation_development_diff_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "runs",
+                "automation_repository_diff_hash",
+                "TEXT",
+            )
+            self._ensure_column(conn, "runs", "automation_result_hash", "TEXT")
             self._ensure_column(conn, "runs", "plan_approval_id", "TEXT")
+            self._ensure_column(
+                conn,
+                "runs",
+                "verification_workspace_diff_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "runs",
+                "verification_evidence_sha256",
+                "TEXT",
+            )
             self._ensure_column(conn, "human_review_actions", "plan_spec", "TEXT")
+            self._ensure_column(
+                conn,
+                "human_review_actions",
+                "automation_plan_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "human_review_actions",
+                "automation_development_diff_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "human_review_actions",
+                "automation_repository_diff_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "human_review_actions",
+                "automation_result_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "human_review_actions",
+                "automation_plan",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "human_review_actions",
+                "automation_result",
+                "TEXT",
+            )
 
     def save_requirements_snapshot(self, snapshot: RequirementsSnapshot) -> dict[str, Any]:
         issue_identifier = snapshot.issue_identifier.strip()
@@ -292,6 +386,10 @@ class Store:
         attempt: int = 1,
         status: str = "queued",
         plan_spec_hash: str | None = None,
+        automation_plan_hash: str | None = None,
+        automation_development_diff_hash: str | None = None,
+        automation_repository_diff_hash: str | None = None,
+        automation_result_hash: str | None = None,
         plan_approval_id: str | None = None,
         require_no_active_run: bool = False,
     ) -> RunRecord:
@@ -312,6 +410,10 @@ class Store:
             started_at=utc_now(),
             branch_name=branch_name,
             plan_spec_hash=plan_spec_hash,
+            automation_plan_hash=automation_plan_hash,
+            automation_development_diff_hash=automation_development_diff_hash,
+            automation_repository_diff_hash=automation_repository_diff_hash,
+            automation_result_hash=automation_result_hash,
             plan_approval_id=plan_approval_id,
         )
         with self._connect() as conn:
@@ -346,6 +448,9 @@ class Store:
         source_review_history: str | None,
         workspace_diff: str,
         workspace_diff_hash: str,
+        automation_plan_hash: str | None = None,
+        automation_plan: str | None = None,
+        automation_result: str | None = None,
     ) -> tuple[dict[str, Any], RunRecord]:
         """Atomically freeze a completed review request and reserve its child run."""
 
@@ -353,6 +458,9 @@ class Store:
         review_source = source_url.strip()
         review_comments = comments.strip()
         diff_hash = workspace_diff_hash.strip()
+        supplied_automation_hash = str(automation_plan_hash or "").strip().lower() or None
+        automation_plan_text = str(automation_plan or "").strip()
+        automation_result_text = str(automation_result or "").strip()
         if not reviewer:
             raise ValueError("reviewer identity is required")
         if not review_source:
@@ -419,6 +527,88 @@ class Store:
             elif approval is not None:
                 raise ValueError("completed run has no approval identity")
 
+            source_automation_hash = (
+                str(source_run.automation_plan_hash or "").strip().lower() or None
+            )
+            source_development_diff_hash: str | None = None
+            source_repository_diff_hash: str | None = None
+            source_result_hash: str | None = None
+            if source_automation_hash is not None:
+                source_automation_hash = normalize_sha256(
+                    source_automation_hash,
+                    "completed run automation plan hash",
+                )
+                if supplied_automation_hash is None:
+                    raise ValueError(
+                        "completed run has no frozen AutomationPlan hash"
+                    )
+                supplied_automation_hash = normalize_sha256(
+                    supplied_automation_hash,
+                    "frozen AutomationPlan hash",
+                )
+                if supplied_automation_hash != source_automation_hash:
+                    raise ValueError(
+                        "frozen AutomationPlan hash does not match the completed run"
+                    )
+                if not automation_plan_text:
+                    raise ValueError(
+                        "completed run has no frozen AutomationPlan content"
+                    )
+                try:
+                    frozen_automation_plan = AutomationPlan.model_validate_json(
+                        automation_plan_text
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "completed run frozen AutomationPlan content is invalid"
+                    ) from exc
+                if frozen_automation_plan.content_hash() != source_automation_hash:
+                    raise ValueError(
+                        "frozen AutomationPlan content does not match the completed run"
+                    )
+                source_development_diff_hash = normalize_sha256(
+                    str(source_run.automation_development_diff_hash or ""),
+                    "completed run automation development-diff hash",
+                )
+                if (
+                    frozen_automation_plan.development_workspace_diff_hash
+                    != source_development_diff_hash
+                ):
+                    raise ValueError(
+                        "frozen AutomationPlan development diff does not match the "
+                        "completed run"
+                    )
+                source_repository_diff_hash = normalize_sha256(
+                    str(source_run.automation_repository_diff_hash or ""),
+                    "completed run automation repository-diff hash",
+                )
+                if not automation_result_text:
+                    raise ValueError(
+                        "completed run has no frozen automation result"
+                    )
+                source_result_hash = normalize_sha256(
+                    str(source_run.automation_result_hash or ""),
+                    "completed run automation result hash",
+                )
+                if (
+                    automation_result_content_hash(automation_result_text)
+                    != source_result_hash
+                ):
+                    raise ValueError(
+                        "frozen automation result does not match the completed run"
+                    )
+            elif (
+                supplied_automation_hash is not None
+                or automation_plan_text
+                or automation_result_text
+                or source_run.automation_development_diff_hash is not None
+                or source_run.automation_repository_diff_hash is not None
+                or source_run.automation_result_hash is not None
+            ):
+                raise ValueError(
+                    "completed run has no automation-plan identity"
+                )
+
             result_run = RunRecord(
                 id=str(uuid.uuid4()),
                 issue_id=source_run.issue_id,
@@ -430,6 +620,14 @@ class Store:
                 started_at=now,
                 branch_name=source_run.branch_name,
                 plan_spec_hash=plan_hash,
+                automation_plan_hash=source_automation_hash,
+                automation_development_diff_hash=(
+                    source_development_diff_hash
+                ),
+                automation_repository_diff_hash=(
+                    source_repository_diff_hash
+                ),
+                automation_result_hash=source_result_hash,
                 plan_approval_id=approval_id,
             )
             self._insert_run(conn, result_run)
@@ -439,6 +637,9 @@ class Store:
                   id, issue_identifier, source_run_id, result_run_id,
                   reviewer_identity, source_url, comments,
                   requirements_snapshot_hash, plan_spec_hash, plan_spec,
+                  automation_plan_hash, automation_development_diff_hash,
+                  automation_repository_diff_hash, automation_result_hash,
+                  automation_plan, automation_result,
                   plan_approval_id, approval_json, source_final_message,
                   source_review, source_review_history, workspace_diff,
                   workspace_diff_hash, triage_decision, triage_output,
@@ -447,7 +648,7 @@ class Store:
                 )
                 VALUES (
                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -461,6 +662,12 @@ class Store:
                     requirements_snapshot_hash,
                     plan_hash,
                     plan_text or None,
+                    source_automation_hash,
+                    source_development_diff_hash,
+                    source_repository_diff_hash,
+                    source_result_hash,
+                    automation_plan_text or None,
+                    automation_result_text or None,
                     approval_id,
                     json.dumps(
                         frozen_approval,
@@ -614,17 +821,81 @@ class Store:
                 raise StoreIntegrityError(
                     "human resume approval identity does not match its predecessor run"
                 )
+            requirements_fingerprint = issue_description_fingerprint(issue)
+            if (
+                predecessor.blocked_phase == "verification_environment"
+                and predecessor.plan_spec_hash
+                and predecessor.plan_approval_id
+                and predecessor.issue_fingerprint
+                and issue.requirements_snapshot is not None
+                and issue.requirements_snapshot.schema_version
+                == "jira-requirements/v4"
+            ):
+                frozen_row = conn.execute(
+                    """
+                    SELECT issue_identifier, content_hash, schema_version,
+                           snapshot_json, captured_at, stored_at
+                    FROM requirements_snapshots
+                    WHERE issue_identifier = ? AND content_hash = ?
+                    """,
+                    (
+                        predecessor.issue_identifier,
+                        predecessor.issue_fingerprint,
+                    ),
+                ).fetchone()
+                approval_row = conn.execute(
+                    "SELECT * FROM plan_approvals WHERE id = ?",
+                    (predecessor.plan_approval_id,),
+                ).fetchone()
+                if frozen_row is not None and approval_row is not None:
+                    frozen_snapshot = self._validated_requirements_snapshot_row(
+                        frozen_row,
+                        expected_issue_identifier=predecessor.issue_identifier,
+                        expected_content_hash=predecessor.issue_fingerprint,
+                    )
+                    frozen_approval = dict(approval_row)
+                    if (
+                        frozen_snapshot.schema_version
+                        in {
+                            "jira-requirements/v1",
+                            "jira-requirements/v2",
+                            "jira-requirements/v3",
+                        }
+                        and not frozen_approval.get("invalidated_at")
+                        and frozen_approval.get("issue_identifier")
+                        == predecessor.issue_identifier
+                        and frozen_approval.get("plan_spec_hash")
+                        == predecessor.plan_spec_hash
+                        and frozen_approval.get("requirements_snapshot_hash")
+                        == predecessor.issue_fingerprint
+                        and requirements_planning_authority_equivalent(
+                            frozen_snapshot,
+                            issue.requirements_snapshot,
+                        )
+                    ):
+                        # Keep the queued resume fenced to the exact historical
+                        # PlanSpec/approval pair. The current v4 snapshot was
+                        # saved above for audit and is rechecked by the runner.
+                        requirements_fingerprint = predecessor.issue_fingerprint
             record = RunRecord(
                 id=str(uuid.uuid4()),
                 issue_id=issue.id,
                 issue_identifier=issue.identifier,
-                issue_fingerprint=issue_description_fingerprint(issue),
+                issue_fingerprint=requirements_fingerprint,
                 workspace_path=str(workspace_path),
                 status="queued",
                 attempt=attempt,
                 started_at=utc_now(),
                 branch_name=branch_name,
                 plan_spec_hash=predecessor.plan_spec_hash,
+                automation_plan_hash=predecessor.automation_plan_hash,
+                automation_development_diff_hash=(
+                    predecessor.automation_development_diff_hash
+                ),
+                automation_repository_diff_hash=(
+                    predecessor.automation_repository_diff_hash
+                ),
+                automation_result_hash=predecessor.automation_result_hash,
                 plan_approval_id=predecessor.plan_approval_id,
             )
             self._insert_run(conn, record)
@@ -699,13 +970,41 @@ class Store:
             )
             if cursor.rowcount != 1:
                 return None
+            predecessor = conn.execute(
+                """
+                SELECT p.plan_spec_hash, p.automation_plan_hash,
+                       p.automation_development_diff_hash,
+                       p.automation_repository_diff_hash,
+                       p.automation_result_hash, p.plan_approval_id
+                FROM human_resume_handoffs AS h
+                JOIN runs AS p ON p.id = h.predecessor_run_id
+                WHERE h.resume_run_id = ?
+                """,
+                (resume_run_id,),
+            ).fetchone()
+            if predecessor is None:
+                raise StoreIntegrityError(
+                    "human resume predecessor disappeared during stale reclaim"
+                )
             conn.execute(
                 """
                 UPDATE runs SET status = 'queued', finished_at = NULL, error = NULL,
-                                blocked_phase = NULL
+                                blocked_phase = NULL, plan_spec_hash = ?,
+                                automation_plan_hash = ?,
+                                automation_development_diff_hash = ?,
+                                automation_repository_diff_hash = ?,
+                                automation_result_hash = ?, plan_approval_id = ?
                 WHERE id = ? AND status = 'running'
                 """,
-                (resume_run_id,),
+                (
+                    predecessor["plan_spec_hash"],
+                    predecessor["automation_plan_hash"],
+                    predecessor["automation_development_diff_hash"],
+                    predecessor["automation_repository_diff_hash"],
+                    predecessor["automation_result_hash"],
+                    predecessor["plan_approval_id"],
+                    resume_run_id,
+                ),
             )
             row = conn.execute(
                 """
@@ -713,7 +1012,8 @@ class Store:
                        h.claimed_at AS handoff_claimed_at,
                        h.claim_token AS handoff_claim_token,
                        a.plan_spec_hash, a.requirements_snapshot_hash,
-                       a.approver_identity, a.approved_at,
+                       a.approver_identity AS plan_approver_identity,
+                       a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
                        a.invalidation_reason AS approval_invalidation_reason
                 FROM human_resume_handoffs AS h
@@ -723,7 +1023,7 @@ class Store:
                 """,
                 (resume_run_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return human_input_from_row(row) if row else None
 
     def release_human_resume_handoff(self, resume_run_id: str, claim_token: str) -> bool:
         with self._connect() as conn:
@@ -840,7 +1140,13 @@ class Store:
             "blocked_phase",
             "verification_status",
             "verification_output_path",
+            "verification_workspace_diff_hash",
+            "verification_evidence_sha256",
             "plan_spec_hash",
+            "automation_plan_hash",
+            "automation_development_diff_hash",
+            "automation_repository_diff_hash",
+            "automation_result_hash",
             "plan_approval_id",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
@@ -949,22 +1255,35 @@ class Store:
             )
             if cursor.rowcount != 1:
                 return None
-            conn.execute(
-                """
-                UPDATE runs
-                SET status = 'queued', finished_at = NULL, error = NULL,
-                    blocked_phase = NULL
-                WHERE id = (
-                    SELECT result_run_id FROM human_review_actions WHERE id = ?
-                )
-                  AND status = 'running'
-                """,
-                (action_id,),
-            )
             row = conn.execute(
                 "SELECT * FROM human_review_actions WHERE id = ?",
                 (action_id,),
             ).fetchone()
+            if row is None:
+                raise StoreIntegrityError(
+                    "human review action disappeared during stale reclaim"
+                )
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = 'queued', finished_at = NULL, error = NULL,
+                    blocked_phase = NULL, plan_spec_hash = ?,
+                    automation_plan_hash = ?,
+                    automation_development_diff_hash = ?,
+                    automation_repository_diff_hash = ?,
+                    automation_result_hash = ?, plan_approval_id = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    row["plan_spec_hash"],
+                    row["automation_plan_hash"],
+                    row["automation_development_diff_hash"],
+                    row["automation_repository_diff_hash"],
+                    row["automation_result_hash"],
+                    row["plan_approval_id"],
+                    row["result_run_id"],
+                ),
+            )
         return human_review_action_from_row(row) if row else None
 
     def release_human_review_action(
@@ -1127,7 +1446,13 @@ class Store:
             "blocked_phase",
             "verification_status",
             "verification_output_path",
+            "verification_workspace_diff_hash",
+            "verification_evidence_sha256",
             "plan_spec_hash",
+            "automation_plan_hash",
+            "automation_development_diff_hash",
+            "automation_repository_diff_hash",
+            "automation_result_hash",
             "plan_approval_id",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
@@ -1200,7 +1525,13 @@ class Store:
             "blocked_phase",
             "verification_status",
             "verification_output_path",
+            "verification_workspace_diff_hash",
+            "verification_evidence_sha256",
             "plan_spec_hash",
+            "automation_plan_hash",
+            "automation_development_diff_hash",
+            "automation_repository_diff_hash",
+            "automation_result_hash",
             "plan_approval_id",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
@@ -1376,6 +1707,10 @@ class Store:
             "question": question,
             "response": response,
             "approval_id": approval_id,
+            "action": "response",
+            "approver_identity": None,
+            "workspace_diff_hash": None,
+            "verification_evidence_sha256": None,
             "claimed_at": None,
             "claim_token": None,
             "consumed_at": None,
@@ -1392,9 +1727,11 @@ class Store:
                 """
                 INSERT INTO human_inputs (
                   id, issue_identifier, run_id, question, response, approval_id,
-                  claimed_at, claim_token, consumed_at, created_at
+                  action, approver_identity, workspace_diff_hash,
+                  verification_evidence_sha256, claimed_at, claim_token,
+                  consumed_at, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -1403,10 +1740,135 @@ class Store:
                     record["question"],
                     record["response"],
                     record["approval_id"],
+                    record["action"],
+                    record["approver_identity"],
+                    record["workspace_diff_hash"],
+                    record["verification_evidence_sha256"],
                     record["claimed_at"],
                     record["claim_token"],
                     record["consumed_at"],
                     record["created_at"],
+                ),
+            )
+        return record
+
+    def add_verification_bypass_input(
+        self,
+        issue_identifier: str,
+        *,
+        run_id: str,
+        approver_identity: str,
+        workspace_diff_hash: str,
+        verification_evidence_sha256: str,
+        question: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically queue an explicit override bound to code and verification evidence."""
+
+        approver = " ".join(approver_identity.split())
+        if not approver:
+            raise ValueError("approver identity is required")
+        diff_hash = normalize_sha256(
+            workspace_diff_hash,
+            "workspace diff hash",
+        )
+        evidence_hash = normalize_sha256(
+            verification_evidence_sha256,
+            "verification evidence SHA-256",
+        )
+        record = {
+            "id": str(uuid.uuid4()),
+            "issue_identifier": issue_identifier,
+            "run_id": run_id,
+            "question": question,
+            "response": "Verification bypass approved.",
+            "approval_id": None,
+            "action": "verification_bypass",
+            "approver_identity": approver,
+            "workspace_diff_hash": diff_hash,
+            "verification_evidence_sha256": evidence_hash,
+            "claimed_at": None,
+            "claim_token": None,
+            "consumed_at": None,
+            "created_at": utc_now().isoformat(),
+        }
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._assert_human_input_submission_allowed(
+                conn,
+                issue_identifier=issue_identifier,
+                run_id=run_id,
+            )
+            run = conn.execute(
+                """
+                SELECT status, blocked_phase, verification_status,
+                       verification_output_path,
+                       verification_workspace_diff_hash,
+                       verification_evidence_sha256
+                FROM runs
+                WHERE id = ? AND issue_identifier = ?
+                """,
+                (run_id, issue_identifier),
+            ).fetchone()
+            if (
+                run is None
+                or run["status"] != "blocked"
+                or run["blocked_phase"]
+                not in {"verification", "verification_environment"}
+                or run["verification_status"]
+                in {None, "passed", "not_configured"}
+                or not str(run["verification_output_path"] or "").strip()
+            ):
+                raise ValueError(
+                    "run is not blocked with retained failed verification evidence"
+                )
+            try:
+                persisted_diff_hash = normalize_sha256(
+                    str(run["verification_workspace_diff_hash"] or ""),
+                    "persisted verification workspace diff hash",
+                )
+                persisted_evidence_hash = normalize_sha256(
+                    str(run["verification_evidence_sha256"] or ""),
+                    "persisted verification evidence SHA-256",
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "failed run has no valid verification-time integrity binding"
+                ) from exc
+            if (
+                diff_hash != persisted_diff_hash
+                or evidence_hash != persisted_evidence_hash
+            ):
+                raise ValueError(
+                    "verification bypass does not match the failed run integrity binding"
+                )
+            conn.execute(
+                """
+                INSERT INTO human_inputs (
+                  id, issue_identifier, run_id, question, response, approval_id,
+                  action, approver_identity, workspace_diff_hash,
+                  verification_evidence_sha256, claimed_at, claim_token,
+                  consumed_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(
+                    record[key]
+                    for key in (
+                        "id",
+                        "issue_identifier",
+                        "run_id",
+                        "question",
+                        "response",
+                        "approval_id",
+                        "action",
+                        "approver_identity",
+                        "workspace_diff_hash",
+                        "verification_evidence_sha256",
+                        "claimed_at",
+                        "claim_token",
+                        "consumed_at",
+                        "created_at",
+                    )
                 ),
             )
         return record
@@ -1451,6 +1913,10 @@ class Store:
             "question": question,
             "response": "Approved.",
             "approval_id": approval["id"],
+            "action": "plan_approval",
+            "approver_identity": approver,
+            "workspace_diff_hash": None,
+            "verification_evidence_sha256": None,
             "claimed_at": None,
             "claim_token": None,
             "consumed_at": None,
@@ -1506,9 +1972,11 @@ class Store:
                 """
                 INSERT INTO human_inputs (
                   id, issue_identifier, run_id, question, response, approval_id,
-                  claimed_at, claim_token, consumed_at, created_at
+                  action, approver_identity, workspace_diff_hash,
+                  verification_evidence_sha256, claimed_at, claim_token,
+                  consumed_at, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 tuple(human_input[key] for key in (
                     "id",
@@ -1517,6 +1985,10 @@ class Store:
                     "question",
                     "response",
                     "approval_id",
+                    "action",
+                    "approver_identity",
+                    "workspace_diff_hash",
+                    "verification_evidence_sha256",
                     "claimed_at",
                     "claim_token",
                     "consumed_at",
@@ -1695,7 +2167,8 @@ class Store:
                 rows = conn.execute(
                     """
                     SELECT h.*, a.plan_spec_hash, a.requirements_snapshot_hash,
-                           a.approver_identity, a.approved_at,
+                           a.approver_identity AS plan_approver_identity,
+                           a.approved_at,
                            a.invalidated_at AS approval_invalidated_at,
                            a.invalidation_reason AS approval_invalidation_reason
                     FROM human_inputs AS h
@@ -1710,7 +2183,8 @@ class Store:
                 rows = conn.execute(
                     """
                     SELECT h.*, a.plan_spec_hash, a.requirements_snapshot_hash,
-                           a.approver_identity, a.approved_at,
+                           a.approver_identity AS plan_approver_identity,
+                           a.approved_at,
                            a.invalidated_at AS approval_invalidated_at,
                            a.invalidation_reason AS approval_invalidation_reason
                     FROM human_inputs AS h
@@ -1720,14 +2194,15 @@ class Store:
                     """,
                     (limit,),
                 ).fetchall()
-        return [dict(row) for row in rows]
+        return [human_input_from_row(row) for row in rows]
 
     def list_unconsumed_human_inputs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT h.*, a.plan_spec_hash, a.requirements_snapshot_hash,
-                       a.approver_identity, a.approved_at,
+                       a.approver_identity AS plan_approver_identity,
+                       a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
                        a.invalidation_reason AS approval_invalidation_reason
                 FROM human_inputs AS h
@@ -1738,14 +2213,15 @@ class Store:
                 """,
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [human_input_from_row(row) for row in rows]
 
     def latest_unconsumed_human_input_for_issue(self, issue_identifier: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT h.*, a.plan_spec_hash, a.requirements_snapshot_hash,
-                       a.approver_identity, a.approved_at,
+                       a.approver_identity AS plan_approver_identity,
+                       a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
                        a.invalidation_reason AS approval_invalidation_reason
                 FROM human_inputs AS h
@@ -1757,7 +2233,7 @@ class Store:
                 """,
                 (issue_identifier,),
             ).fetchone()
-        return dict(row) if row else None
+        return human_input_from_row(row) if row else None
 
     def claim_human_input(
         self,
@@ -1791,7 +2267,8 @@ class Store:
             row = conn.execute(
                 """
                 SELECT h.*, a.plan_spec_hash, a.requirements_snapshot_hash,
-                       a.approver_identity, a.approved_at,
+                       a.approver_identity AS plan_approver_identity,
+                       a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
                        a.invalidation_reason AS approval_invalidation_reason
                 FROM human_inputs AS h
@@ -1800,7 +2277,7 @@ class Store:
                 """,
                 (input_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return human_input_from_row(row) if row else None
 
     def renew_human_input_claim(
         self,
@@ -1869,14 +2346,51 @@ class Store:
             raise ValueError("run is not the latest actionable blocked run for this issue")
         pending = conn.execute(
             """
-            SELECT id FROM human_inputs
+            SELECT id, run_id, approval_id FROM human_inputs
             WHERE issue_identifier = ? AND consumed_at IS NULL
-            LIMIT 1
+            ORDER BY created_at
             """,
             (issue_identifier,),
-        ).fetchone()
-        if pending is not None:
+        ).fetchall()
+        if any(row["run_id"] == run_id for row in pending):
             raise ValueError("human input is already pending for this issue")
+        if not pending:
+            return
+
+        # A newer blocked run supersedes responses queued for older attempts. Keep
+        # the history, but retire those responses atomically before accepting input
+        # for the current run. This also fences a dispatcher that claimed an old
+        # response immediately before the newer run was created.
+        retired_at = utc_now().isoformat()
+        pending_ids = [str(row["id"]) for row in pending]
+        placeholders = ",".join("?" for _ in pending_ids)
+        conn.execute(
+            f"""
+            UPDATE human_inputs
+            SET consumed_at = ?, claimed_at = NULL, claim_token = NULL
+            WHERE id IN ({placeholders}) AND consumed_at IS NULL
+            """,
+            (retired_at, *pending_ids),
+        )
+        approval_ids = [
+            str(row["approval_id"])
+            for row in pending
+            if row["approval_id"] is not None
+        ]
+        if approval_ids:
+            approval_placeholders = ",".join("?" for _ in approval_ids)
+            conn.execute(
+                f"""
+                UPDATE plan_approvals
+                SET invalidated_at = ?, invalidation_reason = ?
+                WHERE id IN ({approval_placeholders}) AND invalidated_at IS NULL
+                """,
+                (
+                    retired_at,
+                    "superseded by human input for a newer run",
+                    *approval_ids,
+                ),
+            )
 
     def _is_latest_actionable_blocked_run(
         self,
@@ -1980,11 +2494,15 @@ class Store:
             INSERT INTO runs (
               id, issue_id, issue_identifier, issue_fingerprint,
               workspace_path, status, attempt,
-              started_at, plan_spec_hash, plan_approval_id,
+              started_at, plan_spec_hash, automation_plan_hash,
+              automation_development_diff_hash, automation_repository_diff_hash,
+              automation_result_hash,
+              plan_approval_id,
               finished_at, final_message, error, blocked_phase, branch_name,
-              verification_status, verification_output_path
+              verification_status, verification_output_path,
+              verification_workspace_diff_hash, verification_evidence_sha256
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             run_values(record),
         )
@@ -2020,6 +2538,23 @@ def human_review_action_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return action
 
 
+def human_input_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    human_input = dict(row)
+    plan_approver = human_input.pop("plan_approver_identity", None)
+    if not human_input.get("approver_identity"):
+        human_input["approver_identity"] = plan_approver
+    return human_input
+
+
+def normalize_sha256(value: str, label: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{label} must be a 64-character hexadecimal SHA-256")
+    return normalized
+
+
 def run_values(record: RunRecord) -> tuple[Any, ...]:
     return (
         record.id,
@@ -2031,6 +2566,10 @@ def run_values(record: RunRecord) -> tuple[Any, ...]:
         record.attempt,
         record.started_at.isoformat(),
         record.plan_spec_hash,
+        record.automation_plan_hash,
+        record.automation_development_diff_hash,
+        record.automation_repository_diff_hash,
+        record.automation_result_hash,
         record.plan_approval_id,
         serialize_value(record.finished_at),
         record.final_message,
@@ -2039,6 +2578,8 @@ def run_values(record: RunRecord) -> tuple[Any, ...]:
         record.branch_name,
         record.verification_status,
         record.verification_output_path,
+        record.verification_workspace_diff_hash,
+        record.verification_evidence_sha256,
     )
 
 
@@ -2059,6 +2600,14 @@ def run_from_row(row: sqlite3.Row) -> RunRecord:
         attempt=row["attempt"],
         started_at=datetime.fromisoformat(row["started_at"]),
         plan_spec_hash=row["plan_spec_hash"],
+        automation_plan_hash=row["automation_plan_hash"],
+        automation_development_diff_hash=row[
+            "automation_development_diff_hash"
+        ],
+        automation_repository_diff_hash=row[
+            "automation_repository_diff_hash"
+        ],
+        automation_result_hash=row["automation_result_hash"],
         plan_approval_id=row["plan_approval_id"],
         finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
         final_message=row["final_message"],
@@ -2067,4 +2616,8 @@ def run_from_row(row: sqlite3.Row) -> RunRecord:
         branch_name=row["branch_name"],
         verification_status=row["verification_status"],
         verification_output_path=row["verification_output_path"],
+        verification_workspace_diff_hash=row[
+            "verification_workspace_diff_hash"
+        ],
+        verification_evidence_sha256=row["verification_evidence_sha256"],
     )

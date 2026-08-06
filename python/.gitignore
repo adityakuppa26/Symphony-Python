@@ -1,0 +1,9 @@
+/.symphony/
+/.pytest_cache/
+/.venv/
+/build/
+/dist/
+__pycache__/
+*.egg-info/
+*.orig
+*.py[cod]

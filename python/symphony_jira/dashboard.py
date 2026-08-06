@@ -4,21 +4,57 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .automation_plan import (
+    AutomationPlan,
+    AutomationPlanError,
+    automation_result_content_hash,
+    parse_automation_plan,
+)
 from .human_review import (
     HumanReviewContextError,
     capture_workspace_diff,
+    hash_verification_evidence,
     read_frozen_text_artifact,
     validate_frozen_snapshot_artifacts,
 )
-from .models import RunRecord
+from .models import RequirementsSnapshot, RunRecord
 from .orchestrator import (
+    VERIFICATION_BYPASS_PHASES,
+    capture_automation_repository_diff,
+    inspect_automation_repository,
+    managed_diff_repositories,
+    managed_workspace_repositories,
     validate_plan_repository_baselines,
 )
-from .plan_spec import PlanSpecError, parse_plan_spec
-from .store import Store, StoreIntegrityError
+from .plan_spec import (
+    PlanSpec,
+    PlanSpecError,
+    parse_frozen_legacy_plan_spec,
+    parse_plan_spec,
+)
+from .store import Store, StoreIntegrityError, normalize_sha256
 from .workflow import WorkflowDefinition
 
 MAX_HUMAN_REVIEW_REQUEST_BYTES = 1024 * 1024
+SUMMARY_ITEM_LIMIT = 3
+SUMMARY_ITEM_MAX_CHARACTERS = 180
+SUMMARY_GOAL_MAX_CHARACTERS = 240
+SUMMARY_APPROACH_MAX_CHARACTERS = 360
+SUMMARY_REPOSITORIES_MAX_CHARACTERS = 180
+SUMMARY_AUTOMATION_RESULT_MAX_CHARACTERS = 360
+PLAN_SUMMARY_UNAVAILABLE = (
+    "Plan summary unavailable because the plan could not be validated for this run. "
+    "Open the full plan file for details."
+)
+AUTOMATION_PLAN_SUMMARY_UNAVAILABLE = (
+    "Automation plan summary unavailable because the artifact could not be "
+    "validated for this run. "
+    "Open the full automation plan file for details."
+)
+AUTOMATION_RESULT_SUMMARY_UNAVAILABLE = (
+    "Automation result unavailable because the artifact is missing or could not "
+    "be validated for this run. Human review is disabled."
+)
 
 
 
@@ -100,9 +136,6 @@ def create_app(
                 status_code=409,
                 detail="this historical run is no longer the latest actionable blocked run",
             )
-        if store.latest_unconsumed_human_input_for_issue(run.issue_identifier) is not None:
-            raise HTTPException(status_code=409, detail="human input is already pending for this issue")
-
         body = await request.body()
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -151,6 +184,40 @@ def create_app(
                     plan_spec_hash=plan_spec_hash,
                     requirements_snapshot_hash=requirements_snapshot_hash,
                 )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        elif action == "bypass_verification":
+            if (
+                run.blocked_phase not in VERIFICATION_BYPASS_PHASES
+                or run.verification_status in {None, "passed", "not_configured"}
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="this run is not blocked by a failed verification",
+                )
+            if not approver_identity:
+                raise HTTPException(
+                    status_code=400,
+                    detail="approver identity is required",
+                )
+            try:
+                binding = prepare_verification_bypass_context(
+                    run,
+                    workflow,
+                    store,
+                )
+                record = store.add_verification_bypass_input(
+                    run.issue_identifier,
+                    run_id=run.id,
+                    question=run.error,
+                    approver_identity=approver_identity,
+                    **binding,
+                )
+            except (HumanReviewContextError, PlanSpecError, StoreIntegrityError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"verification bypass context is not reusable: {exc}",
+                ) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         elif not response:
@@ -337,6 +404,9 @@ def build_state(
 ) -> dict[str, Any]:
     runs = store.list_runs(limit=recent_limit)
     enriched = [enrich_run(run, store, workflow) for run in runs]
+    automation_visible = workflow.config.automation.enabled or any(
+        run.get("automation_plan_hash") for run in enriched
+    )
     latest_run_ids_by_issue = latest_run_ids(enriched)
     running = [run for run in enriched if run["status"] == "running"]
     queued = [run for run in enriched if run["status"] == "queued"]
@@ -348,6 +418,7 @@ def build_state(
         "jira_jql": workflow.config.tracker.jql,
         "poll_interval_seconds": workflow.config.polling.interval_seconds,
         "workspace_root": str(workflow.config.workspace.root),
+        "automation_enabled": automation_visible,
         "running_issues": running,
         "queued_issues": queued,
         "blocked_issues": blocked,
@@ -401,6 +472,8 @@ def summarize_human_review_action(
 ) -> dict[str, Any]:
     frozen_context_fields = {
         "approval",
+        "automation_plan",
+        "automation_result",
         "claim_token",
         "plan_spec",
         "source_final_message",
@@ -477,6 +550,285 @@ def current_plan_spec_hash(
             f"PlanSpec repository baseline validation failed: {baseline_error}"
         )
     return plan_hash
+
+
+def prepare_verification_bypass_context(
+    run: RunRecord,
+    workflow: WorkflowDefinition,
+    store: Store,
+) -> dict[str, str]:
+    """Bind an explicit override to the exact failed code and evidence state."""
+
+    snapshot_hash = str(run.issue_fingerprint or "").strip()
+    if not snapshot_hash:
+        raise HumanReviewContextError(
+            "failed verification run has no requirements snapshot hash"
+        )
+    snapshot = store.get_requirements_snapshot(
+        run.issue_identifier,
+        snapshot_hash,
+    )
+    if snapshot is None:
+        raise HumanReviewContextError(
+            "the immutable requirements snapshot for this run is missing"
+        )
+    workspace_path = Path(run.workspace_path)
+    artifact_error = validate_frozen_snapshot_artifacts(
+        workspace_path,
+        snapshot_hash,
+    )
+    if artifact_error:
+        raise HumanReviewContextError(artifact_error)
+    plan_content = read_frozen_text_artifact(
+        workspace_path,
+        workflow.config.codex.output_plan_file,
+        label="verification bypass PlanSpec",
+        required=True,
+    )
+    if not plan_content:
+        raise HumanReviewContextError(
+            "verification bypass PlanSpec is missing or empty"
+        )
+    plan_spec = parse_dashboard_plan_spec(
+        plan_content,
+        run=run,
+        requirements_snapshot=snapshot,
+    )
+    validate_dashboard_plan_binding(
+        plan_spec,
+        run=run,
+        requirements_snapshot=snapshot,
+    )
+    baseline_error = validate_plan_repository_baselines(
+        plan_spec,
+        workspace_path,
+        require_clean=False,
+    )
+    if baseline_error:
+        raise HumanReviewContextError(
+            f"verification bypass repository baseline is invalid: {baseline_error}"
+        )
+    try:
+        persisted_diff_hash = normalize_sha256(
+            str(run.verification_workspace_diff_hash or ""),
+            "persisted verification workspace diff hash",
+        )
+        persisted_evidence_hash = normalize_sha256(
+            str(run.verification_evidence_sha256 or ""),
+            "persisted verification evidence SHA-256",
+        )
+    except ValueError as exc:
+        raise HumanReviewContextError(
+            "failed run has no valid verification-time integrity binding; "
+            "rerun verification before requesting an override"
+        ) from exc
+    workspace_diff = capture_workspace_diff(
+        workspace_path,
+        plan_spec,
+        managed_repositories=managed_diff_repositories(workflow.config),
+    )
+    evidence_hash = hash_verification_evidence(
+        workspace_path,
+        run.verification_output_path,
+    )
+    if workspace_diff.content_hash != persisted_diff_hash:
+        raise HumanReviewContextError(
+            "workspace changed after the failed verification; rerun verification "
+            "before requesting an override"
+        )
+    if evidence_hash != persisted_evidence_hash:
+        raise HumanReviewContextError(
+            "verification evidence changed after the failed verification; rerun "
+            "verification before requesting an override"
+        )
+    return {
+        "workspace_diff_hash": persisted_diff_hash,
+        "verification_evidence_sha256": persisted_evidence_hash,
+    }
+
+
+def prepare_bound_automation_context(
+    run: RunRecord,
+    workflow: WorkflowDefinition,
+    development_plan: PlanSpec,
+    *,
+    require_result: bool,
+    allow_partial_scope: bool = False,
+) -> dict[str, str | None]:
+    """Read automation artifacts only when they match this run's durable binding."""
+
+    raw_expected_hash = str(run.automation_plan_hash or "").strip()
+    if not raw_expected_hash:
+        return {
+            "automation_plan_hash": None,
+            "automation_plan": None,
+            "automation_result": None,
+        }
+    try:
+        expected_hash = normalize_sha256(
+            raw_expected_hash,
+            "completed run automation plan hash",
+        )
+    except ValueError as exc:
+        raise HumanReviewContextError(
+            "completed run has an invalid automation-plan hash"
+        ) from exc
+    try:
+        expected_development_diff_hash = normalize_sha256(
+            str(run.automation_development_diff_hash or ""),
+            "completed run automation development-diff hash",
+        )
+        expected_repository_diff_hash = normalize_sha256(
+            str(run.automation_repository_diff_hash or ""),
+            "completed run automation repository-diff hash",
+        )
+    except ValueError as exc:
+        raise HumanReviewContextError(
+            "completed run has an invalid automation diff binding"
+        ) from exc
+    expected_result_hash: str | None = None
+    if run.automation_result_hash:
+        try:
+            expected_result_hash = normalize_sha256(
+                run.automation_result_hash,
+                "completed run automation result hash",
+            )
+        except ValueError as exc:
+            if require_result:
+                raise HumanReviewContextError(
+                    "completed run has an invalid automation-result hash"
+                ) from exc
+            expected_result_hash = None
+    elif require_result:
+        raise HumanReviewContextError(
+            "completed run has no exact automation-result hash"
+        )
+
+    workspace_path = Path(run.workspace_path)
+    plan_content = read_frozen_text_artifact(
+        workspace_path,
+        workflow.config.automation.output_plan_file,
+        label="validated AutomationPlan artifact",
+        required=True,
+    )
+    if not plan_content or not plan_content.strip():
+        raise HumanReviewContextError(
+            "completed run's validated AutomationPlan is missing or empty"
+        )
+    try:
+        candidate = AutomationPlan.model_validate_json(plan_content)
+        development_diff = capture_workspace_diff(
+            workspace_path,
+            development_plan,
+            managed_repositories=managed_workspace_repositories(workflow.config),
+        )
+        repository_state = inspect_automation_repository(
+            workspace_path,
+            workflow.config.automation.workspace_subdir.as_posix(),
+            expected_head_sha=candidate.repository_baseline_sha,
+            expected_branch_name=run.issue_identifier,
+            require_clean=False,
+        )
+        plan = parse_automation_plan(
+            plan_content,
+            expected_issue_key=run.issue_identifier,
+            expected_requirements_snapshot_hash=str(run.issue_fingerprint or ""),
+            expected_development_plan_spec_hash=development_plan.content_hash(),
+            expected_development_diff_hash=development_diff.content_hash,
+            expected_repository=(
+                workflow.config.automation.workspace_subdir.as_posix()
+            ),
+            expected_repository_baseline_sha=candidate.repository_baseline_sha,
+            development_plan_spec=development_plan,
+        )
+        repository_diff = capture_automation_repository_diff(
+            workspace_path,
+            development_plan,
+            workflow.config,
+        )
+    except (AutomationPlanError, HumanReviewContextError, ValueError) as exc:
+        raise HumanReviewContextError(
+            f"completed run's validated AutomationPlan is not reusable: {exc}"
+        ) from exc
+    if plan.content_hash() != expected_hash:
+        raise HumanReviewContextError(
+            "validated AutomationPlan does not match the completed run's trusted hash"
+        )
+    if plan.development_workspace_diff_hash != expected_development_diff_hash:
+        raise HumanReviewContextError(
+            "validated AutomationPlan does not match the completed run's "
+            "development-diff hash"
+        )
+    if repository_diff.content_hash != expected_repository_diff_hash:
+        raise HumanReviewContextError(
+            "automation checkout does not match the completed run's exact "
+            "repository-diff hash"
+        )
+    if plan.decision == "no_update_required":
+        if repository_state.dirty:
+            raise HumanReviewContextError(
+                "validated no-op AutomationPlan has automation checkout changes"
+            )
+    else:
+        planned_file_types = tuple(
+            sorted(
+                (change.path, change.change_type)
+                for change in plan.affected_file_changes
+            )
+        )
+        scope_matches = (
+            all(
+                dict(planned_file_types).get(path) == change_type
+                for path, change_type in repository_state.changed_file_types
+            )
+            if allow_partial_scope
+            else repository_state.changed_file_types == planned_file_types
+        )
+        if not scope_matches:
+            raise HumanReviewContextError(
+                "automation checkout changes do not match the validated "
+                "AutomationPlan file scope"
+            )
+
+    normalized_result: str | None = None
+    if expected_result_hash is not None:
+        try:
+            result_content = read_frozen_text_artifact(
+                workspace_path,
+                workflow.config.automation.output_result_file,
+                label="automation result artifact",
+                required=True,
+            )
+            normalized_result = (
+                result_content.strip()
+                if result_content is not None and result_content.strip()
+                else None
+            )
+            if normalized_result is None:
+                raise HumanReviewContextError(
+                    "completed run's automation result is missing or empty"
+                )
+            if (
+                automation_result_content_hash(normalized_result)
+                != expected_result_hash
+            ):
+                raise HumanReviewContextError(
+                    "automation result artifact does not match the completed run's "
+                    "trusted hash"
+                )
+        except HumanReviewContextError:
+            if require_result:
+                raise
+            normalized_result = None
+    if require_result and normalized_result is None:
+        raise HumanReviewContextError(
+            "completed run's automation result is missing or empty"
+        )
+    return {
+        "automation_plan_hash": expected_hash,
+        "automation_plan": plan_content.strip(),
+        "automation_result": normalized_result,
+    }
 
 
 def prepare_human_review_context(
@@ -590,7 +942,17 @@ def prepare_human_review_context(
             f"completed run's review artifact is missing or empty: {review_path}"
         )
 
-    workspace_diff = capture_workspace_diff(workspace_path, plan_spec)
+    workspace_diff = capture_workspace_diff(
+        workspace_path,
+        plan_spec,
+        managed_repositories=managed_diff_repositories(workflow.config),
+    )
+    automation_context = prepare_bound_automation_context(
+        run,
+        workflow,
+        plan_spec,
+        require_result=bool(run.automation_plan_hash),
+    )
     return {
         "plan_spec": plan_content,
         "approval": approval,
@@ -598,6 +960,7 @@ def prepare_human_review_context(
         "source_review_history": source_review_history,
         "workspace_diff": workspace_diff.content,
         "workspace_diff_hash": workspace_diff.content_hash,
+        **automation_context,
     }
 
 
@@ -615,21 +978,114 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
     source_review_actions = store.list_human_review_actions_for_source_run(run.id)
     result_review_action = store.human_review_action_for_result_run(run.id)
     plan_path = Path(run.workspace_path) / workflow.config.codex.output_plan_file
+    plan_content = read_text_if_exists(plan_path)
+    requirements_snapshot: RequirementsSnapshot | None = None
+    requirements_summary_error: str | None = None
+    snapshot_hash = str(run.issue_fingerprint or "").strip()
+    if snapshot_hash:
+        try:
+            requirements_snapshot = store.get_requirements_snapshot(
+                run.issue_identifier,
+                snapshot_hash,
+            )
+        except StoreIntegrityError:
+            requirements_summary_error = (
+                "Requirements summary unavailable because the stored specification "
+                "failed integrity validation."
+            )
+    requirements_path = requirements_artifact_path(run, snapshot_hash)
+    requirements_exists = bool(
+        requirements_path is not None and requirements_path.is_file()
+    )
     review_path = Path(run.workspace_path) / workflow.config.codex.output_review_file
     review_history_path = Path(run.workspace_path) / workflow.config.codex.output_review_history_file
+    automation_plan_path = (
+        Path(run.workspace_path) / workflow.config.automation.output_plan_file
+    )
+    automation_result_path = (
+        Path(run.workspace_path) / workflow.config.automation.output_result_file
+    )
+    automation_plan_content: str | None = None
+    automation_result_content: str | None = None
+    automation_plan_summary: str | None = None
+    automation_binding_valid = False
+    if run.automation_plan_hash:
+        try:
+            if not plan_content:
+                raise HumanReviewContextError(
+                    "the run's validated development PlanSpec is unavailable"
+                )
+            development_plan = parse_dashboard_plan_spec(
+                plan_content,
+                run=run,
+                requirements_snapshot=requirements_snapshot,
+            )
+            validate_dashboard_plan_binding(
+                development_plan,
+                run=run,
+                requirements_snapshot=requirements_snapshot,
+            )
+            automation_context = prepare_bound_automation_context(
+                run,
+                workflow,
+                development_plan,
+                require_result=False,
+                allow_partial_scope=(
+                    run.status == "blocked"
+                    and run.blocked_phase
+                    in {"automation_planning", "automation_implementation"}
+                ),
+            )
+            automation_plan_content = automation_context["automation_plan"]
+            automation_result_content = automation_context["automation_result"]
+            automation_plan_summary = summarize_automation_plan_content(
+                automation_plan_content
+            )
+            automation_binding_valid = automation_plan_content is not None
+        except (HumanReviewContextError, PlanSpecError, StoreIntegrityError):
+            automation_plan_summary = AUTOMATION_PLAN_SUMMARY_UNAVAILABLE
+    automation_review_context_valid = not run.automation_plan_hash or (
+        automation_binding_valid and automation_result_content is not None
+    )
+    latest_event_type = events[-1].event_type if events else None
     data.update(
         {
-            "current_phase": infer_phase(run, bool(events), review_path.exists()),
+            "current_phase": infer_phase(run, latest_event_type),
             "elapsed_seconds": elapsed_seconds(run),
             "plan_path": str(plan_path),
             "plan_exists": plan_path.exists(),
-            "plan_content": read_text_if_exists(plan_path),
+            "plan_content": plan_content,
+            "plan_summary": summarize_plan_content(
+                plan_content,
+                run=run,
+                requirements_snapshot=requirements_snapshot,
+            ),
+            "requirements_path": (
+                str(requirements_path) if requirements_path is not None else None
+            ),
+            "requirements_exists": requirements_exists,
+            "requirements_summary": (
+                requirements_summary_error
+                or summarize_requirements_snapshot(requirements_snapshot)
+            ),
             "review_path": str(review_path),
             "review_exists": review_path.exists(),
             "review_content": read_text_if_exists(review_path),
             "review_history_path": str(review_history_path),
             "review_history_exists": review_history_path.exists(),
             "review_history_content": read_text_if_exists(review_history_path),
+            "automation_plan_path": str(automation_plan_path),
+            "automation_plan_exists": automation_binding_valid,
+            "automation_plan_content": automation_plan_content,
+            "automation_plan_summary": automation_plan_summary,
+            "automation_result_path": str(automation_result_path),
+            "automation_result_exists": (
+                automation_binding_valid and automation_result_content is not None
+            ),
+            "automation_result_content": automation_result_content,
+            "automation_result_summary": summarize_automation_result_content(
+                automation_result_content
+            ),
             "human_inputs": human_inputs,
             "plan_approvals": plan_approvals,
             "active_plan_approval": active_plan_approval,
@@ -646,22 +1102,30 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
                 if result_review_action
                 else None
             ),
-            "human_review_actionable": store.is_latest_actionable_completed_run(
-                run.id
+            "human_review_actionable": (
+                automation_review_context_valid
+                and store.is_latest_actionable_completed_run(run.id)
             ),
         }
     )
     return data
 
 
-def infer_phase(run: RunRecord, has_events: bool, has_review: bool) -> str:
+def infer_phase(run: RunRecord, latest_event_type: str | None) -> str:
     if run.status == "queued":
         return "queued"
     if run.status == "running":
-        if has_review:
-            return "review/regeneration"
-        if has_events:
-            return "codex"
+        event_type = str(latest_event_type or "").strip().lower()
+        if event_type.startswith("automation_planning."):
+            return "automation planning"
+        if event_type.startswith("automation_implementation."):
+            return "automation implementation"
+        if event_type.startswith("plan"):
+            return "planning"
+        if event_type.startswith(("review", "human_review.")):
+            return "review"
+        if event_type:
+            return "implementation"
         return "setup"
     if run.status == "completed":
         return "completed"
@@ -686,7 +1150,12 @@ def elapsed_seconds(run: RunRecord) -> float:
 
 def render_dashboard_html(state: dict[str, Any]) -> str:
     visible_runs = state["all_runs"][:20]
-    rows = "\n".join(render_run_row(run) for run in visible_runs)
+    automation_enabled = bool(state.get("automation_enabled"))
+    rows = "\n".join(
+        render_run_row(run, automation_enabled=automation_enabled)
+        for run in visible_runs
+    )
+    automation_header = "<th>Automation</th>" if automation_enabled else ""
     running = ", ".join(run["issue_identifier"] for run in state["running_issues"]) or "none"
     queued = ", ".join(run["issue_identifier"] for run in state["queued_issues"]) or "none"
     blocked = ", ".join(run["issue_identifier"] for run in state["blocked_issues"]) or "none"
@@ -696,6 +1165,7 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
   <title>Symphony Jira</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 2rem; color: #111827; }}
@@ -711,6 +1181,8 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     details {{ max-width: 42rem; }}
     summary {{ cursor: pointer; color: #1f2937; font-weight: 600; }}
     .preview {{ color: #4b5563; margin-top: 0.35rem; }}
+    .brief-summary {{ white-space: pre-line; line-height: 1.4; max-width: 34rem; }}
+    .artifact-path {{ color: #6b7280; margin-top: 0.5rem; max-width: 34rem; overflow-wrap: anywhere; }}
   </style>
 </head>
 <body>
@@ -730,15 +1202,22 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
   </div>
   <h2>Recent Runs</h2>
   <table>
-    <thead><tr><th>Issue</th><th>Status</th><th>Phase</th><th>Blocked Phase</th><th>Elapsed</th><th>Workspace</th><th>Verification</th><th>Plan</th><th>Review</th><th>Error</th><th>Human Input</th><th>Final Message</th></tr></thead>
+    <thead><tr><th>Issue</th><th>Status</th><th>Phase</th><th>Blocked Phase</th><th>Elapsed</th><th>Workspace</th><th>Verification</th><th>Requirements Spec</th><th>Plan</th>{automation_header}<th>Review</th><th>Error</th><th>Human Input</th><th>Final Message</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
 </body>
 </html>"""
 
 
-def render_run_row(run: dict[str, Any]) -> str:
-    final_message = run.get("final_message") or ""
+def render_run_row(
+    run: dict[str, Any],
+    *,
+    automation_enabled: bool = False,
+) -> str:
+    final_message = display_final_message(run)
+    automation_cell = (
+        f"<td>{render_automation_cell(run)}</td>" if automation_enabled else ""
+    )
     return (
         "<tr>"
         f"<td>{escape(run.get('issue_identifier'))}</td>"
@@ -748,7 +1227,9 @@ def render_run_row(run: dict[str, Any]) -> str:
         f"<td>{format_elapsed(run.get('elapsed_seconds'))}</td>"
         f"<td><code>{escape(run.get('workspace_path'))}</code></td>"
         f"<td>{escape(run.get('verification_status'))}</td>"
+        f"<td>{render_requirements_cell(run)}</td>"
         f"<td>{render_plan_cell(run)}</td>"
+        f"{automation_cell}"
         f"<td>{render_review_cell(run)}</td>"
         f"<td>{render_long_text_cell(display_error(run), 'Show full error')}</td>"
         f"<td>{render_human_input_cell(run)}</td>"
@@ -788,11 +1269,90 @@ def render_review_cell(run: dict[str, Any]) -> str:
 def render_plan_cell(run: dict[str, Any]) -> str:
     if not run.get("plan_exists"):
         return "none"
-    content = str(run.get("plan_content") or "")
-    return (
-        f"<code>{escape(run.get('plan_path'))}</code>"
-        f"{render_long_text_cell(content, 'Show plan', force_details=True) if content else ''}"
+    summary = str(run.get("plan_summary") or "").strip() or (
+        PLAN_SUMMARY_UNAVAILABLE
     )
+    return render_brief_artifact(summary, run.get("plan_path"), "Full plan file")
+
+
+def render_requirements_cell(run: dict[str, Any]) -> str:
+    summary = str(run.get("requirements_summary") or "").strip()
+    if not summary and not run.get("requirements_exists"):
+        return "none"
+    summary = summary or (
+        "Requirements summary unavailable. Open the full requirements file for details."
+    )
+    label = (
+        "Full requirements file"
+        if run.get("requirements_exists")
+        else "Expected requirements file (not present)"
+    )
+    return render_brief_artifact(
+        summary,
+        run.get("requirements_path"),
+        label,
+    )
+
+
+def render_automation_cell(run: dict[str, Any]) -> str:
+    artifacts: list[str] = []
+    if run.get("automation_plan_exists"):
+        plan_summary = str(run.get("automation_plan_summary") or "").strip()
+        artifacts.append(
+            "<div><strong>Plan</strong>"
+            + render_brief_artifact(
+                plan_summary or AUTOMATION_PLAN_SUMMARY_UNAVAILABLE,
+                run.get("automation_plan_path"),
+                "Automation plan file",
+            )
+            + "</div>"
+        )
+    elif run.get("automation_plan_hash"):
+        artifacts.append(
+            "<div><strong>Plan</strong>"
+            + render_brief_artifact(
+                str(run.get("automation_plan_summary") or "").strip()
+                or AUTOMATION_PLAN_SUMMARY_UNAVAILABLE,
+                None,
+                "Automation plan file",
+            )
+            + "</div>"
+        )
+    if run.get("automation_result_exists"):
+        result_summary = str(run.get("automation_result_summary") or "").strip()
+        artifacts.append(
+            "<div><strong>Result</strong>"
+            + render_brief_artifact(
+                result_summary or "Automation result is empty.",
+                run.get("automation_result_path"),
+                "Automation result file",
+            )
+            + "</div>"
+        )
+    elif (
+        run.get("status") == "completed"
+        and run.get("automation_plan_hash")
+    ):
+        artifacts.append(
+            "<div><strong>Result</strong>"
+            + render_brief_artifact(
+                AUTOMATION_RESULT_SUMMARY_UNAVAILABLE,
+                None,
+                "Automation result file",
+            )
+            + "</div>"
+        )
+    return "".join(artifacts) or "none"
+
+
+def render_brief_artifact(summary: str, path: Any, label: str) -> str:
+    path_html = ""
+    if path:
+        path_html = (
+            f'<div class="artifact-path">{escape(label)}:<br>'
+            f"<code>{escape(path)}</code></div>"
+        )
+    return f'<div class="brief-summary">{escape(summary)}</div>{path_html}'
 
 
 def render_long_text_cell(value: Any, summary: str, *, force_details: bool = False) -> str:
@@ -817,10 +1377,291 @@ def read_text_if_exists(path: Path) -> str | None:
         return None
 
 
+def requirements_artifact_path(
+    run: RunRecord,
+    snapshot_hash: str,
+) -> Path | None:
+    if not snapshot_hash:
+        return None
+    return (
+        Path(run.workspace_path)
+        / ".symphony"
+        / "requirements-snapshots"
+        / f"{snapshot_hash}.json"
+    )
+
+
+def summarize_automation_plan_content(content: str | None) -> str | None:
+    if not content or not content.strip():
+        return None
+    try:
+        plan = AutomationPlan.model_validate_json(content)
+    except (TypeError, ValueError):
+        return AUTOMATION_PLAN_SUMMARY_UNAVAILABLE
+
+    blocking_questions = sum(
+        question.blocks_implementation for question in plan.open_questions
+    ) + sum(assumption.needs_human for assumption in plan.assumptions)
+    rationale = compact_summary_text(
+        plan.rationale,
+        SUMMARY_APPROACH_MAX_CHARACTERS,
+    )
+    return "\n".join(
+        (
+            f"Decision: {str(plan.decision).replace('_', ' ')}.",
+            f"Repository: {plan.automation_repository}.",
+            f"Rationale: {rationale}",
+            "Scope: "
+            f"{counted_label(len(plan.mapped_scenarios), 'scenario')}, "
+            f"{counted_label(len(plan.affected_file_changes), 'file change')}, "
+            f"{counted_label(len(plan.verification), 'verification step')}.",
+            f"Risks: {len(plan.risks)}. Blocking questions: "
+            f"{'none' if blocking_questions == 0 else blocking_questions}.",
+        )
+    )
+
+
+def summarize_automation_result_content(content: str | None) -> str | None:
+    if not content or not content.strip():
+        return None
+    return compact_summary_text(content, SUMMARY_AUTOMATION_RESULT_MAX_CHARACTERS)
+
+
+def summarize_plan_content(
+    content: str | None,
+    *,
+    run: RunRecord,
+    requirements_snapshot: RequirementsSnapshot | None,
+) -> str | None:
+    if not content or not content.strip():
+        return None
+    try:
+        plan = parse_dashboard_plan_spec(
+            content,
+            run=run,
+            requirements_snapshot=requirements_snapshot,
+        )
+        validate_dashboard_plan_binding(
+            plan,
+            run=run,
+            requirements_snapshot=requirements_snapshot,
+        )
+    except PlanSpecError:
+        return PLAN_SUMMARY_UNAVAILABLE
+
+    acceptance_count = sum(
+        len(requirement.acceptance_criteria)
+        for requirement in plan.requirements
+    )
+    repository_names = compact_summary_text(
+        ", ".join(plan.affected_surface.repositories),
+        SUMMARY_REPOSITORIES_MAX_CHARACTERS,
+    )
+    blocking_questions = sum(
+        question.blocks_implementation for question in plan.open_questions
+    ) + sum(assumption.needs_human for assumption in plan.assumptions)
+    goal = compact_summary_text(
+        plan.requirements[0].statement,
+        SUMMARY_GOAL_MAX_CHARACTERS,
+    )
+    approach = compact_summary_text(
+        plan.simplest_implementation,
+        SUMMARY_APPROACH_MAX_CHARACTERS,
+    )
+    question_summary = (
+        "none" if blocking_questions == 0 else str(blocking_questions)
+    )
+    return "\n".join(
+        (
+            f"Goal: {goal}",
+            f"Approach: {approach}",
+            "Scope: "
+            f"{counted_label(len(plan.requirements), 'requirement')}, "
+            f"{counted_label(acceptance_count, 'acceptance criterion', 'acceptance criteria')}, "
+            f"{counted_label(len(plan.test_cases), 'test')} across {repository_names}.",
+            f"Risks: {len(plan.risks)}. Blocking questions: {question_summary}.",
+        )
+    )
+
+
+def parse_dashboard_plan_spec(
+    content: str,
+    *,
+    run: RunRecord,
+    requirements_snapshot: RequirementsSnapshot | None,
+) -> PlanSpec:
+    snapshot_hash = str(run.issue_fingerprint or "").strip()
+    if not snapshot_hash:
+        raise PlanSpecError("run has no requirements snapshot hash")
+    if requirements_snapshot is None:
+        raise PlanSpecError("run's immutable requirements snapshot is unavailable")
+    try:
+        return parse_plan_spec(
+            content,
+            expected_issue_key=run.issue_identifier,
+            expected_snapshot_hash=snapshot_hash,
+            requirements_snapshot=requirements_snapshot,
+        )
+    except PlanSpecError:
+        if requirements_snapshot.schema_version not in {
+            "jira-requirements/v1",
+            "jira-requirements/v2",
+            "jira-requirements/v3",
+        }:
+            raise
+        return parse_frozen_legacy_plan_spec(
+            content,
+            expected_issue_key=run.issue_identifier,
+            expected_snapshot_hash=snapshot_hash,
+            issue_type=None,
+            requirements_snapshot=requirements_snapshot,
+        )
+
+
+def validate_dashboard_plan_binding(
+    plan: PlanSpec,
+    *,
+    run: RunRecord,
+    requirements_snapshot: RequirementsSnapshot | None,
+) -> None:
+    if requirements_snapshot is None:
+        raise PlanSpecError("run's immutable requirements snapshot is unavailable")
+    plan_hash = plan.content_hash()
+    trusted_hash = str(run.plan_spec_hash or "").strip()
+    trusted = False
+    if trusted_hash:
+        if plan_hash != trusted_hash:
+            raise PlanSpecError("PlanSpec does not match the run's trusted plan hash")
+        trusted = True
+
+    original_content = str(run.final_message or "").strip()
+    if run.blocked_phase == "planning_approval":
+        if not original_content:
+            raise PlanSpecError("planning run has no original validated PlanSpec")
+        original_plan = parse_dashboard_plan_spec(
+            original_content,
+            run=run,
+            requirements_snapshot=requirements_snapshot,
+        )
+        if plan_hash != original_plan.content_hash():
+            raise PlanSpecError("PlanSpec file differs from the planning result")
+        trusted = True
+    elif not trusted and original_content:
+        try:
+            original_plan = parse_dashboard_plan_spec(
+                original_content,
+                run=run,
+                requirements_snapshot=requirements_snapshot,
+            )
+        except PlanSpecError:
+            pass
+        else:
+            if plan_hash == original_plan.content_hash():
+                trusted = True
+
+    if not trusted:
+        raise PlanSpecError("PlanSpec has no trusted binding for this run")
+
+
+def summarize_requirements_snapshot(
+    snapshot: RequirementsSnapshot | None,
+) -> str | None:
+    if snapshot is None:
+        return None
+    requirements = [
+        decision
+        for decision in snapshot.current_requirements
+        if decision.kind == "requirement"
+    ]
+    acceptance_criteria = [
+        decision
+        for decision in snapshot.current_requirements
+        if decision.kind == "acceptance_criterion"
+    ]
+    lines = [
+        f"{counted_label(len(requirements), 'requirement')} and "
+        f"{counted_label(len(acceptance_criteria), 'acceptance criterion', 'acceptance criteria')}."
+    ]
+    for decision in requirements[:SUMMARY_ITEM_LIMIT]:
+        lines.append(
+            "- "
+            + compact_summary_text(
+                decision.text,
+                SUMMARY_ITEM_MAX_CHARACTERS,
+            )
+        )
+    remaining = len(requirements) - SUMMARY_ITEM_LIMIT
+    if remaining > 0:
+        lines.append(f"+{remaining} more requirements; open the full file.")
+
+    sources = requirements_source_labels(snapshot)
+    if sources:
+        lines.append(f"Sources: {', '.join(sources)}.")
+    completeness = (
+        "complete"
+        if not snapshot.incomplete_reasons
+        else f"incomplete ({len(snapshot.incomplete_reasons)} issues)"
+    )
+    contradictions = len(snapshot.unresolved_contradictions)
+    contradiction_summary = (
+        "no unresolved contradictions"
+        if contradictions == 0
+        else f"{contradictions} unresolved contradictions"
+    )
+    lines.append(f"Status: {completeness}; {contradiction_summary}.")
+    return "\n".join(lines)
+
+
+def requirements_source_labels(snapshot: RequirementsSnapshot) -> list[str]:
+    sources = [
+        source
+        for decision in snapshot.current_requirements
+        for source in decision.sources
+    ]
+    source_types = {source.source_type for source in sources}
+    labels_by_type = {
+        "comment": "Comments",
+        "attachment": "Attachments",
+        "relation": "Related issues",
+    }
+    labels = ["Description"] if "description" in source_types else []
+    custom_field_labels = sorted(
+        {
+            (source.field_name or "Custom fields").strip()
+            for source in sources
+            if source.source_type == "custom_field"
+        },
+        key=str.casefold,
+    )
+    labels.extend(custom_field_labels)
+    labels.extend(
+        labels_by_type[source_type]
+        for source_type in ("comment", "attachment", "relation")
+        if source_type in source_types
+    )
+    return labels
+
+
+def compact_summary_text(value: Any, max_characters: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_characters:
+        return text
+    return text[: max_characters - 1].rstrip() + "…"
+
+
+def counted_label(count: int, singular: str, plural: str | None = None) -> str:
+    label = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {label}"
+
+
 def display_blocked_phase(run: dict[str, Any]) -> str:
     if run.get("blocked_phase") == "planning_approval":
         return "plan completed"
-    return str(run.get("blocked_phase") or "")
+    phase = str(run.get("blocked_phase") or "")
+    return {
+        "automation_planning": "automation planning",
+        "automation_implementation": "automation implementation",
+    }.get(phase, phase)
 
 
 def display_status(run: dict[str, Any]) -> str:
@@ -833,6 +1674,23 @@ def display_error(run: dict[str, Any]) -> str:
     if run.get("blocked_phase") == "planning_approval":
         return ""
     return str(run.get("error") or "")
+
+
+def display_final_message(run: dict[str, Any]) -> str:
+    final_message = str(run.get("final_message") or "")
+    plan_content = str(run.get("plan_content") or "")
+    if run.get("blocked_phase") == "planning_approval" or (
+        final_message.strip()
+        and plan_content.strip()
+        and final_message.strip() == plan_content.strip()
+    ):
+        if str(run.get("plan_summary") or "").strip() in {
+            "",
+            PLAN_SUMMARY_UNAVAILABLE,
+        }:
+            return "Plan details could not be validated for this run."
+        return "Plan ready for approval. See the brief Plan summary."
+    return final_message
 
 
 def render_human_input_cell(run: dict[str, Any]) -> str:
@@ -884,6 +1742,15 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
                 "Requirements snapshot: "
                 f"<code>{escape(latest.get('requirements_snapshot_hash'))}</code></div>"
             )
+        elif latest.get("action") == "verification_bypass":
+            approval_details = (
+                f"<div>Verification override approved by "
+                f"{escape(latest.get('approver_identity'))}</div>"
+                f"<div class=\"muted\">Workspace diff: "
+                f"<code>{escape(latest.get('workspace_diff_hash'))}</code><br>"
+                "Verification evidence: "
+                f"<code>{escape(latest.get('verification_evidence_sha256'))}</code></div>"
+            )
         return (
             review_lineage
             + f"<strong>{escape(state)}</strong>{approval_details}"
@@ -907,12 +1774,53 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
             "<button type=\"submit\">Request Adjustments</button>"
             "</form></div>"
         )
+    if (
+        run.get("blocked_phase") in VERIFICATION_BYPASS_PHASES
+        and run.get("verification_status") not in {None, "passed", "not_configured"}
+    ):
+        retry_form = (
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input type=\"hidden\" name=\"action\" value=\"retry_verification\">"
+            "<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
+            "placeholder=\"Describe what was fixed before retrying\"></textarea><br>"
+            "<button type=\"submit\">Retry Verification</button>"
+            "</form>"
+        )
+        if not (
+            is_sha256(run.get("verification_workspace_diff_hash"))
+            and is_sha256(run.get("verification_evidence_sha256"))
+        ):
+            return review_lineage + (
+                "<div><strong>Verification did not pass</strong>"
+                "<div class=\"muted\">This run predates verification-time "
+                "integrity binding and cannot be safely bypassed. Retry Verification "
+                "to establish the code and evidence binding first.</div>"
+                f"{retry_form}</div>"
+            )
+        return review_lineage + (
+            "<div><strong>Verification did not pass</strong>"
+            "<div class=\"muted\">An explicit human override can hand off the "
+            "existing changes. The failed verification result stays in run history.</div>"
+            f"<form method=\"post\" action=\"{action_url}\">"
+            "<input type=\"hidden\" name=\"action\" value=\"bypass_verification\">"
+            "<input name=\"approver_identity\" required placeholder=\"Approver identity\">"
+            "<button type=\"submit\">Bypass Verification and Hand Off</button>"
+            "</form>"
+            f"{retry_form}</div>"
+        )
     return review_lineage + (
         f"<form method=\"post\" action=\"{action_url}\">"
         "<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
         "placeholder=\"Add clarification for Codex\"></textarea><br>"
         "<button type=\"submit\">Resume</button>"
         "</form>"
+    )
+
+
+def is_sha256(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return len(normalized) == 64 and all(
+        character in "0123456789abcdef" for character in normalized
     )
 
 

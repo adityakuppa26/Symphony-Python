@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -13,9 +15,11 @@ from symphony_jira.human_review import (
     build_human_review_triage_prompt,
     capture_workspace_diff,
     classify_human_review_triage,
+    hash_verification_evidence,
     issue_from_frozen_snapshot,
     read_frozen_text_artifact,
     read_only_codex_config,
+    write_frozen_text_artifact,
 )
 from symphony_jira.models import (
     RequirementArtifact,
@@ -45,6 +49,18 @@ class HumanReviewTests(unittest.TestCase):
         self.assertEqual(
             classify_human_review_triage(message),
             ("plan_changes_required", "The API contract changes."),
+        )
+
+    def test_classify_human_review_triage_can_replan_only_automation(self) -> None:
+        self.assertEqual(
+            classify_human_review_triage(
+                '{"decision":"automation_plan_changes_required",'
+                '"reason":"Use the existing page object instead."}'
+            ),
+            (
+                "automation_plan_changes_required",
+                "Use the existing page object instead.",
+            ),
         )
 
     def test_classify_human_review_triage_rejects_invalid_output(self) -> None:
@@ -173,13 +189,17 @@ class HumanReviewTests(unittest.TestCase):
             workspace = Path(tmp) / "workspace"
             workspace.mkdir()
 
+            plan_spec = _plan_spec([("repo", "a" * 40)])
+            # Exercise capture's own defense in depth even though normal PlanSpec
+            # parsing rejects this traversal before review.
+            plan_spec.baseline_repository_shas[0].repository = "../outside"
             with self.assertRaisesRegex(
                 HumanReviewContextError,
                 "resolves outside the workspace",
             ):
                 capture_workspace_diff(
                     workspace,
-                    _plan_spec([("../outside", "a" * 40)]),
+                    plan_spec,
                 )
 
     def test_capture_workspace_diff_rejects_repository_symlink_escape(
@@ -276,6 +296,99 @@ class HumanReviewTests(unittest.TestCase):
                     label="review",
                 )
 
+    def test_write_frozen_text_artifact_replaces_leaf_link_without_following_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            artifacts = workspace / ".symphony"
+            artifacts.mkdir(parents=True)
+            outside = root / "outside.md"
+            outside.write_text("do not change", encoding="utf-8")
+            artifact = artifacts / "codex-automation-final.md"
+            artifact.symlink_to(outside)
+
+            write_frozen_text_artifact(
+                workspace,
+                ".symphony/codex-automation-final.md",
+                "safe result",
+                label="automation result",
+            )
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), "do not change")
+            self.assertFalse(artifact.is_symlink())
+            self.assertEqual(artifact.read_text(encoding="utf-8"), "safe result")
+
+    def test_write_frozen_text_artifact_rejects_linked_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (workspace / ".symphony").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(HumanReviewContextError, "safely write"):
+                write_frozen_text_artifact(
+                    workspace,
+                    ".symphony/codex-automation-final.md",
+                    "unsafe result",
+                    label="automation result",
+                )
+            self.assertFalse((outside / "codex-automation-final.md").exists())
+
+    def test_runtime_manifest_evidence_binds_hook_log_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            runtime_dir = workspace / ".symphony" / "runtime"
+            hook_dir = workspace / ".symphony" / "hooks"
+            runtime_dir.mkdir(parents=True)
+            hook_dir.mkdir(parents=True)
+            hook_path = hook_dir / "verify.log"
+            hook_content = b"hook output\x00\xff\n"
+            hook_path.write_bytes(hook_content)
+            manifest_path = runtime_dir / "verification.json"
+            manifest = {
+                "schema_version": "1.0",
+                "issue_identifier": "T-1",
+                "plan_spec_hash": "a" * 64,
+                "affected_repositories": ["repo"],
+                "hook": {
+                    "output_path": str(hook_path),
+                    "output_sha256": hashlib.sha256(hook_content).hexdigest(),
+                },
+                "runtime": {"checks": []},
+            }
+            manifest_content = json.dumps(manifest, sort_keys=True) + "\n"
+            manifest_path.write_text(manifest_content, encoding="utf-8")
+
+            self.assertEqual(
+                hash_verification_evidence(workspace, manifest_path),
+                hashlib.sha256(manifest_content.encode("utf-8")).hexdigest(),
+            )
+
+            hook_path.write_bytes(b"changed hook output\n")
+            with self.assertRaisesRegex(
+                HumanReviewContextError,
+                "verification hook log changed after its manifest was written",
+            ):
+                hash_verification_evidence(workspace, manifest_path)
+
+            manifest["hook"] = {
+                "output_path": None,
+                "output_sha256": "b" * 64,
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                HumanReviewContextError,
+                "log hash without an output path",
+            ):
+                hash_verification_evidence(workspace, manifest_path)
+
     def test_issue_from_frozen_snapshot_rehydrates_exact_context(self) -> None:
         snapshot = _snapshot()
         source_run = _source_run(snapshot)
@@ -342,6 +455,9 @@ class HumanReviewTests(unittest.TestCase):
             "requirements_snapshot_hash": snapshot.calculate_content_hash(),
             "plan_spec_hash": "b" * 64,
             "plan_spec": '{"decision":"ready_for_approval"}',
+            "automation_plan_hash": "c" * 64,
+            "automation_plan": '{"decision":"update_required"}',
+            "automation_result": "Added the focused browser regression.",
             "approval": {
                 "approved_by": "Grace Approver",
                 "approval_id": "approval-3",
@@ -375,6 +491,9 @@ class HumanReviewTests(unittest.TestCase):
             '"issue_identifier": "T-7"',
             "b" * 64,
             '{"decision":"ready_for_approval"}',
+            "c" * 64,
+            '{"decision":"update_required"}',
+            "Added the focused browser regression.",
             '"approved_by": "Grace Approver"',
             "Implemented the approved plan.",
             '{"decision":"approve"}',
@@ -392,6 +511,11 @@ class HumanReviewTests(unittest.TestCase):
             "Please reuse parse_widget and add a regression test.",
             "b" * 64,
             '{"decision":"ready_for_approval"}',
+            "c" * 64,
+            '{"decision":"update_required"}',
+            "Added the focused browser regression.",
+            "Do not edit the configured automation checkout",
+            "automation_plan_changes_required",
             '"decision":"plan_changes_required"',
         ):
             self.assertIn(expected, implementation_prompt)

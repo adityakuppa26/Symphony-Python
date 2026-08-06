@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from .config import CodexConfig
+from .environment import filtered_subprocess_environment
+from .human_review import write_frozen_text_artifact
 
 
 EventCallback = Callable[[int, str, dict[str, Any]], None | Awaitable[None]]
@@ -27,6 +31,17 @@ class CodexRunResult:
 
 
 class CodexRunner:
+    def __init__(
+        self,
+        *,
+        environ: Mapping[str, str] | None = None,
+        excluded_environment_names: Iterable[str | None] = (),
+    ) -> None:
+        self._environ = environ
+        self._excluded_environment_names = frozenset(
+            name for name in excluded_environment_names if name
+        )
+
     async def run(
         self,
         prompt: str,
@@ -38,18 +53,23 @@ class CodexRunner:
         log_callback: LogCallback | None = None,
     ) -> CodexRunResult:
         symphony_dir = workspace_path / ".symphony"
-        symphony_dir.mkdir(parents=True, exist_ok=True)
         stderr_path = symphony_dir / "codex-stderr.log"
         final_message_path = workspace_path / config.output_last_message_file
-        final_message_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_bytes = prompt.encode("utf-8")
+
+        process_options: dict[str, Any] = {}
+        if os.name == "posix":
+            process_options["start_new_session"] = True
 
         process = await asyncio.create_subprocess_exec(
             config.command,
             *config.args,
-            prompt,
             cwd=str(workspace_path),
+            env=self._subprocess_environment(config),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_options,
         )
 
         events: list[dict[str, Any]] = []
@@ -98,28 +118,104 @@ class CodexRunner:
             assert process.stderr is not None
             data = await process.stderr.read()
             text = data.decode(errors="replace")
-            stderr_path.write_text(text, encoding="utf-8")
+            write_frozen_text_artifact(
+                workspace_path,
+                ".symphony/codex-stderr.log",
+                text,
+                label="Codex stderr artifact",
+            )
             return text
+
+        async def write_stdin() -> bool:
+            assert process.stdin is not None
+            delivered = False
+            cancelled = False
+            try:
+                for offset in range(0, len(prompt_bytes), 65536):
+                    process.stdin.write(prompt_bytes[offset : offset + 65536])
+                    await process.stdin.drain()
+                delivered = True
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                    if not cancelled:
+                        await process.stdin.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    delivered = False
+            return delivered
 
         stdout_task = asyncio.create_task(read_stdout())
         stderr_task = asyncio.create_task(read_stderr())
+        stdin_task = asyncio.create_task(write_stdin())
+
+        async def terminate_and_settle() -> int | None:
+            if not stdin_task.done():
+                stdin_task.cancel()
+            returncode = await terminate_runner_process(
+                process,
+                terminate_timeout_seconds=5,
+            )
+            for task in (stdin_task, stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                stdin_task,
+                stdout_task,
+                stderr_task,
+                return_exceptions=True,
+            )
+            if not stderr_path.exists():
+                write_frozen_text_artifact(
+                    workspace_path,
+                    ".symphony/codex-stderr.log",
+                    "",
+                    label="Codex stderr artifact",
+                )
+            return returncode
+
+        async def wait_for_completion() -> tuple[int, bool, str]:
+            returncode = await process.wait()
+            prompt_delivered = await stdin_task
+            await stdout_task
+            stderr_text = await stderr_task
+            return returncode, prompt_delivered, stderr_text
 
         timed_out = False
         try:
-            returncode = await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            timed_out = True
-            returncode = await terminate_process(process, terminate_timeout_seconds=5)
-
-        await stdout_task
-        stderr_text = await stderr_task
+            try:
+                returncode, prompt_delivered, stderr_text = await asyncio.wait_for(
+                    wait_for_completion(),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                returncode = await terminate_and_settle()
+                prompt_delivered = False
+                stderr_text = ""
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(terminate_and_settle())
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(cleanup_task)
+            raise
+        except Exception:
+            await terminate_and_settle()
+            raise
 
         if final_message is None:
             final_message = final_message_from_events(events)
-        if final_message:
-            final_message_path.write_text(final_message, encoding="utf-8")
-        else:
-            final_message_path.write_text("", encoding="utf-8")
+        write_frozen_text_artifact(
+            workspace_path,
+            config.output_last_message_file,
+            final_message or "",
+            label="Codex final-message artifact",
+        )
 
         if timed_out:
             return CodexRunResult(
@@ -127,6 +223,18 @@ class CodexRunner:
                 returncode=returncode,
                 final_message=final_message,
                 error=f"Codex timed out after {timeout_seconds} seconds",
+                stderr_path=stderr_path,
+                final_message_path=final_message_path,
+                events=events,
+                raw_stdout_lines=raw_lines,
+            )
+
+        if not prompt_delivered and returncode == 0:
+            return CodexRunResult(
+                status="failed",
+                returncode=returncode,
+                final_message=final_message,
+                error="Codex exited before the complete prompt was delivered over stdin",
                 stderr_path=stderr_path,
                 final_message_path=final_message_path,
                 events=events,
@@ -158,6 +266,14 @@ class CodexRunner:
             raw_stdout_lines=raw_lines,
         )
 
+    def _subprocess_environment(self, config: CodexConfig) -> dict[str, str]:
+        source = os.environ if self._environ is None else self._environ
+        return filtered_subprocess_environment(
+            source,
+            excluded_names=self._excluded_environment_names,
+            excluded_patterns=config.environment_exclude,
+        )
+
 
 async def maybe_await(value):
     if inspect.isawaitable(value):
@@ -178,6 +294,63 @@ async def terminate_process(process: Any, *, terminate_timeout_seconds: int) -> 
         except ProcessLookupError:
             return await process.wait()
         return await process.wait()
+
+
+async def terminate_runner_process(
+    process: Any,
+    *,
+    terminate_timeout_seconds: int,
+) -> int | None:
+    """Terminate the isolated Codex process group, with a portable fallback."""
+    process_id = getattr(process, "pid", None)
+    if os.name != "posix" or not isinstance(process_id, int):
+        return await terminate_process(
+            process,
+            terminate_timeout_seconds=terminate_timeout_seconds,
+        )
+
+    wait_task = asyncio.create_task(process.wait())
+    _signal_process_group(process_id, signal.SIGTERM)
+
+    async def wait_until_group_exits() -> int | None:
+        returncode = await asyncio.shield(wait_task)
+        while _process_group_exists(process_id):
+            await asyncio.sleep(0.05)
+        return returncode
+
+    try:
+        return await asyncio.wait_for(
+            wait_until_group_exits(),
+            timeout=terminate_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        _signal_process_group(process_id, signal.SIGKILL)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(wait_task),
+                timeout=terminate_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
+            return getattr(process, "returncode", None)
+
+
+def _signal_process_group(process_group_id: int, signal_number: signal.Signals) -> None:
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def event_type_from(raw: dict[str, Any]) -> str:

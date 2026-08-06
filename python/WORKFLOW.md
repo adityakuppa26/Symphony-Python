@@ -15,48 +15,38 @@ tracker:
   comment_on_start: false
   comment_on_finish: false
   requirements:
-    # Add installation-specific Jira field IDs here. Acceptance-criteria fields
-    # are also included in the general custom-field requirements bundle.
+    # Add installation-specific Jira field IDs here. Generic custom fields are
+    # retained as context; only acceptance-criteria fields are planning evidence.
     custom_fields: []
-    acceptance_criteria_fields: []
-    field_authority: {}
+    acceptance_criteria_fields: ["customfield_15812"]
+    field_authority:
+      customfield_15812: product
     description_authority: product
     comment_authority: product
     # Exact display-name/email/username matches are trimmed and case-insensitive.
     # Edited comments use updateAuthor and updated time for the current body.
     comment_authority_by_author: {}
-    # Every description/comment/author/field/attachment/relation authority must
-    # be nonblank and listed here or configuration validation fails.
+    # Only the root Description, configured Acceptance Criteria fields, and root
+    # comments are planning authority. Other authority settings are retained for
+    # contextual metadata and cannot create or block PlanSpec scope.
     authority_rank:
       context: 10
       supporting_evidence: 10
       engineering_context: 20
       product: 30
       product_owner: 40
-    attachment_authority: supporting_evidence
     relation_authority: context
     comment_page_size: 100
     # Bounds root-search and one-hop related hydration; it is not a count limit.
     # Valid range: 1 through 32.
     related_issue_hydration_max_concurrency: 8
-    download_attachments: true
-    max_attachment_bytes: 10485760
-    # Content URLs must resolve to the exact Jira origin. Bytes are streamed and
-    # aborted above max_attachment_bytes; downloads never send Jira auth off-origin.
-    # Valid concurrency range: 1 through 32.
-    attachment_download_max_concurrency: 4
-    require_attachment_analysis: true
-    # Codex mode sends screenshots and rendered PDF pages to the model provider
-    # configured for the locally authenticated Codex CLI. Enable it only after
-    # that provider is approved for the Jira evidence's data-handling class.
-    attachment_analyzer: codex
-    attachment_analysis_timeout_seconds: 120
-    attachment_pdf_max_pages: 8
-    attachment_analysis_max_concurrency: 1
-    attachment_analysis_max_output_characters: 12000
+    # Attachments are intentionally excluded from planning for stability. Jira
+    # Description, Acceptance Criteria, and comments are the complete product
+    # authority for this workflow.
     # Mandatory: false is rejected so completed-work identity cannot use a partial
-    # search result. Missing core/configured fields and absent/malformed changelog
-    # provenance are completeness gates; null/empty values are valid when present.
+    # search result. Missing root Description/comment or configured Acceptance
+    # Criteria keys are completeness gates; null/empty values are valid when present.
+    # Changelog, related-issue, and other contextual gaps remain warnings.
     hydrate_search_results: true
     # By default, Epics also use quoted modern JQL: parent = "<issue-key>".
     # Set false (with child_issue_jql null) to opt out.
@@ -64,8 +54,8 @@ tracker:
     # A template containing {issue_key} overrides the default and retains
     # discovery for any issue type, including non-Epics.
     child_issue_jql: null
-    # Child pagination is deduplicated and fails incomplete on errors, truncation,
-    # non-progress, inconsistent total/isLast, or this bound. Maximum: 1000.
+    # Child pagination is deduplicated and bounded. Errors, truncation, non-progress,
+    # inconsistent total/isLast, or reaching this bound remain context warnings.
     child_issue_max_pages: 100
 
 polling:
@@ -77,18 +67,106 @@ workspace:
 
 hooks:
   after_create: |
-    git clone /home/adkuppa/foyr2 foyr2
-    git clone /home/adkuppa/cpm cpm
-    git clone /home/adkuppa/pi pi
+    set -eu
+    git clone --branch develop --single-branch /home/adkuppa/foyr2 foyr2
+    git clone --branch develop --single-branch /home/adkuppa/cpm cpm
+    git clone --branch develop --single-branch /home/adkuppa/pi pi
+    git clone --no-hardlinks --branch master --single-branch /home/adkuppa/CPM automation
+    git -C automation remote remove origin
+    git -C foyr2 checkout -b feature/{{ issue.identifier }}
+    git -C cpm checkout -b feature/{{ issue.identifier }}
+    git -C pi checkout -b feature/{{ issue.identifier }}
+    git -C automation checkout -b "{{ issue.identifier }}"
   before_run: |
+    set -eu
+    test ! -L automation
+    if [ ! -e automation ]; then
+      git clone --no-hardlinks --branch master --single-branch /home/adkuppa/CPM automation
+      git -C automation remote remove origin
+      git -C automation checkout -b "{{ issue.identifier }}"
+    fi
+    test -d automation/.git
+    test ! -L automation/.git
+    if git -C automation remote get-url origin >/dev/null 2>&1; then
+      git -C automation remote remove origin
+    fi
+    test -z "$(git -C automation remote)"
+    test "$(git -C foyr2 symbolic-ref --short HEAD)" = "feature/{{ issue.identifier }}"
+    test "$(git -C cpm symbolic-ref --short HEAD)" = "feature/{{ issue.identifier }}"
+    test "$(git -C pi symbolic-ref --short HEAD)" = "feature/{{ issue.identifier }}"
+    test "$(git -C automation symbolic-ref --short HEAD)" = "{{ issue.identifier }}"
+    git -C foyr2 show-ref --verify --quiet refs/heads/develop
+    git -C cpm show-ref --verify --quiet refs/heads/develop
+    git -C pi show-ref --verify --quiet refs/heads/develop
+    git -C automation show-ref --verify --quiet refs/heads/master
     git -C foyr2 status --short
     git -C cpm status --short
     git -C pi status --short
-  # Advisory: failure is recorded and surfaced, but does not block completion.
+    git -C automation status --short
   verify: |
     git -C foyr2 diff --check
     git -C cpm diff --check
     git -C pi diff --check
+    git -C automation diff --check
+  verify_required: true
+
+runtime:
+  kind: podman_compose
+  enabled: true
+  required: true
+  shutdown_after_handoff: true
+  shutdown_grace_seconds: 120
+  command: ["/usr/bin/podman", "compose"]
+  project_directory: "/home/adkuppa/compost"
+  compose_file: "/home/adkuppa/compost/docker-compose.yml"
+  env_file: "/home/adkuppa/compost/.env"
+  project_name: "compost"
+  lock_file: "~/.local/state/symphony/compost-runtime.lock"
+  repositories:
+    foyr2:
+      workspace_subdir: "foyr2"
+      source_env: "FOYR_SRC"
+      service: "foyr"
+      mount_target: "/src"
+      dependencies: ["ibis"]
+      force_recreate_dependencies: ["ibis"]
+      container_workdir: "/src"
+      verification_profile: "foyr_pytest"
+    cpm:
+      workspace_subdir: "cpm"
+      source_env: "CPM_SRC"
+      service: "cpm"
+      mount_target: "/TexturaWD/textura"
+      dependencies: ["oracledb19", "memcached"]
+      container_workdir: "/TexturaWD/textura"
+      verification_profile: "cpm_pytest"
+    pi:
+      workspace_subdir: "pi"
+      source_env: "PI_SRC"
+      service: "pi"
+      mount_target: "/pi"
+      dependencies: ["oracledb23ai"]
+      container_workdir: "/pi"
+      verification_profile: "pi_pytest"
+  verification_profiles:
+    cpm_pytest:
+      argv: ["pytest"]
+      default_args: ["Test/unit"]
+      timeout_seconds: 3600
+    foyr_pytest:
+      argv: ["pytest"]
+      default_args:
+        - "/src/tests"
+        - "-n"
+        - "4"
+        - "--tb=native"
+        - "--junitxml=/src/pytest-results.xml"
+      environment:
+        FOYR_CONFIG_FILE: "/src/tests/testing.yml"
+      timeout_seconds: 3600
+    pi_pytest:
+      argv: ["hatch", "run", "dev:test"]
+      timeout_seconds: 3600
 
 agent:
   max_concurrent_agents: 1
@@ -107,8 +185,6 @@ codex:
     - "sandbox_workspace_write.network_access=true"
     - "-c"
     - 'approval_policy="untrusted"'
-    - "--add-dir"
-    - "/home/adkuppa/compost"
   output_last_message_file: ".symphony/codex-final.md"
   output_plan_file: ".symphony/codex-plan.md"
   output_review_file: ".symphony/codex-review.md"
@@ -121,30 +197,32 @@ codex:
   # a heartbeat runs at least every 60 seconds and stale owners cannot finalize.
   require_plan_approval: true
   planning_prompt: |
-    Treat Symphony's canonical, versioned Jira requirements snapshot as the authoritative product input. The description and comments in the human-readable workflow prompt are orientation only and are not a complete specification.
+    Treat Symphony's canonical, versioned Jira planning-evidence bundle as the authoritative product input. Only the root issue Description, configured Acceptance Criteria field, and root issue comments may define requirements or acceptance criteria.
     Inspect the relevant repo areas and produce the required validated PlanSpec JSON.
-    Verify the snapshot hash, use only source IDs present in that snapshot, and preserve its explicit separation of current requirements, superseded requirements, inferred behavior, and unresolved contradictions.
-    New snapshots use jira-requirements/v2. Mixed clauses and bullets have exact digest-stable #unit source IDs. Jira authors may use [classification: current], [inferred], [superseded], [contradiction], and [supersedes: jira:KEY:artifact-or-unit-id]. Ambiguous replacement prose, lower/unranked overrides, cycles, and clear polarity/order conflicts remain unresolved rather than silently changing scope.
-    Complete attachment summaries enter the same taxonomy as supporting evidence. Only an exact current attachment decision unit may anchor a PlanRequirement; inferred, superseded, or contradictory units cannot. Attachment section labels never manufacture acceptance criteria.
-    Symphony hard-blocks before this planning prompt whenever incomplete_reasons is non-empty. Missing requested root/related field keys (distinct from present null/empty values), missing OCR/vision analysis, off-origin or failed attachment downloads, truncated comments, absent/malformed changelog provenance or total, unavailable exact source author/timestamp, blank/unranked authority, and unresolved Jira contradictions must be corrected in Jira or the evidence pipeline and then refetched; dashboard clarification text cannot waive this source-provenance gate.
+    Verify the snapshot hash, cite only allowed source IDs in that bundle, and preserve its separation of current, superseded, inferred, and explicitly contradictory decisions.
+    Attachments are disabled and must not be downloaded, analyzed, cited, hashed, or used to create scope. Parent/child/link data, related issues, components, versions, changelog metadata, and generic custom fields are context only; missing context must not block planning.
+    Hard-block only when root Description, configured Acceptance Criteria, or root comments cannot be fetched completely, or when those authoritative sources contain an explicit unresolved contradiction. Model-generated schema, citation, traceability, repository-baseline, or Epic bookkeeping mistakes should be corrected by Symphony's automatic PlanSpec repair pass rather than presented as Jira defects.
     Pay extra attention to report/table behavior, translations, API compatibility, persistence/schema behavior, backward compatibility, and which repo owns the change.
     Before proposing implementation:
     - Compare the issue branch against its merge base. Do not treat code already added on the issue branch as an established repository pattern.
+    - Keep automation/ out of the development PlanSpec and implementation scope. Symphony plans and applies automation updates in a separate post-development phase using the approved PlanSpec and actual development changes.
     - Inspect the target file and at least two nearby implementations of the same UI or API behavior. Cite those precedents in the plan.
     - Prefer the existing local pattern. Any new renderer, helper, component flag, special-case reset, or persistence behavior must explain why existing patterns are insufficient.
-    - Give every requirement and acceptance criterion a stable ID linked to its exact Jira issue identifier, source type, and source ID, including exact #unit IDs and related-issue attachment evidence. Cover every current requirement source in the requirement layer and every current acceptance-criterion source in its matching nested layer. Every PlanRequirement and AcceptanceCriterion must cite a current decision source, and every completely analyzed root or related attachment must be cited by active scope. Separate explicit Jira requirements from inferred behavior. If an inference changes reset, saved-filter, default, persistence, or compatibility semantics, request clarification instead of implementing it.
-    - Include every relevant role/state combination in the role/state matrix, and reference every planned requirement and acceptance-criterion ID in at least one row. Set canonical_role to exactly gc, sub, gc_as_sub, all, or other, and keep the human-readable role display label separate; role-specific labels must identify only their matching canonical role and cannot be negated/exclusionary. Do not collapse GC, Sub, and GC-acting-as-Sub when their behavior or evidence differs. A role explicitly absent/not shown in only a complete attachment summary does not require a row; a current Jira decision that the role is not applicable still requires its own state row.
-    - Record every affected repository name as a workspace-relative Git worktree root (`.` means the workspace-root repository) and its full `git rev-parse HEAD` SHA. Symphony checks that path and SHA before approval, implementation, and requirements checkpoints. Initial planning and approval require clean declared worktrees; only untracked `.symphony/**` run artifacts are ignored. Precedents must be Git-tracked and outside `.symphony`. Implementation dirt is expected afterward, but HEAD must remain at the approved SHA. Also enumerate affected files, APIs, schemas, migrations, and translations, using explicit empty lists only when a surface is not applicable.
-    - Map exactly one test case to each acceptance criterion.
+    - When Jira requires backwards compatibility, preservation of existing behavior, or a standard component pattern, reuse the established repository behavior for incidental edge cases such as null placement. Cite the precedent instead of asking for a new product decision or manufacturing a new acceptance criterion. Ask only if Jira conflicts with the precedent or no applicable precedent exists and the implementation would introduce new user-visible semantics.
+    - Give every requirement and acceptance criterion a stable ID linked to an exact allowed Jira source, including exact #unit IDs. Cover each current Description/comment requirement decision in the requirement layer and each current configured Acceptance Criteria decision in the nested acceptance-criterion layer. Separate explicit Jira requirements from inferred behavior. If an inference changes reset, saved-filter, default, persistence, or compatibility semantics, request clarification instead of implementing it.
+    - Include role/state rows only for behavior that actually varies by role or state. Role-neutral requirements need no matrix row. Set canonical_role to exactly gc, sub, gc_as_sub, all, or other; it is the machine-readable role, while the human-readable role label is descriptive and is not independently parsed. Every ID that a row does reference must exist in the PlanSpec, and roles with different Jira-required behavior must not be collapsed.
+    - Record every affected repository name as one normalized, workspace-relative POSIX Git worktree root (`.` means the workspace-root repository), with no redundant `./` segments or alternate aliases, and include its full `git rev-parse HEAD` SHA. Symphony checks that path and SHA before approval, implementation, and requirements checkpoints. Initial planning and approval require clean declared worktrees; only untracked `.symphony/**` run artifacts are ignored. Precedents must be Git-tracked and outside `.symphony`. Implementation dirt is expected afterward, but HEAD must remain at the approved SHA. Also enumerate affected files, APIs, schemas, migrations, and translations, using explicit empty lists only when a surface is not applicable.
+    - Map at least one test case to each acceptance criterion. Multiple tests may cover the same criterion.
     - For filters, document expected behavior for initial load, saved-filter application, manual clearing, Reset Filters, and page reload.
     - Include the existing precedents, simplest implementation considered, non-goals, prohibited scope, rollout, rollback, compatibility, risks, and open questions.
-    - For an Epic, either partition all requirements and acceptance criteria into bounded child plans or justify single_change mode, which requires explicit approval of the exact PlanSpec.
+    - For an Epic, either partition all requirements and acceptance criteria into bounded child plans or justify single_change mode, which requires explicit approval of the exact PlanSpec. When the canonical snapshot contains no child or linked Jira issues that can own bounded child plans, use single_change with bounded_child_plans=[] and requires_explicit_single_change_approval=true; never emit epic_strategy=null.
   review_after_run: true
   max_review_iterations: 10
   output_human_review_triage_file: ".symphony/codex-human-review-triage.md"
   human_review_triage_prompt: |
     Classify pasted human code-review feedback against the exact frozen requirements snapshot, validated PlanSpec, approval, previous final response, prior reviews, and current workspace diff.
     Return code_changes only when every requested edit remains within the exact PlanSpec.
+    Return automation_plan_changes_required when the development PlanSpec remains valid and only the derived automation plan must change.
     Return plan_changes_required when behavior, scope, architecture, acceptance criteria, affected surfaces, compatibility, or non-goals must change.
     Return needs_human only when that boundary cannot be determined safely.
     Do not edit files during triage, and do not treat pasted review prose as a new product requirement.
@@ -161,17 +239,28 @@ codex:
     - Do not approve behavioral UI changes without a targeted test or documented manual verification of the affected state transitions.
     Also, ensure that the code changes are not doing more than what's asked for. If there is an unnecessary change, add a feedback accordingly to make it a minimal but relevant change.
     Return JSON with:
-    - decision: "approve", "changes_required", or "plan_changes_required"
+    - decision: "approve", "changes_required", "automation_plan_changes_required", or "plan_changes_required"
     - findings: a list of concrete findings
     - residual_risk: a short risk summary
-    Use changes_required only for code changes that remain within the exact validated PlanSpec. Use plan_changes_required when a finding changes required behavior, scope, requirements or acceptance criteria, architecture, or affected surfaces; Symphony invalidates the prior approval and returns the issue to planning for a new PlanSpec and approval. Empty or unrecognized review output is invalid and blocks rather than approving.
-    - To run tests,
-      1. Update .env file under /home/adkuppa/compost/. Set the CPM_SRC, FOYR_SRC, PI_SRC variables to the right directory under /home/adkuppa/codex-workspaces/.
-      2. Make sure the relevant services are running. If not, "podman compose up <service_name>" will start the service. Example, podman compose up cpm.
-      3. Run "podman compose run foyr bash" or "podman compose run cpm bash" and you'll have the bash environment.
-      4. Use pytest to run the unit tests.
+    Use changes_required only for code changes that remain within the exact validated development and automation plans. Use automation_plan_changes_required when the development PlanSpec remains valid and only the derived automation plan must change. Use plan_changes_required when a finding changes required behavior, scope, requirements or acceptance criteria, architecture, or affected surfaces; Symphony invalidates the prior approval and returns the issue to development planning for a new PlanSpec and approval. Empty or unrecognized review output is invalid and blocks rather than approving.
+    Symphony owns required runtime verification and supplies its persisted evidence to review. Codex must never edit or invoke /home/adkuppa/compost or Podman.
     Before you handoff, make sure the changes made are working and not causing api or ui failures.
     Focus on correctness, regressions, missing tests, and translation consistency.
+
+automation:
+  enabled: true
+  workspace_subdir: "automation"
+  output_plan_file: ".symphony/codex-automation-plan.md"
+  output_result_file: ".symphony/codex-automation-final.md"
+  planning_prompt: |
+    After the approved development PlanSpec has been implemented, plan only the relevant automation update in automation/.
+    Use the canonical Jira requirements, exact approved development PlanSpec, development result, and actual development diff as the behavior contract, then inspect the existing automation code for its established patterns.
+    Identify the smallest useful regression or end-to-end coverage change, including the exact automation files and focused checks. Do not edit files during this planning pass.
+    If the development change does not warrant an automation-code update, return an explicit no-op plan with a concrete reason; do not manufacture coverage or unrelated cleanup.
+  implementation_prompt: |
+    Apply the automation plan only in automation/. Keep the change narrowly tied to the Jira requirements, approved development PlanSpec, and actual development implementation, and follow the repository's existing automation patterns.
+    Do not edit foyr2/, cpm/, or pi/, and do not add unrelated refactors or speculative coverage.
+    If the automation plan is a no-op, leave automation/ unchanged and report the reason.
 ---
 
 You are working on Jira issue {{ issue.identifier }}.
@@ -182,8 +271,8 @@ Priority: {{ issue.priority or "unknown" }}
 URL: {{ issue.url }}
 
 Canonical requirements contract:
-- Symphony's hydrated requirements snapshot is authoritative for planning, approval, implementation, and review.
-- The snapshot includes configured fields, full paginated comments, attachments and analyses, relations, components, versions, provenance, authority, classifications, incomplete reasons, and a stable content hash.
+- Symphony's root Jira Description, configured Acceptance Criteria field, and complete root comments are authoritative for planning, approval, implementation, and review.
+- The versioned planning-evidence snapshot hashes only those authoritative sources and their classifications. Attachments are disabled; relations, related issues, components, versions, generic custom fields, and metadata warnings are contextual and cannot create scope or block planning.
 - Snapshot artifacts are owner-only, bounded, atomic, no-follow and inode-checked current/history files; unsafe filesystems or substitutions fail closed.
 - Implementation must follow the exact validated PlanSpec bound to that snapshot hash. If either artifact changes or is missing, stop and return to planning.
 {% if issue.requirements_snapshot %}
@@ -202,12 +291,14 @@ Comment summary:
 - {{ comment.author }} at {{ comment.created }}: {{ comment.body }}
 {% endfor %}
 
-Repos available in this workspace:
+Development repos available in this workspace:
 - foyr2/
 - cpm/
 - pi/
 
-Make changes in whichever repo is required by the Jira issue.
+The post-development automation repo is automation/. During development, make
+changes only in whichever development repo is required by the Jira issue; Symphony
+plans and applies any relevant automation update afterward.
 
 Repository rules:
 - Implement the smallest correct change for this issue.
@@ -217,10 +308,7 @@ Repository rules:
 - Keep unrelated refactors out of scope.
 - Identify unstated edge cases, but do not invent behavior for them. Follow an established precedent or request clarification when the choice changes user-visible semantics.
 - Leave a concise final report with files changed, verification, and residual risk.
-- Attempt the configured verification command. If the stack is unavailable or the command fails, report the limitation and residual risk, then continue; the orchestrator records the hook result as advisory.
-- To run tests,
-  1. Update .env file under /home/adkuppa/compost/. Set the CPM_SRC, FOYR_SRC, PI_SRC variables to the right directory under /home/adkuppa/codex-workspaces/.
-  2. Make sure the relevant services are running. If not, "podman compose up <service_name>" will start the service. Example, podman compose up cpm.
-  3. Run "podman compose run foyr bash" or "podman compose run cpm bash" and you'll have the bash environment.
-  4. Use pytest to run the unit tests.
+- Add or update the repository tests required by the validated PlanSpec. Symphony owns required runtime verification after implementation.
+- Do not edit automation/ during development. Its separate planning pass uses the canonical requirements, approved development PlanSpec, and resulting development diff. A justified no-op is valid when no automation-code change is relevant.
+- Never edit or invoke /home/adkuppa/compost or Podman. Symphony binds this ticket's workspace paths through subprocess environment overrides without changing the shared .env file.
 - Before you handoff, make sure the changes you made are working and not causing api or ui failures.

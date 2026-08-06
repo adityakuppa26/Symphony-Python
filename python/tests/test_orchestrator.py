@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import subprocess
@@ -8,9 +9,15 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from symphony_jira.codex_runner import CodexRunResult
-from symphony_jira.dashboard import prepare_human_review_context
+from symphony_jira.config import RuntimeRepositoryConfig
+from symphony_jira.dashboard import (
+    prepare_human_review_context,
+    prepare_verification_bypass_context,
+)
 from symphony_jira.models import (
     AttachmentAnalysis,
     Issue,
@@ -22,14 +29,20 @@ from symphony_jira.models import (
 )
 from symphony_jira.plan_spec import parse_plan_spec
 from symphony_jira.requirements_artifacts import write_requirements_snapshot_artifacts
+from symphony_jira.runtime import RuntimeVerificationResult
 from symphony_jira.orchestrator import (
     PollingOrchestrator,
     SingleIssueOrchestrator,
+    apply_default_epic_strategy,
+    capture_automation_mutation_guard,
     classify_review_decision,
     finish_comment,
     parse_human_request,
+    planning_requirements_snapshot_prompt,
     retry_backoff_seconds,
+    restore_automation_mutation_guard,
     select_dispatchable_issues,
+    inspect_automation_repository,
     validate_plan_artifact,
     validate_plan_repository_baselines,
 )
@@ -114,6 +127,24 @@ class FakeJira:
         return True
 
 
+class OrderedHandoffJira(FakeJira):
+    def __init__(
+        self,
+        issue: Issue,
+        events: list[str],
+        *,
+        transition_succeeds: bool = True,
+    ) -> None:
+        super().__init__(issue)
+        self.events = events
+        self.transition_succeeds = transition_succeeds
+
+    async def transition_issue(self, key: str, target_status: str) -> bool:
+        self.events.append("transition")
+        self.transitions.append(target_status)
+        return self.transition_succeeds
+
+
 class TerminalReconciliationJira(FakeJira):
     def __init__(self, issue: Issue) -> None:
         super().__init__(issue)
@@ -130,6 +161,37 @@ class TerminalReconciliationJira(FakeJira):
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_default_codex_runner_excludes_configured_jira_credential_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_path = write_workflow(root, write_fake_codex(root))
+            workflow = load_workflow(workflow_path, environ={"TEST_JIRA_TOKEN": "token"})
+            workflow.config.tracker.auth.token_env = "CUSTOM_JIRA_SECRET"
+            workflow.config.tracker.auth.email_env = "CUSTOM_JIRA_USER"
+            workflow.config.runtime.enabled = True
+            store = Store(root / ".symphony" / "symphony.sqlite3")
+
+            with (
+                patch("symphony_jira.orchestrator.CodexRunner") as runner_class,
+                patch(
+                    "symphony_jira.orchestrator.RuntimeManager"
+                ) as runtime_class,
+            ):
+                orchestrator = SingleIssueOrchestrator(workflow, object(), store)
+
+            runner_class.assert_called_once_with(
+                excluded_environment_names={"CUSTOM_JIRA_SECRET", "CUSTOM_JIRA_USER"}
+            )
+            self.assertIs(orchestrator.codex_runner, runner_class.return_value)
+            runtime_class.assert_called_once_with(
+                workflow.config.runtime,
+                excluded_environment_names={
+                    "CUSTOM_JIRA_SECRET",
+                    "CUSTOM_JIRA_USER",
+                },
+            )
+            self.assertIs(orchestrator.runtime_manager, runtime_class.return_value)
+
     def test_single_issue_execution_uses_fake_jira_and_fake_codex(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -161,6 +223,1484 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("Codex run completed for T-1", jira.comments[1])
             self.assertEqual(len(store.list_codex_events(result.run.id)), 1)
             self.assertTrue((root / "workspaces" / "T-1").is_dir())
+
+    def test_automation_plan_and_update_run_after_development_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  review_after_run: true
+  max_review_iterations: 1
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug with regression coverage",
+                description="Please fix and cover the behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner("update_required")
+            store = Store(root / "db.sqlite3")
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    store,
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(
+                runner.phases,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                    "automation_implementation",
+                    "review",
+                ],
+            )
+            self.assertTrue(
+                (result.workspace.path / "automation" / "generated-test.java").is_file()
+            )
+            self.assertTrue(
+                (result.workspace.path / workflow.config.automation.output_plan_file).is_file()
+            )
+            self.assertTrue(
+                (result.workspace.path / workflow.config.automation.output_result_file).is_file()
+            )
+            self.assertIn("Validated automation plan", runner.review_prompt)
+            self.assertIn("Automation:", result.run.final_message or "")
+
+    def test_automation_no_update_plan_skips_automation_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Internal-only fix",
+                description="Change internal behavior already covered by automation",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner("no_update_required")
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(
+                runner.phases,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                ],
+            )
+            self.assertIn(
+                "No automation update was required",
+                result.run.final_message or "",
+            )
+
+    def test_automation_update_requires_a_nonempty_completion_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Require an automation completion report",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                empty_automation_result=True,
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "automation_implementation")
+            self.assertIn(
+                "without a non-empty completion result",
+                result.run.error or "",
+            )
+            self.assertIsNone(result.run.automation_result_hash)
+            self.assertIn(
+                "treated the attempt as incomplete",
+                (
+                    result.workspace.path
+                    / workflow.config.automation.output_result_file
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_automation_planning_clarification_resume_skips_development(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Clarify automation coverage",
+                description="Implement and automate the behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                first_automation_plan_needs_human=True,
+            )
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+            )
+
+            blocked = asyncio.run(orchestrator.run_once("T-1"))
+            assert blocked.run is not None
+            self.assertEqual(blocked.run.status, "blocked")
+            self.assertEqual(blocked.run.blocked_phase, "automation_planning")
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    force=True,
+                    attempt=2,
+                    previous_run=blocked.run,
+                    human_input={
+                        "question": blocked.run.error,
+                        "response": "Add the focused regression scenario.",
+                    },
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertEqual(runner.phases.count("development_implementation"), 1)
+            self.assertEqual(runner.phases.count("automation_planning"), 2)
+            self.assertEqual(runner.phases[-1], "automation_implementation")
+            self.assertIn(
+                "Add the focused regression scenario.",
+                runner.automation_plan_prompts[-1],
+            )
+
+    def test_automation_implementation_blocks_unplanned_file_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Reject automation scope drift",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                unplanned_automation_file=True,
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(
+                result.run.blocked_phase,
+                "automation_implementation",
+            )
+            self.assertIn("unplanned: unexpected-test.java", result.run.error or "")
+            self.assertEqual(
+                runner.phases,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                    "automation_implementation",
+                ],
+            )
+            automation_repository = Path(result.run.workspace_path) / "automation"
+            self.assertFalse(
+                (automation_repository / "generated-test.java").exists()
+            )
+            self.assertFalse(
+                (automation_repository / "unexpected-test.java").exists()
+            )
+
+            runner.unplanned_automation_file = False
+            resumed = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once(
+                    "T-1",
+                    force=True,
+                    attempt=2,
+                    previous_run=result.run,
+                    human_input={"response": "Retry the exact approved scope."},
+                )
+            )
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertFalse(
+                (automation_repository / "unexpected-test.java").exists()
+            )
+            self.assertTrue(
+                (automation_repository / "generated-test.java").is_file()
+            )
+
+    def test_automation_planning_restores_and_blocks_ignored_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Reject hidden automation planning changes",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                ignored_automation_mutation_phase="planning",
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "automation_planning")
+            self.assertIn("Git-ignored files", result.run.error or "")
+            automation_repository = result.workspace.path / "automation"
+            self.assertEqual(
+                (automation_repository / "preexisting-output.tmp").read_text(
+                    encoding="utf-8"
+                ),
+                "baseline ignored output\n",
+            )
+            self.assertFalse(
+                (automation_repository / "new-output.tmp").exists()
+            )
+
+    def test_automation_implementation_restores_and_blocks_ignored_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Reject hidden automation implementation changes",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                ignored_automation_mutation_phase="implementation",
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(
+                result.run.blocked_phase,
+                "automation_implementation",
+            )
+            self.assertIn("Git-ignored files", result.run.error or "")
+            automation_repository = result.workspace.path / "automation"
+            self.assertEqual(
+                (automation_repository / "preexisting-output.tmp").read_text(
+                    encoding="utf-8"
+                ),
+                "baseline ignored output\n",
+            )
+            self.assertFalse(
+                (automation_repository / "new-output.tmp").exists()
+            )
+            self.assertFalse(
+                (automation_repository / "generated-test.java").exists()
+            )
+
+    def test_automation_repository_rejects_local_git_hiding_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            automation_repository = workspace / "automation"
+            ensure_test_git_repository(workspace, repository="automation")
+            subprocess.run(
+                ["git", "-C", str(automation_repository), "checkout", "-q", "-B", "T-1"],
+                check=True,
+            )
+            tracked_path = automation_repository / "tracked-test.java"
+            tracked_path.write_text("final class TrackedTest {}\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(automation_repository), "add", "tracked-test.java"],
+                check=True,
+            )
+            commit_test_git_repository(automation_repository, "add tracked test")
+
+            with self.subTest("skip-worktree index flag"):
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(automation_repository),
+                        "update-index",
+                        "--skip-worktree",
+                        "tracked-test.java",
+                    ],
+                    check=True,
+                )
+                with self.assertRaisesRegex(Exception, "skip-worktree"):
+                    inspect_automation_repository(
+                        workspace,
+                        "automation",
+                        expected_branch_name="T-1",
+                        require_clean=False,
+                    )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(automation_repository),
+                        "update-index",
+                        "--no-skip-worktree",
+                        "tracked-test.java",
+                    ],
+                    check=True,
+                )
+
+            with self.subTest("local exclude metadata"):
+                (automation_repository / ".git" / "info" / "exclude").write_text(
+                    "hidden-output.tmp\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(Exception, "info/exclude"):
+                    inspect_automation_repository(
+                        workspace,
+                        "automation",
+                        expected_branch_name="T-1",
+                        require_clean=False,
+                    )
+                (automation_repository / ".git" / "info" / "exclude").write_text(
+                    "# no local excludes\n",
+                    encoding="utf-8",
+                )
+
+            with self.subTest("local config excludes file"):
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(automation_repository),
+                        "config",
+                        "--local",
+                        "core.excludesFile",
+                        str(workspace / "outside-excludes"),
+                    ],
+                    check=True,
+                )
+                with self.assertRaisesRegex(Exception, "core.excludesfile"):
+                    inspect_automation_repository(
+                        workspace,
+                        "automation",
+                        expected_branch_name="T-1",
+                        require_clean=False,
+                    )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(automation_repository),
+                        "config",
+                        "--local",
+                        "--unset",
+                        "core.excludesFile",
+                    ],
+                    check=True,
+                )
+
+            with self.subTest("file mode tracking disabled"):
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(automation_repository),
+                        "config",
+                        "--local",
+                        "core.filemode",
+                        "false",
+                    ],
+                    check=True,
+                )
+                with self.assertRaisesRegex(Exception, "core.filemode"):
+                    inspect_automation_repository(
+                        workspace,
+                        "automation",
+                        expected_branch_name="T-1",
+                        require_clean=False,
+                    )
+
+    def test_automation_mutation_guard_preserves_retained_file_newly_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            automation_repository = workspace / "automation"
+            ensure_test_git_repository(workspace, repository="automation")
+            ignore_file = automation_repository / ".gitignore"
+            ignore_file.write_text("*.baseline.tmp\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(automation_repository), "add", ".gitignore"],
+                check=True,
+            )
+            commit_test_git_repository(automation_repository, "add ignore rules")
+            retained_file = automation_repository / "retained-test.java"
+            retained_file.write_text(
+                "final class RetainedTest {}\n",
+                encoding="utf-8",
+            )
+            guard = capture_automation_mutation_guard(workspace, "automation")
+
+            ignore_file.write_text(
+                "*.baseline.tmp\nretained-test.java\nnew-output.tmp\n",
+                encoding="utf-8",
+            )
+            retained_file.write_text("unsafe replacement\n", encoding="utf-8")
+            new_ignored_file = automation_repository / "new-output.tmp"
+            new_ignored_file.write_text("new hidden output\n", encoding="utf-8")
+
+            error = restore_automation_mutation_guard(
+                workspace,
+                "automation",
+                guard,
+            )
+
+            self.assertIsNotNone(error)
+            self.assertIn("pre-existing dirty file became ignored", error or "")
+            self.assertEqual(
+                retained_file.read_text(encoding="utf-8"),
+                "final class RetainedTest {}\n",
+            )
+            self.assertFalse(new_ignored_file.exists())
+
+    def test_automation_mutation_guard_preserves_staged_addition_newly_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            automation_repository = workspace / "automation"
+            ensure_test_git_repository(workspace, repository="automation")
+            ignore_file = automation_repository / ".gitignore"
+            ignore_file.write_text("*.baseline.tmp\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(automation_repository), "add", ".gitignore"],
+                check=True,
+            )
+            commit_test_git_repository(automation_repository, "add ignore rules")
+            retained_file = automation_repository / "retained-test.java"
+            retained_file.write_text(
+                "final class RetainedTest {}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(automation_repository),
+                    "add",
+                    "retained-test.java",
+                ],
+                check=True,
+            )
+            guard = capture_automation_mutation_guard(workspace, "automation")
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(automation_repository),
+                    "reset",
+                    "-q",
+                    "HEAD",
+                    "--",
+                    "retained-test.java",
+                ],
+                check=True,
+            )
+            ignore_file.write_text(
+                "*.baseline.tmp\nretained-test.java\n",
+                encoding="utf-8",
+            )
+            retained_file.write_text("unsafe replacement\n", encoding="utf-8")
+
+            error = restore_automation_mutation_guard(
+                workspace,
+                "automation",
+                guard,
+            )
+
+            self.assertIsNotNone(error)
+            self.assertIn("pre-existing dirty file became ignored", error or "")
+            self.assertEqual(
+                retained_file.read_text(encoding="utf-8"),
+                "final class RetainedTest {}\n",
+            )
+
+    def test_automation_mutation_guard_clears_new_index_hiding_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            automation_repository = workspace / "automation"
+            ensure_test_git_repository(workspace, repository="automation")
+            tracked_file = automation_repository / "tracked-test.java"
+            tracked_file.write_text("final class TrackedTest {}\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(automation_repository), "add", "tracked-test.java"],
+                check=True,
+            )
+            commit_test_git_repository(automation_repository, "add tracked test")
+            guard = capture_automation_mutation_guard(workspace, "automation")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(automation_repository),
+                    "update-index",
+                    "--skip-worktree",
+                    "tracked-test.java",
+                ],
+                check=True,
+            )
+
+            error = restore_automation_mutation_guard(
+                workspace,
+                "automation",
+                guard,
+            )
+            index_state = subprocess.run(
+                ["git", "-C", str(automation_repository), "ls-files", "-v"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+            self.assertIsNotNone(error)
+            self.assertIn("index hiding flags changed", error or "")
+            self.assertEqual(index_state, "H tracked-test.java\n")
+
+    def test_automation_mutation_guard_refuses_a_redirected_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            automation_repository = workspace / "automation"
+            ensure_test_git_repository(workspace, repository="automation")
+            guard = capture_automation_mutation_guard(workspace, "automation")
+            original_repository = workspace / "automation-original"
+            automation_repository.rename(original_repository)
+            outside_directory = workspace / "outside"
+            outside_directory.mkdir()
+            sentinel = outside_directory / "sentinel.txt"
+            sentinel.write_text("untouched\n", encoding="utf-8")
+            automation_repository.symlink_to(
+                outside_directory,
+                target_is_directory=True,
+            )
+
+            error = restore_automation_mutation_guard(
+                workspace,
+                "automation",
+                guard,
+            )
+
+            self.assertIsNotNone(error)
+            self.assertIn("refused to follow", error or "")
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_automation_plan_rejects_a_git_ignored_target_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Reject an ignored planned automation source",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                ignore_planned_automation_path=True,
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "automation_planning")
+            self.assertIn("ignored by Git", result.run.error or "")
+            self.assertNotIn("automation_implementation", runner.phases)
+
+    def test_automation_resume_rejects_development_drift_before_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Reject development drift on automation retry",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                unplanned_automation_file=True,
+            )
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+            )
+
+            blocked = asyncio.run(orchestrator.run_once("T-1"))
+            assert blocked.run is not None
+            assert blocked.workspace is not None
+            (blocked.workspace.path / "repo" / "development.py").write_text(
+                "IMPLEMENTED = True\nUNAUTHORIZED_DRIFT = True\n",
+                encoding="utf-8",
+            )
+            planning_count = runner.phases.count("automation_planning")
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    force=True,
+                    attempt=2,
+                    previous_run=blocked.run,
+                    human_input={"response": "Retry automation."},
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "planning")
+            self.assertIn("Development workspace changed", resumed.run.error or "")
+            self.assertIn("not accepted as automation output", resumed.run.error or "")
+            self.assertIsNone(resumed.run.automation_plan_hash)
+            self.assertIsNone(resumed.run.automation_development_diff_hash)
+            self.assertIsNone(resumed.run.automation_repository_diff_hash)
+            self.assertIsNone(resumed.run.automation_result_hash)
+            self.assertEqual(
+                runner.phases.count("automation_planning"),
+                planning_count,
+            )
+
+            runner.unplanned_automation_file = False
+            (blocked.workspace.path / "repo" / "development.py").unlink()
+            recovered = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    force=True,
+                    attempt=3,
+                    previous_run=resumed.run,
+                    human_input={
+                        "response": (
+                            "Replan the development work and remove any change that "
+                            "is not justified by the Jira requirements."
+                        )
+                    },
+                )
+            )
+
+            assert recovered.run is not None
+            self.assertEqual(recovered.run.status, "completed", recovered.run.error)
+            self.assertEqual(runner.phases.count("development_plan"), 2)
+            self.assertEqual(runner.phases.count("development_implementation"), 2)
+            self.assertNotIn(
+                "UNAUTHORIZED_DRIFT",
+                (blocked.workspace.path / "repo" / "development.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_automation_development_mutation_transitions_to_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="  plan_before_implementation: true",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Recover from automation development mutation",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                change_development_during_automation=True,
+            )
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+            )
+
+            blocked = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert blocked.run is not None
+            assert blocked.workspace is not None
+            self.assertEqual(blocked.run.status, "blocked")
+            self.assertEqual(blocked.run.blocked_phase, "planning")
+            self.assertIn(
+                "Automation implementation changed a development repository",
+                blocked.run.error or "",
+            )
+            self.assertIn(
+                "not accepted as automation output",
+                blocked.run.error or "",
+            )
+            self.assertIsNone(blocked.run.automation_plan_hash)
+            self.assertIsNone(blocked.run.automation_development_diff_hash)
+            self.assertIsNone(blocked.run.automation_repository_diff_hash)
+            self.assertIsNone(blocked.run.automation_result_hash)
+            self.assertFalse(
+                (blocked.workspace.path / "automation" / "generated-test.java").exists()
+            )
+            self.assertIn(
+                "AUTOMATION_SCOPE_VIOLATION",
+                (blocked.workspace.path / "repo" / "development.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+            runner.change_development_during_automation = False
+            (blocked.workspace.path / "repo" / "development.py").unlink()
+            recovered = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    force=True,
+                    attempt=2,
+                    previous_run=blocked.run,
+                    human_input={
+                        "response": (
+                            "Replan from Jira and remove the unauthorized automation-phase "
+                            "development edit."
+                        )
+                    },
+                )
+            )
+
+            assert recovered.run is not None
+            self.assertEqual(recovered.run.status, "completed", recovered.run.error)
+            self.assertEqual(runner.phases.count("development_plan"), 2)
+            self.assertEqual(runner.phases.count("development_implementation"), 2)
+            self.assertNotIn(
+                "AUTOMATION_SCOPE_VIOLATION",
+                (blocked.workspace.path / "repo" / "development.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_review_development_change_replans_automation_before_second_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  review_after_run: true
+  max_review_iterations: 2
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Refresh automation after review",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            events: list[str] = []
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                review_decisions=["changes_required", "approve"],
+                change_development_on_regeneration=True,
+                events=events,
+            )
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+            )
+            run_hook = orchestrator.workspace_manager.run_hook
+
+            async def record_run_hook(name, *args, **kwargs):
+                if name == "verify":
+                    events.append("verify")
+                return await run_hook(name, *args, **kwargs)
+
+            with patch.object(
+                orchestrator.workspace_manager,
+                "run_hook",
+                side_effect=record_run_hook,
+            ):
+                result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(
+                runner.phases,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                    "automation_implementation",
+                    "review",
+                    "regeneration",
+                    "automation_planning",
+                    "automation_implementation",
+                    "review",
+                ],
+            )
+            self.assertEqual(
+                events,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                    "automation_implementation",
+                    "verify",
+                    "review",
+                    "regeneration",
+                    "automation_planning",
+                    "automation_implementation",
+                    "verify",
+                    "review",
+                ],
+            )
+            self.assertEqual(len(runner.automation_plan_diff_hashes), 2)
+            self.assertNotEqual(
+                runner.automation_plan_diff_hashes[0],
+                runner.automation_plan_diff_hashes[1],
+            )
+            retained_plan = json.loads(
+                (
+                    result.workspace.path
+                    / workflow.config.automation.output_plan_file
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                retained_plan["development_workspace_diff_hash"],
+                runner.automation_plan_diff_hashes[-1],
+            )
+            self.assertIsNotNone(result.run.automation_plan_hash)
+            self.assertEqual(result.run.verification_status, "passed")
+
+    def test_review_replan_can_reconcile_retained_update_to_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  review_after_run: true
+  max_review_iterations: 2
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Remove obsolete derived automation",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                automation_decisions=["update_required", "no_update_required"],
+                review_decisions=["changes_required", "approve"],
+                change_development_on_regeneration=True,
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(
+                runner.phases,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                    "automation_implementation",
+                    "review",
+                    "regeneration",
+                    "automation_planning",
+                    "review",
+                ],
+            )
+            self.assertFalse(
+                (result.workspace.path / "automation" / "generated-test.java").exists()
+            )
+            self.assertFalse(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(result.workspace.path / "automation"),
+                        "status",
+                        "--porcelain=v1",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            self.assertIn(
+                "baseline checkout, without those changes",
+                " ".join(runner.automation_plan_prompts[-1].split()),
+            )
+            self.assertIn(
+                "No automation update was required",
+                result.run.final_message or "",
+            )
+
+    def test_development_replanning_invalidates_derived_automation_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  review_after_run: true
+  max_review_iterations: 1
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Return safely to development planning",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                review_decisions=["plan_changes_required"],
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            assert result.workspace is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "planning")
+            self.assertIsNone(result.run.automation_plan_hash)
+            self.assertIsNone(result.run.automation_repository_diff_hash)
+            self.assertFalse(
+                (result.workspace.path / "automation" / "generated-test.java").exists()
+            )
+            self.assertFalse(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(result.workspace.path / "automation"),
+                        "status",
+                        "--porcelain=v1",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+            )
+
+    def test_automation_enabled_development_planning_question_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(root, write_fake_codex(root)),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Clarify development scope",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = PlanningQuestionThenPlanCodexRunner()
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "planning")
+            self.assertIn("Where should the column go?", result.run.error or "")
+            self.assertEqual(runner.prompts_seen, ["plan_question"])
+
+    def test_post_automation_environment_resume_reuses_bound_automation_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_runtime_workflow(
+                    root,
+                    write_fake_codex(root),
+                    required=True,
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Resume verification after automation",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner("update_required")
+            runtime_manager = FakeRuntimeManager("environment_blocked")
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+                runtime_manager=runtime_manager,
+            )
+
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            assert first.workspace is not None
+            self.assertEqual(first.run.status, "blocked")
+            self.assertEqual(
+                first.run.blocked_phase,
+                "verification_environment",
+            )
+            self.assertIsNotNone(first.run.automation_plan_hash)
+            first_automation_hash = first.run.automation_plan_hash
+            self.assertTrue(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(first.workspace.path / "automation"),
+                        "status",
+                        "--porcelain=v1",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+            )
+
+            runtime_manager.status = "passed"
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    previous_run=first.run,
+                    human_input={
+                        "response": "The operator fixed the local runtime environment."
+                    },
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertEqual(
+                resumed.run.automation_plan_hash,
+                first_automation_hash,
+            )
+            self.assertEqual(len(runtime_manager.calls), 2)
+            self.assertEqual(
+                runner.phases,
+                [
+                    "development_plan",
+                    "development_implementation",
+                    "automation_planning",
+                    "automation_implementation",
+                ],
+            )
+            self.assertEqual(len(runner.automation_plan_prompts), 1)
+
+    def test_post_automation_resume_requires_automation_to_remain_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_runtime_workflow(
+                    root,
+                    write_fake_codex(root),
+                    required=True,
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Keep the automation continuation bound",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner("update_required")
+            runtime_manager = FakeRuntimeManager("environment_blocked")
+            store = Store(root / "db.sqlite3")
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                store,
+                codex_runner=runner,
+                runtime_manager=runtime_manager,
+            )
+
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            expected_bindings = (
+                first.run.automation_plan_hash,
+                first.run.automation_development_diff_hash,
+                first.run.automation_repository_diff_hash,
+                first.run.automation_result_hash,
+            )
+            phase_count = len(runner.phases)
+            workflow.config.automation.enabled = False
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    force=True,
+                    attempt=2,
+                    previous_run=first.run,
+                    human_input={"response": "The runtime environment is ready."},
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "automation_planning")
+            self.assertIn("Re-enable", resumed.run.error or "")
+            self.assertEqual(
+                (
+                    resumed.run.automation_plan_hash,
+                    resumed.run.automation_development_diff_hash,
+                    resumed.run.automation_repository_diff_hash,
+                    resumed.run.automation_result_hash,
+                ),
+                expected_bindings,
+            )
+            self.assertEqual(len(runner.phases), phase_count)
+
+    def test_post_automation_resume_rejects_a_missing_noop_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_runtime_workflow(
+                    root,
+                    write_fake_codex(root),
+                    required=True,
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Retain no-op result across verification",
+                description="Implement behavior already covered by automation",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner("no_update_required")
+            runtime_manager = FakeRuntimeManager("environment_blocked")
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+                runtime_manager=runtime_manager,
+            )
+
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            assert first.workspace is not None
+            self.assertEqual(first.run.blocked_phase, "verification_environment")
+            self.assertIsNotNone(first.run.automation_result_hash)
+            (
+                first.workspace.path
+                / workflow.config.automation.output_result_file
+            ).unlink()
+            runtime_manager.status = "passed"
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    force=True,
+                    attempt=2,
+                    previous_run=first.run,
+                    human_input={"response": "The runtime environment is ready."},
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "automation_planning")
+            self.assertIn("result artifact is missing", resumed.run.error or "")
+
+    def test_post_automation_review_resume_skips_writable_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  review_after_run: true
+  max_review_iterations: 2
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            workflow.config.automation.enabled = True
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Resume the retained review",
+                description="Implement and automate the focused behavior",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AutomationWorkflowCodexRunner(
+                "update_required",
+                review_decisions=["needs_human", "approve"],
+            )
+            orchestrator = SingleIssueOrchestrator(
+                workflow,
+                FakeJira(issue),
+                Store(root / "db.sqlite3"),
+                codex_runner=runner,
+            )
+
+            blocked = asyncio.run(orchestrator.run_once("T-1"))
+            assert blocked.run is not None
+            self.assertEqual(blocked.run.status, "blocked")
+            self.assertEqual(blocked.run.blocked_phase, "review")
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    previous_run=blocked.run,
+                    human_input={
+                        "response": "The retained evidence answers the review question."
+                    },
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertEqual(runner.phases.count("development_implementation"), 1)
+            self.assertEqual(runner.phases.count("automation_planning"), 1)
+            self.assertEqual(runner.phases.count("automation_implementation"), 1)
+            self.assertEqual(runner.phases.count("review"), 2)
 
     def test_failed_verify_hook_is_advisory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +1767,884 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(jira.transitions, ["Done"])
 
+    def test_required_verify_hook_blocks_before_runtime_or_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_path = write_workflow(root, write_fake_codex(root))
+            workflow_path.write_text(
+                workflow_path.read_text(encoding="utf-8")
+                .replace("  verify: |\n", "  verify_required: true\n  verify: |\n")
+                .replace("    echo verify ok", "    exit 7"),
+                encoding="utf-8",
+            )
+            workflow = load_workflow(
+                workflow_path,
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / "db.sqlite3"),
+                    codex_runner=MessageCodexRunner(["Implementation complete."]),
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "verification")
+            self.assertEqual(result.run.verification_status, "failed")
+            self.assertIn("Required verification hook failed", result.run.error or "")
+
+    def test_required_runtime_verification_passes_exact_plan_repositories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, runtime_manager, _ = run_runtime_case(
+                root,
+                runtime_status="passed",
+                required=True,
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed")
+            self.assertEqual(result.run.verification_status, "passed")
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(runtime_manager.calls[0]["repositories"], ("repo",))
+            self.assertEqual(
+                runtime_manager.calls[0]["source_repositories"],
+                ("repo",),
+            )
+            manifest_path = Path(result.run.verification_output_path or "")
+            self.assertIn(result.run.id, manifest_path.name)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["affected_repositories"], ["repo"])
+            self.assertEqual(manifest["runtime"]["status"], "passed")
+            self.assertEqual(manifest["hook"]["status"], "passed")
+            hook_log_path = Path(manifest["hook"]["output_path"])
+            self.assertEqual(
+                manifest["hook"]["output_sha256"],
+                hashlib.sha256(hook_log_path.read_bytes()).hexdigest(),
+            )
+            runtime_check = manifest["runtime"]["checks"][0]
+            runtime_log_path = Path(runtime_check["log_path"])
+            self.assertEqual(
+                runtime_check["log_sha256"],
+                hashlib.sha256(runtime_log_path.read_bytes()).hexdigest(),
+            )
+
+    def test_runtime_translates_plan_repository_path_to_config_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, runtime_manager, _ = run_runtime_case(
+                root,
+                runtime_status="passed",
+                required=True,
+                shutdown_after_handoff=True,
+                repository_key="backend",
+                workspace_subdir="services/api",
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(
+                runtime_manager.calls[0]["repositories"],
+                ("backend",),
+            )
+            self.assertEqual(
+                runtime_manager.calls[0]["source_repositories"],
+                ("backend",),
+            )
+            self.assertEqual(
+                runtime_manager.shutdown_calls[0]["repositories"],
+                ("backend",),
+            )
+            manifest = json.loads(
+                Path(result.run.verification_output_path or "").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["affected_repositories"],
+                ["services/api"],
+            )
+            self.assertEqual(
+                manifest["runtime"]["checks"][0]["repository"],
+                "backend",
+            )
+            self.assertEqual(
+                manifest["runtime"]["checks"][0]["workspace_subdir"],
+                "services/api",
+            )
+
+    def test_required_runtime_test_failure_blocks_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, _, jira = run_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "verification")
+            self.assertEqual(result.run.verification_status, "test_failed")
+            self.assertIn("repo (test_failed)", result.run.error or "")
+            self.assertEqual(
+                len(result.run.verification_workspace_diff_hash or ""),
+                64,
+            )
+            evidence_path = Path(result.run.verification_output_path or "")
+            self.assertEqual(
+                result.run.verification_evidence_sha256,
+                hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(jira.transitions, [])
+
+    def test_required_runtime_environment_block_blocks_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, _, _ = run_runtime_case(
+                root,
+                runtime_status="environment_blocked",
+                required=True,
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(
+                result.run.blocked_phase,
+                "verification_environment",
+            )
+            self.assertEqual(
+                result.run.verification_status,
+                "environment_blocked",
+            )
+
+    def test_environment_resume_preserves_plan_and_reruns_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, _ = create_runtime_case(
+                root,
+                runtime_status="environment_blocked",
+                required=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            self.assertEqual(
+                first.run.blocked_phase,
+                "verification_environment",
+            )
+            first_plan_hash = first.run.plan_spec_hash
+            first_manifest_path = first.run.verification_output_path
+
+            runtime_manager.status = "passed"
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input={
+                        "response": "The operator fixed the local runtime environment."
+                    },
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed")
+            self.assertEqual(resumed.run.plan_spec_hash, first_plan_hash)
+            self.assertEqual(len(runtime_manager.calls), 2)
+            self.assertNotEqual(
+                resumed.run.verification_output_path,
+                first_manifest_path,
+            )
+            self.assertTrue(Path(first_manifest_path or "").is_file())
+            self.assertEqual(
+                runner.prompts_seen,
+                ["plan", "implementation"],
+            )
+            logs = orchestrator.store.list_logs(run_id=resumed.run.id)
+            self.assertTrue(
+                any(
+                    "Skipped Codex implementation for an environment-only resume"
+                    in log["message"]
+                    for log in logs
+                )
+            )
+
+    def test_human_verification_bypass_hands_off_without_rerunning_codex_or_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+                shutdown_after_handoff=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            self.assertEqual(first.run.status, "blocked")
+            self.assertEqual(first.run.blocked_phase, "verification")
+            first_manifest_path = first.run.verification_output_path
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=verification_bypass_input(
+                        orchestrator,
+                        first.run,
+                    ),
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertIsNone(resumed.run.blocked_phase)
+            self.assertEqual(resumed.run.verification_status, "test_failed")
+            self.assertEqual(
+                resumed.run.verification_output_path,
+                first_manifest_path,
+            )
+            self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, ["Done"])
+            self.assertEqual(len(runtime_manager.shutdown_calls), 1)
+            self.assertEqual(
+                runtime_manager.shutdown_calls[0]["repositories"],
+                ("repo",),
+            )
+            self.assertIn(
+                "Verification override:",
+                resumed.run.final_message or "",
+            )
+            self.assertIn(
+                "operator@example.test",
+                resumed.run.final_message or "",
+            )
+            logs = orchestrator.store.list_logs(run_id=resumed.run.id)
+            self.assertTrue(
+                any(
+                    log["level"] == "warning"
+                    and "explicitly overridden by operator@example.test"
+                    in log["message"]
+                    and log["path"] == first_manifest_path
+                    for log in logs
+                )
+            )
+
+    def test_generic_human_response_with_old_bypass_prefix_does_not_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            runtime_manager.status = "passed"
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input={
+                        "action": "response",
+                        "run_id": first.run.id,
+                        "response": (
+                            "Verification bypass approved for handoff by: "
+                            "operator@example.test"
+                        ),
+                    },
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertEqual(resumed.run.verification_status, "passed")
+            self.assertEqual(
+                runner.prompts_seen,
+                ["plan", "implementation", "implementation"],
+            )
+            self.assertEqual(len(runtime_manager.calls), 2)
+            self.assertEqual(jira.transitions, ["Done"])
+            self.assertNotIn(
+                "Verification override:",
+                resumed.run.final_message or "",
+            )
+
+    def test_verification_bypass_blocks_when_workspace_diff_drifts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            self.assertIsNotNone(
+                first.run.verification_workspace_diff_hash,
+                first.run.error,
+            )
+            bypass_input = verification_bypass_input(orchestrator, first.run)
+            repository_path = Path(first.run.workspace_path) / "repo"
+            (repository_path / "unverified-drift.txt").write_text(
+                "changed after approval\n",
+                encoding="utf-8",
+            )
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=bypass_input,
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "verification")
+            self.assertIn(
+                "workspace diff changed after approval",
+                resumed.run.error or "",
+            )
+            self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, [])
+
+    def test_verification_bypass_binding_includes_managed_sibling_repository(self) -> None:
+        class SiblingRepositoryRunner(PlanThenImplementCodexRunner):
+            async def run(self, prompt, workspace_path, config, **kwargs):
+                if not self.prompts_seen:
+                    sibling = Path(workspace_path) / "sibling"
+                    sibling.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(
+                        ["git", "init", "-q", str(sibling)],
+                        check=True,
+                    )
+                    commit_test_git_repository(sibling, "sibling baseline")
+                return await super().run(
+                    prompt,
+                    workspace_path,
+                    config,
+                    **kwargs,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            runner = SiblingRepositoryRunner()
+            orchestrator.codex_runner = runner
+            orchestrator.config.runtime.repositories["sibling"] = (
+                RuntimeRepositoryConfig(
+                    workspace_subdir=Path("sibling"),
+                    source_env="SIBLING_SRC",
+                    service="sibling",
+                    mount_target="/sibling",
+                    verification_profile="tests",
+                )
+            )
+            sibling_path = root / "workspaces" / "T-1" / "sibling"
+
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            self.assertIsNotNone(
+                first.run.verification_workspace_diff_hash,
+                first.run.error,
+            )
+            bypass_input = verification_bypass_input(orchestrator, first.run)
+            (sibling_path / "unverified-drift.txt").write_text(
+                "changed outside the planned repository\n",
+                encoding="utf-8",
+            )
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=bypass_input,
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "verification")
+            self.assertIn(
+                "workspace diff changed after approval",
+                resumed.run.error or "",
+            )
+            self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, [])
+
+    def test_verification_bypass_blocks_when_evidence_drifts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            bypass_input = verification_bypass_input(orchestrator, first.run)
+            evidence_path = Path(first.run.verification_output_path or "")
+            evidence_path.write_text(
+                evidence_path.read_text(encoding="utf-8") + "\nchanged\n",
+                encoding="utf-8",
+            )
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=bypass_input,
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "verification")
+            self.assertIn(
+                "evidence changed after approval",
+                resumed.run.error or "",
+            )
+            self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, [])
+
+    def test_verification_bypass_blocks_when_runtime_log_drifts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            bypass_input = verification_bypass_input(orchestrator, first.run)
+            evidence_path = Path(first.run.verification_output_path or "")
+            manifest = json.loads(evidence_path.read_text(encoding="utf-8"))
+            runtime_log_path = Path(
+                manifest["runtime"]["checks"][0]["log_path"]
+            )
+            runtime_log_path.write_bytes(
+                runtime_log_path.read_bytes() + b"changed after approval\n"
+            )
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=bypass_input,
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "verification")
+            self.assertIn(
+                "runtime verification log changed after its manifest was written",
+                resumed.run.error or "",
+            )
+            self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, [])
+
+    def test_verification_bypass_still_runs_configured_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            runner = VerificationBypassReviewRunner(["approve"])
+            orchestrator.codex_runner = runner
+            orchestrator.config.codex.review_after_run = True
+            orchestrator.config.codex.max_review_iterations = 2
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=verification_bypass_input(
+                        orchestrator,
+                        first.run,
+                    ),
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertEqual(
+                runner.prompts_seen,
+                ["plan", "implementation", "review"],
+            )
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, ["Done"])
+            self.assertIn("Review:", resumed.run.final_message or "")
+            self.assertIn("Verification override:", resumed.run.final_message or "")
+
+    def test_verification_bypass_blocks_when_review_changes_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            runner = VerificationBypassReviewRunner(
+                ["approve"],
+                mutate_review=True,
+            )
+            orchestrator.codex_runner = runner
+            orchestrator.config.codex.review_after_run = True
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=verification_bypass_input(
+                        orchestrator,
+                        first.run,
+                    ),
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "verification")
+            self.assertIn(
+                "completion after review",
+                resumed.run.error or "",
+            )
+            self.assertEqual(
+                runner.prompts_seen,
+                ["plan", "implementation", "review"],
+            )
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, [])
+
+    def test_verification_bypass_blocks_when_after_run_changes_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, runner, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            bypass_input = verification_bypass_input(orchestrator, first.run)
+            orchestrator.config.hooks.after_run = (
+                "printf 'after-run\\n' >> repo/after-run-drift.txt"
+            )
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=bypass_input,
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "blocked")
+            self.assertEqual(resumed.run.blocked_phase, "verification")
+            self.assertIn(
+                "after after_run before Jira handoff",
+                resumed.run.error or "",
+            )
+            self.assertEqual(runner.prompts_seen, ["plan", "implementation"])
+            self.assertEqual(len(runtime_manager.calls), 1)
+            self.assertEqual(jira.transitions, [])
+
+    def test_review_changes_consume_bypass_and_require_normal_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+            )
+            runner = VerificationBypassReviewRunner(
+                ["changes_required", "approve"]
+            )
+            orchestrator.codex_runner = runner
+            orchestrator.config.codex.review_after_run = True
+            orchestrator.config.codex.max_review_iterations = 2
+            first = asyncio.run(orchestrator.run_once("T-1"))
+            assert first.run is not None
+            bypass_input = verification_bypass_input(orchestrator, first.run)
+            runtime_manager.status = "passed"
+
+            resumed = asyncio.run(
+                orchestrator.run_once(
+                    "T-1",
+                    attempt=2,
+                    human_input=bypass_input,
+                    previous_run=first.run,
+                )
+            )
+
+            assert resumed.run is not None
+            self.assertEqual(resumed.run.status, "completed", resumed.run.error)
+            self.assertEqual(resumed.run.verification_status, "passed")
+            self.assertEqual(
+                runner.prompts_seen,
+                [
+                    "plan",
+                    "implementation",
+                    "review",
+                    "regeneration",
+                    "review",
+                ],
+            )
+            self.assertEqual(len(runtime_manager.calls), 2)
+            self.assertEqual(jira.transitions, ["Done"])
+            self.assertIn(
+                "override was consumed when review required code changes",
+                resumed.run.final_message or "",
+            )
+
+    def test_advisory_runtime_failure_is_persisted_but_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, _, _ = run_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=False,
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed")
+            self.assertEqual(result.run.verification_status, "test_failed")
+            self.assertIsNone(result.run.error)
+            logs = Store(root / "db.sqlite3").list_logs(run_id=result.run.id)
+            self.assertTrue(
+                any("runtime verification is advisory" in log["message"] for log in logs)
+            )
+
+    def test_runtime_shutdown_runs_after_persisted_successful_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, original_jira = create_runtime_case(
+                root,
+                runtime_status="passed",
+                required=True,
+                shutdown_after_handoff=True,
+            )
+            events: list[str] = []
+            jira = OrderedHandoffJira(original_jira.issue, events)
+            orchestrator.jira = jira
+            runtime_manager.events = events
+            runtime_manager.on_shutdown = lambda: (
+                orchestrator.store.latest_run_for_issue("T-1").status
+            )
+
+            result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed")
+            self.assertEqual(events, ["verify", "transition", "shutdown"])
+            self.assertEqual(runtime_manager.persisted_status_at_shutdown, "completed")
+            self.assertEqual(len(runtime_manager.shutdown_calls), 1)
+            self.assertEqual(
+                runtime_manager.shutdown_calls[0]["repositories"],
+                ("repo",),
+            )
+            self.assertEqual(
+                runtime_manager.shutdown_calls[0]["source_repositories"],
+                ("repo",),
+            )
+            self.assertEqual(jira.transitions, ["Done"])
+
+    def test_runtime_shutdown_runs_when_no_jira_transition_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="passed",
+                required=True,
+                shutdown_after_handoff=True,
+            )
+            orchestrator.config.tracker.handoff_status = None
+
+            result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed")
+            self.assertEqual(jira.transitions, [])
+            self.assertEqual(len(runtime_manager.shutdown_calls), 1)
+
+    def test_completed_review_shuts_down_without_a_second_jira_transition(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workflow = load_completed_review_workflow(root)
+                runtime_workflow = load_workflow(
+                    write_runtime_workflow(
+                        root,
+                        write_fake_codex(root),
+                        required=True,
+                        shutdown_after_handoff=True,
+                    ),
+                    environ={"TEST_JIRA_TOKEN": "token"},
+                )
+                workflow.config.runtime = runtime_workflow.config.runtime
+                workflow.config.tracker.handoff_status = "Done"
+                issue = completed_review_issue()
+                jira = FakeJira(issue)
+                store = Store(root / "db.sqlite3")
+                action, _, result_run, _ = create_completed_review_action(
+                    root,
+                    workflow,
+                    issue,
+                    store,
+                )
+                runtime_manager = FakeRuntimeManager("passed")
+                polling = PollingOrchestrator(
+                    workflow,
+                    jira,
+                    store,
+                    codex_runner=CompletedReviewCodexRunner("code_changes"),
+                    runtime_manager=runtime_manager,
+                )
+
+                await polling.poll_once()
+                await asyncio.gather(
+                    *(running.task for running in polling.running.values())
+                )
+                await polling.reap_finished()
+
+                completed = store.get_run(result_run.id)
+                assert completed is not None
+                self.assertEqual(completed.status, "completed")
+                self.assertEqual(jira.transitions, [])
+                self.assertEqual(len(runtime_manager.shutdown_calls), 1)
+                self.assertEqual(
+                    runtime_manager.shutdown_calls[0]["repositories"],
+                    ("repo",),
+                )
+                linked_action = store.human_review_action_for_result_run(
+                    completed.id
+                )
+                assert linked_action is not None
+                self.assertEqual(linked_action["id"], action["id"])
+                self.assertEqual(linked_action["status"], "completed")
+
+        asyncio.run(run())
+
+    def test_runtime_shutdown_failure_warns_without_changing_completed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="passed",
+                required=True,
+                shutdown_after_handoff=True,
+                shutdown_status="environment_blocked",
+            )
+
+            result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed")
+            self.assertIsNone(result.run.error)
+            self.assertEqual(jira.transitions, ["Done"])
+            self.assertEqual(len(runtime_manager.shutdown_calls), 1)
+            logs = orchestrator.store.list_logs(run_id=result.run.id)
+            warnings = [
+                log
+                for log in logs
+                if log["level"] == "warning"
+                and "Runtime shutdown was blocked" in log["message"]
+            ]
+            self.assertEqual(len(warnings), 1)
+            self.assertTrue(warnings[0]["path"].endswith("fake-shutdown.log"))
+
+    def test_runtime_shutdown_does_not_run_for_blocked_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, jira = create_runtime_case(
+                root,
+                runtime_status="test_failed",
+                required=True,
+                shutdown_after_handoff=True,
+            )
+
+            result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "verification")
+            self.assertEqual(runtime_manager.shutdown_calls, [])
+            self.assertEqual(jira.transitions, [])
+
+    def test_runtime_services_are_retained_when_jira_handoff_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orchestrator, runtime_manager, _, original_jira = create_runtime_case(
+                root,
+                runtime_status="passed",
+                required=True,
+                shutdown_after_handoff=True,
+            )
+            events: list[str] = []
+            jira = OrderedHandoffJira(
+                original_jira.issue,
+                events,
+                transition_succeeds=False,
+            )
+            orchestrator.jira = jira
+            runtime_manager.events = events
+
+            result = asyncio.run(orchestrator.run_once("T-1"))
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed")
+            self.assertEqual(events, ["verify", "transition"])
+            self.assertEqual(runtime_manager.shutdown_calls, [])
+            logs = orchestrator.store.list_logs(run_id=result.run.id)
+            self.assertTrue(
+                any(
+                    log["level"] == "warning"
+                    and "services were retained" in log["message"]
+                    for log in logs
+                )
+            )
+
     def test_dry_run_renders_prompt_without_workspace_or_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -282,6 +2700,12 @@ class OrchestratorTests(unittest.TestCase):
             "changes_required",
         )
         self.assertEqual(classify_review_decision('{"decision":"plan_changes_required"}'), "plan_changes_required")
+        self.assertEqual(
+            classify_review_decision(
+                '{"decision":"automation_plan_changes_required"}'
+            ),
+            "automation_plan_changes_required",
+        )
         self.assertEqual(classify_review_decision(None), "invalid")
         self.assertEqual(classify_review_decision("APPROVE: no findings"), "approve")
         self.assertEqual(classify_review_decision("Approved plan must change"), "invalid")
@@ -1072,6 +3496,236 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertIn("Codex planning/spec pass:", runner.implementation_prompt)
             self.assertIn('"schema_version": "1.0"', runner.implementation_prompt)
+            self.assertIn("Reserve needs_human for a genuine conflict", runner.plan_prompt)
+            self.assertIn(
+                "Do not manufacture requirements or acceptance criteria",
+                runner.plan_prompt,
+            )
+            self.assertIn(
+                "Attachments, attachment metadata/analysis, generic custom fields",
+                runner.plan_prompt,
+            )
+
+    def test_invalid_model_plan_is_automatically_repaired_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  planning_prompt: |
+    Write a plan only.
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            store = Store(root / ".symphony" / "symphony.sqlite3")
+            runner = StructuralPlanRepairCodexRunner()
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    store,
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "completed", result.run.error)
+            self.assertEqual(
+                runner.prompts_seen,
+                ["plan", "plan_repair", "implementation"],
+            )
+            self.assertIn("invalid PlanSpec", runner.repair_prompt)
+            self.assertIn(
+                "Product authority is limited to the root Description",
+                runner.repair_prompt,
+            )
+            self.assertIn(
+                "Attachments, attachment metadata/analysis, generic custom",
+                runner.repair_prompt,
+            )
+            self.assertIn(
+                "Reserve\nneeds_human for a genuine Jira conflict",
+                runner.repair_prompt,
+            )
+            logs = store.list_logs(run_id=result.run.id)
+            self.assertTrue(
+                any("automatic repair attempt 1/2" in log["message"] for log in logs)
+            )
+
+    def test_plan_repair_is_bounded_when_model_keeps_returning_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(
+                write_workflow(
+                    root,
+                    write_fake_codex(root),
+                    codex_extra="""
+  plan_before_implementation: true
+  planning_prompt: |
+    Write a plan only.
+""",
+                ),
+                environ={"TEST_JIRA_TOKEN": "token"},
+            )
+            issue = Issue(
+                id="10001",
+                identifier="T-1",
+                title="Fix bug",
+                description="Please fix",
+                status="To Do",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+            runner = AlwaysInvalidPlanCodexRunner()
+
+            result = asyncio.run(
+                SingleIssueOrchestrator(
+                    workflow,
+                    FakeJira(issue),
+                    Store(root / ".symphony" / "symphony.sqlite3"),
+                    codex_runner=runner,
+                ).run_once("T-1")
+            )
+
+            assert result.run is not None
+            self.assertEqual(result.run.status, "blocked")
+            self.assertEqual(result.run.blocked_phase, "planning")
+            self.assertEqual(runner.calls, 3)
+            self.assertIn(
+                "Automatic PlanSpec repair remained invalid after 2 attempt(s)",
+                result.run.error or "",
+            )
+
+    def test_planning_evidence_excludes_attachments_and_generic_jira_context(self) -> None:
+        def source(source_type: str, source_id: str) -> RequirementSource:
+            return RequirementSource(
+                issue_identifier="T-1",
+                source_type=source_type,
+                source_id=source_id,
+                author="product-owner",
+                authority="product",
+            )
+
+        description_source = source("description", "description")
+        acceptance_source = source("custom_field", "field:customfield_15812")
+        generic_source = source("custom_field", "field:customfield_99999")
+        comment_source = source("comment", "comment:100")
+        attachment_source = source("attachment", "attachment:200")
+        description = RequirementArtifact(
+            artifact_id="description",
+            source_type="description",
+            text="DESCRIPTION-EVIDENCE",
+            source=description_source,
+        )
+        acceptance = RequirementArtifact(
+            artifact_id="field:customfield_15812",
+            source_type="custom_field",
+            text="ACCEPTANCE-EVIDENCE",
+            source=acceptance_source,
+            kind="acceptance_criterion",
+            planning_eligible=True,
+        )
+        generic = RequirementArtifact(
+            artifact_id="field:customfield_99999",
+            source_type="custom_field",
+            text="GENERIC-CUSTOM-FIELD-CONTEXT",
+            source=generic_source,
+            planning_eligible=False,
+        )
+        comment = RequirementArtifact(
+            artifact_id="comment:100",
+            source_type="comment",
+            text="ROOT-COMMENT-EVIDENCE",
+            source=comment_source,
+        )
+        attachment = IssueAttachment(
+            id="200",
+            filename="scope.png",
+            source=attachment_source,
+            analysis=AttachmentAnalysis(
+                status="complete",
+                modality="vision",
+                summary="ATTACHMENT-MUST-NOT-BECOME-SCOPE",
+            ),
+        )
+        snapshot = RequirementsSnapshot(
+            issue_id="10001",
+            issue_identifier="T-1",
+            issue_url="https://jira.example.test/browse/T-1",
+            description=description,
+            custom_fields=[acceptance, generic],
+            comments=[comment],
+            attachments=[attachment],
+            current_requirements=[
+                RequirementDecision(
+                    id="T-1-REQ-01",
+                    text=description.text,
+                    kind="requirement",
+                    classification="current",
+                    sources=[description_source],
+                ),
+                RequirementDecision(
+                    id="T-1-AC-01",
+                    text=acceptance.text,
+                    kind="acceptance_criterion",
+                    classification="current",
+                    sources=[acceptance_source],
+                ),
+                RequirementDecision(
+                    id="T-1-REQ-02",
+                    text=comment.text,
+                    kind="requirement",
+                    classification="current",
+                    sources=[comment_source],
+                ),
+                RequirementDecision(
+                    id="T-1-REQ-X1",
+                    text=generic.text,
+                    kind="requirement",
+                    classification="current",
+                    sources=[generic_source],
+                ),
+                RequirementDecision(
+                    id="T-1-REQ-X2",
+                    text=attachment.analysis.summary,
+                    kind="requirement",
+                    classification="current",
+                    sources=[attachment_source],
+                ),
+            ],
+        )
+        issue = Issue(
+            id="10001",
+            identifier="T-1",
+            title="Planning evidence boundary",
+            description=description.text,
+            status="To Do",
+            url="https://jira.example.test/browse/T-1",
+            requirements_snapshot=snapshot,
+        )
+
+        evidence = planning_requirements_snapshot_prompt(issue)
+
+        self.assertIn("DESCRIPTION-EVIDENCE", evidence)
+        self.assertIn("ACCEPTANCE-EVIDENCE", evidence)
+        self.assertIn("ROOT-COMMENT-EVIDENCE", evidence)
+        self.assertNotIn("GENERIC-CUSTOM-FIELD-CONTEXT", evidence)
+        self.assertNotIn("ATTACHMENT-MUST-NOT-BECOME-SCOPE", evidence)
+        self.assertNotIn("scope.png", evidence)
 
     def test_blocked_planning_pass_records_blocked_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1363,9 +4017,53 @@ class OrchestratorTests(unittest.TestCase):
 
             assert result.run is not None
             self.assertEqual(result.run.status, "blocked")
-            self.assertEqual(result.run.blocked_phase, "planning")
-            self.assertIn("Epic PlanSpec", result.run.error or "")
+            self.assertEqual(result.run.blocked_phase, "planning_approval")
+            self.assertIn("ready", result.run.error or "")
             self.assertEqual(runner.prompts_seen, ["plan"])
+            plan = parse_plan_spec(
+                (Path(result.run.workspace_path) / workflow.config.codex.output_plan_file).read_text(
+                    encoding="utf-8"
+                ),
+                issue_type="Epic",
+            )
+            assert plan.epic_strategy is not None
+            self.assertEqual(plan.epic_strategy.mode, "single_change")
+            self.assertTrue(
+                plan.epic_strategy.requires_explicit_single_change_approval
+            )
+
+    def test_epic_with_contextual_child_issue_still_defaults_to_safe_single_change(self) -> None:
+        plan = parse_plan_spec(
+            valid_plan_spec_message(
+                'requirements_snapshot_hash is "' + ("a" * 64) + '"',
+                "One change",
+            )
+        )
+        issue = hydrated_test_issue(
+            Issue(
+                id="10001",
+                identifier="T-1",
+                title="Parent Epic",
+                description="Implement it",
+                status="To Do",
+                issue_type="Epic",
+                labels=["codex-ready"],
+                url="https://jira.example.test/browse/T-1",
+            )
+        )
+        assert issue.requirements_snapshot is not None
+        child = SimpleNamespace(identifier="T-2")
+        snapshot = issue.requirements_snapshot.model_copy(update={"children": [child]})
+        issue = issue.model_copy(update={"requirements_snapshot": snapshot})
+
+        normalized = apply_default_epic_strategy(plan, issue)
+
+        self.assertIsNotNone(normalized.epic_strategy)
+        assert normalized.epic_strategy is not None
+        self.assertEqual(normalized.epic_strategy.mode, "single_change")
+        self.assertTrue(
+            normalized.epic_strategy.requires_explicit_single_change_approval
+        )
 
     def test_plan_approval_feedback_refines_plan_and_waits_for_approval_again(self) -> None:
         async def run() -> None:
@@ -1527,7 +4225,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("Canonical Jira requirements snapshot is missing", second.run.error or "")
             self.assertEqual(runner.prompts, [])
 
-    def test_incomplete_attachment_analysis_blocks_before_codex_and_cannot_be_approved(self) -> None:
+    def test_incomplete_attachment_analysis_never_blocks_planning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workflow = load_workflow(
@@ -1546,65 +4244,10 @@ class OrchestratorTests(unittest.TestCase):
                 SingleIssueOrchestrator(workflow, jira, store, codex_runner=runner).run_once("T-1")
             )
             assert first.run is not None
-            self.assertEqual(first.run.status, "blocked")
-            self.assertEqual(first.run.blocked_phase, "planning")
-            self.assertIn("Required attachment analysis is incomplete", first.run.error or "")
-            self.assertIn("role-matrix.png (not_configured)", first.run.error or "")
-            self.assertIn("Human approval cannot waive", first.run.error or "")
-            self.assertIsNone(first.workspace)
-            self.assertEqual(runner.prompts, [])
-
-            second = asyncio.run(
-                SingleIssueOrchestrator(workflow, jira, store, codex_runner=runner).run_once(
-                    "T-1",
-                    attempt=2,
-                    previous_run=first.run,
-                    human_input={"response": "Approved."},
-                )
-            )
-            assert second.run is not None
-            self.assertEqual(second.run.status, "blocked")
-            self.assertIn("Required attachment analysis is incomplete", second.run.error or "")
-            self.assertEqual(runner.prompts, [])
-
-    def test_refreshed_complete_attachment_analysis_allows_retry_to_proceed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workflow = load_workflow(
-                write_workflow(root, write_fake_codex(root)),
-                environ={"TEST_JIRA_TOKEN": "token"},
-            )
-            jira = FakeJira(
-                hydrated_issue(
-                    attachment_status="not_configured",
-                    incomplete_reasons=["role-matrix.png has no vision summary"],
-                )
-            )
-            store = Store(root / "db.sqlite3")
-            runner = PromptStatusCodexRunner(["completed"])
-            first = asyncio.run(
-                SingleIssueOrchestrator(workflow, jira, store, codex_runner=runner).run_once("T-1")
-            )
-            assert first.run is not None
-            self.assertEqual(first.run.status, "blocked")
-
-            refreshed = hydrated_issue(attachment_status="complete")
-            jira.issue = refreshed
-            jira.issues = [refreshed]
-            second = asyncio.run(
-                SingleIssueOrchestrator(workflow, jira, store, codex_runner=runner).run_once(
-                    "T-1",
-                    attempt=2,
-                    previous_run=first.run,
-                    human_input={"response": "The analyzer is configured and Jira was refreshed."},
-                )
-            )
-
-            assert second.run is not None
-            self.assertEqual(second.run.status, "completed")
+            self.assertEqual(first.run.status, "completed")
+            self.assertIsNotNone(first.workspace)
             self.assertEqual(len(runner.prompts), 1)
-            self.assertNotIn("The analyzer is configured and Jira was refreshed.", runner.prompts[0])
-            self.assertIn("prior dashboard response", runner.prompts[0])
+            self.assertNotIn("role-matrix.png", runner.prompts[0])
 
     def test_incomplete_snapshot_reason_blocks_even_without_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2256,6 +4899,253 @@ def create_completed_review_action(
     return action, source_run, result_run, approval
 
 
+class FakeRuntimeManager:
+    def __init__(
+        self,
+        status: str,
+        *,
+        shutdown_status: str = "stopped",
+    ) -> None:
+        self.status = status
+        self.shutdown_status = shutdown_status
+        self.calls: list[dict[str, object]] = []
+        self.shutdown_calls: list[dict[str, object]] = []
+        self.events: list[str] | None = None
+        self.on_shutdown = None
+        self.persisted_status_at_shutdown: str | None = None
+
+    async def verify_many(
+        self,
+        workspace_root,
+        repositories,
+        *,
+        target_args_by_repository=None,
+        source_repositories=(),
+    ):
+        repository_names = tuple(repositories)
+        source_names = tuple(source_repositories)
+        if self.events is not None:
+            self.events.append("verify")
+        self.calls.append(
+            {
+                "workspace_root": Path(workspace_root),
+                "repositories": repository_names,
+                "source_repositories": source_names,
+                "target_args_by_repository": target_args_by_repository,
+            }
+        )
+        now = datetime.now(timezone.utc)
+        results = []
+        for repository in repository_names:
+            log_path = (
+                Path(workspace_root)
+                / ".symphony"
+                / "runtime"
+                / f"{repository}-verify-{len(self.calls)}.log"
+            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(f"fake runtime status: {self.status}\n", encoding="utf-8")
+            results.append(
+                RuntimeVerificationResult(
+                    repository=repository,
+                    profile="tests",
+                    status=self.status,
+                    argv=("pytest",),
+                    repository_path=Path(workspace_root) / repository,
+                    started_at=now,
+                    finished_at=now,
+                    returncode=0 if self.status == "passed" else 1,
+                    output=f"fake runtime status: {self.status}",
+                    log_path=log_path,
+                    message=f"fake runtime {self.status}",
+                )
+            )
+        return tuple(results)
+
+    async def shutdown(
+        self,
+        workspace_root,
+        repositories,
+        *,
+        source_repositories=(),
+    ):
+        repository_names = tuple(repositories)
+        source_names = tuple(source_repositories)
+        self.shutdown_calls.append(
+            {
+                "workspace_root": Path(workspace_root),
+                "repositories": repository_names,
+                "source_repositories": source_names,
+            }
+        )
+        if self.events is not None:
+            self.events.append("shutdown")
+        if self.on_shutdown is not None:
+            self.persisted_status_at_shutdown = self.on_shutdown()
+        log_path = (
+            Path(workspace_root)
+            / ".symphony"
+            / "runtime"
+            / "fake-shutdown.log"
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            f"fake shutdown status: {self.shutdown_status}\n",
+            encoding="utf-8",
+        )
+        now = datetime.now(timezone.utc)
+        return SimpleNamespace(
+            repositories=repository_names,
+            services=repository_names,
+            status=self.shutdown_status,
+            argv=("podman", "compose", "stop"),
+            started_at=now,
+            finished_at=now,
+            returncode=0 if self.shutdown_status == "stopped" else 1,
+            output=f"fake shutdown status: {self.shutdown_status}",
+            log_path=log_path,
+            message=f"fake shutdown {self.shutdown_status}",
+        )
+
+
+def write_runtime_workflow(
+    root: Path,
+    fake_codex: Path,
+    *,
+    required: bool,
+    shutdown_after_handoff: bool = False,
+    repository_key: str = "repo",
+    workspace_subdir: str = "repo",
+) -> Path:
+    path = write_workflow(
+        root,
+        fake_codex,
+        codex_extra="""
+  planning_prompt: |
+    Write a plan only. Do not edit files.
+""",
+    )
+    runtime_yaml = f"""runtime:
+  enabled: true
+  required: {str(required).lower()}
+  shutdown_after_handoff: {str(shutdown_after_handoff).lower()}
+  command: ["podman", "compose"]
+  project_directory: "./runtime/project"
+  compose_file: "./runtime/project/compose.yml"
+  env_file: "./runtime/project/.env"
+  project_name: symphony-test
+  lock_file: "./runtime/runtime.lock"
+  repositories:
+    {json.dumps(repository_key)}:
+      workspace_subdir: {json.dumps(workspace_subdir)}
+      source_env: REPO_SRC
+      service: repo
+      mount_target: /repo
+      verification_profile: tests
+  verification_profiles:
+    tests:
+      argv: ["pytest"]
+"""
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        .replace("agent:\n", runtime_yaml + "agent:\n")
+        .replace(
+            '  active_statuses: ["To Do"]',
+            '  active_statuses: ["To Do"]\n  handoff_status: Done',
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def create_runtime_case(
+    root: Path,
+    *,
+    runtime_status: str,
+    required: bool,
+    shutdown_after_handoff: bool = False,
+    shutdown_status: str = "stopped",
+    repository_key: str = "repo",
+    workspace_subdir: str = "repo",
+):
+    workflow = load_workflow(
+        write_runtime_workflow(
+            root,
+            write_fake_codex(root),
+            required=required,
+            shutdown_after_handoff=shutdown_after_handoff,
+            repository_key=repository_key,
+            workspace_subdir=workspace_subdir,
+        ),
+        environ={"TEST_JIRA_TOKEN": "token"},
+    )
+    issue = Issue(
+        id="10001",
+        identifier="T-1",
+        title="Fix bug",
+        description="Please fix",
+        status="To Do",
+        labels=["codex-ready"],
+        url="https://jira.example.test/browse/T-1",
+    )
+    jira = FakeJira(issue)
+    store = Store(root / "db.sqlite3")
+    runtime_manager = FakeRuntimeManager(
+        runtime_status,
+        shutdown_status=shutdown_status,
+    )
+    runner = PlanThenImplementCodexRunner(repository=workspace_subdir)
+    orchestrator = SingleIssueOrchestrator(
+        workflow,
+        jira,
+        store,
+        codex_runner=runner,
+        runtime_manager=runtime_manager,
+    )
+    return orchestrator, runtime_manager, runner, jira
+
+
+def run_runtime_case(
+    root: Path,
+    *,
+    runtime_status: str,
+    required: bool,
+    shutdown_after_handoff: bool = False,
+    repository_key: str = "repo",
+    workspace_subdir: str = "repo",
+):
+    orchestrator, runtime_manager, _, jira = create_runtime_case(
+        root,
+        runtime_status=runtime_status,
+        required=required,
+        shutdown_after_handoff=shutdown_after_handoff,
+        repository_key=repository_key,
+        workspace_subdir=workspace_subdir,
+    )
+    result = asyncio.run(orchestrator.run_once("T-1"))
+    return result, runtime_manager, jira
+
+
+def verification_bypass_input(
+    orchestrator: SingleIssueOrchestrator,
+    blocked_run,
+    *,
+    approver_identity: str = "operator@example.test",
+) -> dict[str, object]:
+    context = prepare_verification_bypass_context(
+        blocked_run,
+        orchestrator.workflow,
+        orchestrator.store,
+    )
+    return {
+        "action": "verification_bypass",
+        "run_id": blocked_run.id,
+        "response": "Verification bypass approved.",
+        "approver_identity": approver_identity,
+        **context,
+    }
+
+
 def write_workflow(root: Path, fake_codex: Path, codex_extra: str = "") -> Path:
     path = root / "WORKFLOW.md"
     path.write_text(
@@ -2536,10 +5426,11 @@ class PlanNeedsHumanThenCompleteRunner:
 
 
 class PlanThenImplementCodexRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, repository: str = "repo") -> None:
         self.prompts_seen: list[str] = []
         self.implementation_prompt = ""
         self.plan_prompt = ""
+        self.repository = repository
 
     async def run(self, prompt, workspace_path, config, *, timeout_seconds, event_callback=None, log_callback=None):
         if "planning pass only" in prompt.lower() or "write the plan/spec now" in prompt.lower():
@@ -2549,13 +5440,139 @@ class PlanThenImplementCodexRunner:
                 workspace_path,
                 "completed",
                 final_message=valid_plan_spec_message(
-                    prompt, "Edit one file and run verify.", baseline_sha=ensure_test_git_repository(Path(workspace_path))
+                    prompt,
+                    "Edit one file and run verify.",
+                    baseline_sha=ensure_test_git_repository(
+                        Path(workspace_path),
+                        repository=self.repository,
+                    ),
+                    repository=self.repository,
                 ),
                 final_path=config.output_last_message_file,
             )
         self.prompts_seen.append("implementation")
         self.implementation_prompt = prompt
         return codex_result(workspace_path, "completed", final_message="implemented")
+
+
+class VerificationBypassReviewRunner(PlanThenImplementCodexRunner):
+    def __init__(
+        self,
+        review_decisions: list[str],
+        *,
+        mutate_review: bool = False,
+    ) -> None:
+        super().__init__()
+        self.review_decisions = list(review_decisions)
+        self.mutate_review = mutate_review
+
+    async def run(
+        self,
+        prompt,
+        workspace_path,
+        config,
+        *,
+        timeout_seconds,
+        event_callback=None,
+        log_callback=None,
+    ):
+        if "Review the current git diff" in prompt:
+            self.prompts_seen.append("review")
+            if self.mutate_review:
+                (Path(workspace_path) / "repo" / "review-drift.txt").write_text(
+                    "changed by review\n",
+                    encoding="utf-8",
+                )
+            decision = self.review_decisions.pop(0)
+            return codex_result(
+                workspace_path,
+                "completed",
+                final_message=json.dumps({"decision": decision}),
+                final_path=config.output_last_message_file,
+            )
+        if "Review feedback:" in prompt:
+            self.prompts_seen.append("regeneration")
+            self.implementation_prompt = prompt
+            return codex_result(
+                workspace_path,
+                "completed",
+                final_message="implemented after review",
+            )
+        return await super().run(
+            prompt,
+            workspace_path,
+            config,
+            timeout_seconds=timeout_seconds,
+            event_callback=event_callback,
+            log_callback=log_callback,
+        )
+
+
+class StructuralPlanRepairCodexRunner:
+    def __init__(self) -> None:
+        self.prompts_seen: list[str] = []
+        self.repair_prompt = ""
+
+    async def run(
+        self,
+        prompt,
+        workspace_path,
+        config,
+        *,
+        timeout_seconds,
+        event_callback=None,
+        log_callback=None,
+    ):
+        if "repairing a model-generated PlanSpec" in prompt:
+            self.prompts_seen.append("plan_repair")
+            self.repair_prompt = prompt
+            return codex_result(
+                workspace_path,
+                "completed",
+                final_message=valid_plan_spec_message(
+                    prompt,
+                    "Repair the structural PlanSpec output.",
+                    baseline_sha=ensure_test_git_repository(Path(workspace_path)),
+                ),
+                final_path=config.output_last_message_file,
+            )
+        if "planning pass only" in prompt.lower():
+            self.prompts_seen.append("plan")
+            return codex_result(
+                workspace_path,
+                "completed",
+                final_message='{"decision":"ready_for_approval"}',
+                final_path=config.output_last_message_file,
+            )
+        self.prompts_seen.append("implementation")
+        return codex_result(
+            workspace_path,
+            "completed",
+            final_message="implemented",
+        )
+
+
+class AlwaysInvalidPlanCodexRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(
+        self,
+        prompt,
+        workspace_path,
+        config,
+        *,
+        timeout_seconds,
+        event_callback=None,
+        log_callback=None,
+    ):
+        self.calls += 1
+        return codex_result(
+            workspace_path,
+            "completed",
+            final_message='{"decision":"ready_for_approval"}',
+            final_path=config.output_last_message_file,
+        )
 
 
 class PlanFeedbackCodexRunner:
@@ -2610,8 +5627,312 @@ class PlanningQuestionThenPlanCodexRunner:
         )
 
 
-def ensure_test_git_repository(workspace_path: Path) -> str:
-    repository_path = workspace_path / "repo"
+class AutomationWorkflowCodexRunner:
+    def __init__(
+        self,
+        decision: str,
+        *,
+        first_automation_plan_needs_human: bool = False,
+        unplanned_automation_file: bool = False,
+        automation_decisions: list[str] | None = None,
+        empty_automation_result: bool = False,
+        review_decisions: list[str] | None = None,
+        change_development_on_regeneration: bool = False,
+        change_development_during_automation: bool = False,
+        ignored_automation_mutation_phase: str | None = None,
+        ignore_planned_automation_path: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
+        self.decision = decision
+        self.first_automation_plan_needs_human = (
+            first_automation_plan_needs_human
+        )
+        self.unplanned_automation_file = unplanned_automation_file
+        self.automation_decisions = list(automation_decisions or [decision])
+        self.empty_automation_result = empty_automation_result
+        self.review_decisions = list(review_decisions or ["approve"])
+        self.change_development_on_regeneration = (
+            change_development_on_regeneration
+        )
+        self.change_development_during_automation = (
+            change_development_during_automation
+        )
+        self.ignored_automation_mutation_phase = (
+            ignored_automation_mutation_phase
+        )
+        self.ignore_planned_automation_path = ignore_planned_automation_path
+        self.events = events
+        self.phases: list[str] = []
+        self.automation_plan_prompts: list[str] = []
+        self.automation_plan_diff_hashes: list[str] = []
+        self.review_prompt = ""
+
+    def record_phase(self, phase: str) -> None:
+        self.phases.append(phase)
+        if self.events is not None:
+            self.events.append(phase)
+
+    async def run(
+        self,
+        prompt,
+        workspace_path,
+        config,
+        *,
+        timeout_seconds,
+        event_callback=None,
+        log_callback=None,
+    ):
+        workspace = Path(workspace_path)
+        if prompt.startswith("You are planning test-automation updates"):
+            self.record_phase("automation_planning")
+            if self.ignored_automation_mutation_phase == "planning":
+                (workspace / "automation" / "preexisting-output.tmp").write_text(
+                    "mutated during planning\n",
+                    encoding="utf-8",
+                )
+                (workspace / "automation" / "new-output.tmp").write_text(
+                    "created during planning\n",
+                    encoding="utf-8",
+                )
+            self.automation_plan_prompts.append(prompt)
+            self.automation_plan_diff_hashes.append(
+                prompt_json_binding(prompt, "development_workspace_diff_hash")
+            )
+            if self.first_automation_plan_needs_human:
+                self.first_automation_plan_needs_human = False
+                return codex_result(
+                    workspace,
+                    "completed",
+                    final_message=(
+                        '{"decision":"needs_human","question":'
+                        '"Which regression scenario should be retained?"}'
+                    ),
+                    final_path=config.output_last_message_file,
+                )
+            decision = (
+                self.automation_decisions.pop(0)
+                if len(self.automation_decisions) > 1
+                else self.automation_decisions[0]
+            )
+            return codex_result(
+                workspace,
+                "completed",
+                final_message=valid_automation_plan_message(
+                    prompt,
+                    decision=decision,
+                ),
+                final_path=config.output_last_message_file,
+            )
+        if prompt.startswith("You are implementing the validated automation plan"):
+            self.record_phase("automation_implementation")
+            automation_repository = workspace / "automation"
+            (automation_repository / "generated-test.java").write_text(
+                "final class GeneratedTest {}\n",
+                encoding="utf-8",
+            )
+            if self.unplanned_automation_file:
+                (automation_repository / "unexpected-test.java").write_text(
+                    "final class UnexpectedTest {}\n",
+                    encoding="utf-8",
+                )
+            if self.change_development_during_automation:
+                (workspace / "repo" / "development.py").write_text(
+                    "IMPLEMENTED = True\nAUTOMATION_SCOPE_VIOLATION = True\n",
+                    encoding="utf-8",
+                )
+            if self.ignored_automation_mutation_phase == "implementation":
+                (automation_repository / "preexisting-output.tmp").write_text(
+                    "mutated during implementation\n",
+                    encoding="utf-8",
+                )
+                (automation_repository / "new-output.tmp").write_text(
+                    "created during implementation\n",
+                    encoding="utf-8",
+                )
+            result = codex_result(
+                workspace,
+                "completed",
+                final_message="Added the focused automation regression coverage.",
+                final_path=config.output_last_message_file,
+            )
+            if self.empty_automation_result:
+                result.final_message = None
+                result.final_message_path.write_text("", encoding="utf-8")
+            return result
+        if prompt.startswith("You are reviewing a completed implementation"):
+            self.record_phase("review")
+            self.review_prompt = prompt
+            decision = self.review_decisions.pop(0)
+            return codex_result(
+                workspace,
+                "completed",
+                final_message=json.dumps(
+                    {"decision": decision, "findings": [], "residual_risk": "low"}
+                ),
+                final_path=config.output_last_message_file,
+            )
+        if "Review feedback:" in prompt:
+            self.record_phase("regeneration")
+            if self.change_development_on_regeneration:
+                (workspace / "repo" / "development.py").write_text(
+                    "IMPLEMENTED = True\nREVIEW_FIX = True\n",
+                    encoding="utf-8",
+                )
+            return codex_result(
+                workspace,
+                "completed",
+                final_message="Implemented the review correction.",
+                final_path=config.output_last_message_file,
+            )
+        if config.output_last_message_file == ".symphony/codex-plan.md" and (
+            "write the plan/spec now" in prompt.lower()
+            or prompt.startswith("You are revising the implementation plan/spec")
+        ):
+            self.record_phase("development_plan")
+            baseline_sha = ensure_test_git_repository(workspace)
+            ensure_test_git_repository(workspace, repository="automation")
+            subprocess.run(
+                ["git", "-C", str(workspace / "automation"), "checkout", "-q", "-B", "T-1"],
+                check=True,
+            )
+            return codex_result(
+                workspace,
+                "completed",
+                final_message=valid_plan_spec_message(
+                    prompt,
+                    "Implement the focused development change.",
+                    baseline_sha=baseline_sha,
+                ),
+                final_path=config.output_last_message_file,
+            )
+
+        self.record_phase("development_implementation")
+        (workspace / "repo" / "development.py").write_text(
+            "IMPLEMENTED = True\n",
+            encoding="utf-8",
+        )
+        if (
+            self.ignored_automation_mutation_phase is not None
+            or self.ignore_planned_automation_path
+        ):
+            automation_repository = workspace / "automation"
+            ignore_file = automation_repository / ".gitignore"
+            if not ignore_file.exists():
+                ignored_patterns = ["*-output.tmp"]
+                if self.ignore_planned_automation_path:
+                    ignored_patterns.append("generated-test.java")
+                ignore_file.write_text(
+                    "\n".join(ignored_patterns) + "\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(
+                    ["git", "-C", str(automation_repository), "add", ".gitignore"],
+                    check=True,
+                )
+                commit_test_git_repository(
+                    automation_repository,
+                    "configure ignored automation outputs",
+                )
+            if self.ignored_automation_mutation_phase is not None:
+                (automation_repository / "preexisting-output.tmp").write_text(
+                    "baseline ignored output\n",
+                    encoding="utf-8",
+                )
+        return codex_result(
+            workspace,
+            "completed",
+            final_message="Implemented the development change.",
+            final_path=config.output_last_message_file,
+        )
+
+
+def prompt_json_binding(prompt: str, name: str) -> str:
+    match = re.search(rf"^- {re.escape(name)}: (.+)$", prompt, flags=re.MULTILINE)
+    if not match:
+        raise AssertionError(f"automation prompt omitted binding {name}")
+    value = json.loads(match.group(1))
+    if not isinstance(value, str):
+        raise AssertionError(f"automation prompt binding {name} is not a string")
+    return value
+
+
+def valid_automation_plan_message(prompt: str, *, decision: str) -> str:
+    update_required = decision == "update_required"
+    scenario_ids = ["AUTO-1"] if update_required else []
+    return json.dumps(
+        {
+            "schema_version": "1.0",
+            "decision": decision,
+            "issue_key": prompt_json_binding(prompt, "issue_key"),
+            "requirements_snapshot_hash": prompt_json_binding(
+                prompt, "requirements_snapshot_hash"
+            ),
+            "development_plan_spec_hash": prompt_json_binding(
+                prompt, "development_plan_spec_hash"
+            ),
+            "development_workspace_diff_hash": prompt_json_binding(
+                prompt, "development_workspace_diff_hash"
+            ),
+            "automation_repository": prompt_json_binding(
+                prompt, "automation_repository"
+            ),
+            "repository_baseline_sha": prompt_json_binding(
+                prompt, "repository_baseline_sha"
+            ),
+            "rationale": (
+                "Add one focused regression scenario."
+                if update_required
+                else "The existing automation already covers the changed behavior."
+            ),
+            "mapped_scenarios": (
+                [
+                    {
+                        "id": "AUTO-1",
+                        "description": "Cover the implemented behavior.",
+                        "requirement_ids": ["R-1"],
+                        "acceptance_criterion_ids": ["AC-1"],
+                    }
+                ]
+                if update_required
+                else []
+            ),
+            "affected_file_changes": (
+                [
+                    {
+                        "path": "generated-test.java",
+                        "change_type": "add",
+                        "description": "Add focused regression coverage.",
+                        "scenario_ids": scenario_ids,
+                    }
+                ]
+                if update_required
+                else []
+            ),
+            "verification": (
+                [
+                    {
+                        "id": "VERIFY-1",
+                        "command": "git diff --check",
+                        "expected_result": "The automation diff is valid.",
+                        "scenario_ids": scenario_ids,
+                    }
+                ]
+                if update_required
+                else []
+            ),
+            "risks": [],
+            "assumptions": [],
+            "open_questions": [],
+        }
+    )
+
+
+def ensure_test_git_repository(
+    workspace_path: Path,
+    *,
+    repository: str = "repo",
+) -> str:
+    repository_path = workspace_path / repository
     if not (repository_path / ".git").is_dir():
         repository_path.mkdir(parents=True, exist_ok=True)
         subprocess.run(

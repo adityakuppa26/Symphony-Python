@@ -7,6 +7,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from symphony_jira.automation_plan import (
+    AutomationPlan,
+    automation_result_content_hash,
+)
 from symphony_jira.models import Issue, RequirementsSnapshot
 from symphony_jira.store import (
     HUMAN_INPUT_CLAIM_LEASE,
@@ -17,6 +21,124 @@ from symphony_jira.store import (
 
 
 class StoreHumanInputTests(unittest.TestCase):
+    def test_verification_bypass_input_persists_structured_integrity_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            issue = make_issue()
+            run = store.create_run(issue, root / "workspace", branch_name=None)
+            run = store.update_run(
+                run.id,
+                status="blocked",
+                blocked_phase="verification",
+                verification_status="test_failed",
+                verification_output_path=str(root / "workspace" / "verification.json"),
+                verification_workspace_diff_hash="a" * 64,
+                verification_evidence_sha256="b" * 64,
+            )
+
+            pending = store.add_verification_bypass_input(
+                "T-1",
+                run_id=run.id,
+                approver_identity="  operator@example.test  ",
+                workspace_diff_hash="a" * 64,
+                verification_evidence_sha256="B" * 64,
+                question="Tests failed",
+            )
+            claimed = store.claim_human_input(pending["id"])
+
+            self.assertEqual(pending["action"], "verification_bypass")
+            self.assertEqual(
+                pending["approver_identity"],
+                "operator@example.test",
+            )
+            self.assertEqual(pending["workspace_diff_hash"], "a" * 64)
+            self.assertEqual(
+                pending["verification_evidence_sha256"],
+                "b" * 64,
+            )
+            assert claimed is not None
+            self.assertEqual(claimed["action"], "verification_bypass")
+            self.assertEqual(
+                claimed["verification_evidence_sha256"],
+                "b" * 64,
+            )
+
+    def test_verification_bypass_input_is_transactionally_fenced_to_run_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            run = store.create_run(
+                make_issue(),
+                root / "workspace",
+                branch_name=None,
+            )
+            run = store.update_run(
+                run.id,
+                status="blocked",
+                blocked_phase="verification",
+                verification_status="test_failed",
+                verification_output_path=str(root / "workspace" / "verification.json"),
+                verification_workspace_diff_hash="a" * 64,
+                verification_evidence_sha256="b" * 64,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not match the failed run integrity binding",
+            ):
+                store.add_verification_bypass_input(
+                    "T-1",
+                    run_id=run.id,
+                    approver_identity="operator@example.test",
+                    workspace_diff_hash="c" * 64,
+                    verification_evidence_sha256="b" * 64,
+                )
+
+            self.assertEqual(store.list_human_inputs(run_id=run.id), [])
+
+    def test_store_migrates_verification_integrity_binding_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "legacy.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE runs (
+                      id TEXT PRIMARY KEY,
+                      issue_id TEXT NOT NULL,
+                      issue_identifier TEXT NOT NULL,
+                      issue_fingerprint TEXT,
+                      workspace_path TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      attempt INTEGER NOT NULL,
+                      started_at TEXT NOT NULL,
+                      plan_spec_hash TEXT,
+                      plan_approval_id TEXT,
+                      finished_at TEXT,
+                      final_message TEXT,
+                      error TEXT,
+                      blocked_phase TEXT,
+                      branch_name TEXT,
+                      verification_status TEXT,
+                      verification_output_path TEXT
+                    )
+                    """
+                )
+
+            Store(db_path)
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+                }
+            self.assertIn("verification_workspace_diff_hash", columns)
+            self.assertIn("verification_evidence_sha256", columns)
+            self.assertIn("automation_plan_hash", columns)
+            self.assertIn("automation_development_diff_hash", columns)
+            self.assertIn("automation_repository_diff_hash", columns)
+            self.assertIn("automation_result_hash", columns)
+
     def test_only_latest_run_overall_is_actionable_even_if_older_run_finishes_later(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -75,6 +197,37 @@ class StoreHumanInputTests(unittest.TestCase):
             self.assertIsNone(persisted["claimed_at"])
             self.assertIsNone(persisted["claim_token"])
             self.assertTrue(persisted["consumed_at"])
+
+    def test_newer_blocked_run_retires_stale_pending_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            issue = make_issue()
+            older = store.create_run(issue, root / "workspace", branch_name=None)
+            older = store.update_run(older.id, status="blocked")
+            stale = store.add_human_input(
+                "T-1",
+                run_id=older.id,
+                response="Response for the older attempt",
+            )
+            newer = store.create_run(issue, root / "workspace", branch_name=None)
+            newer = store.update_run(newer.id, status="blocked")
+
+            current = store.add_human_input(
+                "T-1",
+                run_id=newer.id,
+                response="Response for the current attempt",
+            )
+
+            old_record = store.list_human_inputs(run_id=older.id)[0]
+            self.assertEqual(old_record["id"], stale["id"])
+            self.assertIsNotNone(old_record["consumed_at"])
+            self.assertIsNone(old_record["claimed_at"])
+            self.assertIsNone(old_record["claim_token"])
+            self.assertEqual(
+                store.latest_unconsumed_human_input_for_issue("T-1")["id"],
+                current["id"],
+            )
 
     def test_stale_claim_is_recovered_without_giving_old_owner_mutation_rights(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,6 +320,10 @@ class StoreHumanInputTests(unittest.TestCase):
                 blocked_phase="implementation",
                 plan_spec_hash="a" * 64,
                 plan_approval_id="approval-1",
+                automation_plan_hash="b" * 64,
+                automation_development_diff_hash="c" * 64,
+                automation_repository_diff_hash="d" * 64,
+                automation_result_hash="e" * 64,
             )
             pending = store.add_human_input(
                 "T-1",
@@ -191,6 +348,16 @@ class StoreHumanInputTests(unittest.TestCase):
             self.assertEqual(reserved.status, "queued")
             self.assertEqual(reserved.plan_spec_hash, "a" * 64)
             self.assertEqual(reserved.plan_approval_id, "approval-1")
+            self.assertEqual(reserved.automation_plan_hash, "b" * 64)
+            self.assertEqual(
+                reserved.automation_development_diff_hash,
+                "c" * 64,
+            )
+            self.assertEqual(
+                reserved.automation_repository_diff_hash,
+                "d" * 64,
+            )
+            self.assertEqual(reserved.automation_result_hash, "e" * 64)
             self.assertEqual(store.latest_run_for_issue("T-1").id, reserved.id)
             persisted_input = store.list_human_inputs(run_id=predecessor.id)[0]
             self.assertIsNotNone(persisted_input["consumed_at"])
@@ -211,6 +378,10 @@ class StoreHumanInputTests(unittest.TestCase):
                 blocked_phase="implementation",
                 plan_spec_hash="a" * 64,
                 plan_approval_id="approval-1",
+                automation_plan_hash="b" * 64,
+                automation_development_diff_hash="c" * 64,
+                automation_repository_diff_hash="d" * 64,
+                automation_result_hash="e" * 64,
             )
             pending = first_store.add_human_input(
                 "T-1", run_id=predecessor.id, response="recover this exact response"
@@ -240,6 +411,24 @@ class StoreHumanInputTests(unittest.TestCase):
             )
             assert first_started is not None
             self.assertEqual(first_started.status, "running")
+            advanced = first_store.update_owned_human_resume_run(
+                reserved.id,
+                first_handoff["handoff_claim_token"],
+                now=first_claimed_at,
+                plan_spec_hash="f" * 64,
+                automation_plan_hash="1" * 64,
+                automation_development_diff_hash="2" * 64,
+                automation_repository_diff_hash="3" * 64,
+                automation_result_hash="4" * 64,
+                plan_approval_id="approval-2",
+            )
+            assert advanced is not None
+            self.assertEqual(advanced.plan_spec_hash, "f" * 64)
+            self.assertEqual(advanced.automation_plan_hash, "1" * 64)
+            self.assertEqual(advanced.automation_development_diff_hash, "2" * 64)
+            self.assertEqual(advanced.automation_repository_diff_hash, "3" * 64)
+            self.assertEqual(advanced.automation_result_hash, "4" * 64)
+            self.assertEqual(advanced.plan_approval_id, "approval-2")
 
             self.assertIsNone(
                 restarted_store.claim_human_resume_handoff(
@@ -278,7 +467,30 @@ class StoreHumanInputTests(unittest.TestCase):
             self.assertNotEqual(
                 recovered["handoff_claim_token"], first_handoff["handoff_claim_token"]
             )
-            self.assertEqual(restarted_store.get_run(reserved.id).status, "queued")
+            recovered_run = restarted_store.get_run(reserved.id)
+            assert recovered_run is not None
+            self.assertEqual(recovered_run.status, "queued")
+            self.assertEqual(recovered_run.plan_spec_hash, predecessor.plan_spec_hash)
+            self.assertEqual(
+                recovered_run.automation_plan_hash,
+                predecessor.automation_plan_hash,
+            )
+            self.assertEqual(
+                recovered_run.automation_development_diff_hash,
+                predecessor.automation_development_diff_hash,
+            )
+            self.assertEqual(
+                recovered_run.automation_repository_diff_hash,
+                predecessor.automation_repository_diff_hash,
+            )
+            self.assertEqual(
+                recovered_run.automation_result_hash,
+                predecessor.automation_result_hash,
+            )
+            self.assertEqual(
+                recovered_run.plan_approval_id,
+                predecessor.plan_approval_id,
+            )
             self.assertFalse(
                 first_store.renew_human_resume_handoff(
                     reserved.id, first_handoff["handoff_claim_token"]
@@ -380,6 +592,62 @@ class StoreHumanInputTests(unittest.TestCase):
 
 
 class StoreHumanReviewTests(unittest.TestCase):
+    def test_store_migrates_automation_context_columns_for_review_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "legacy.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE human_review_actions (
+                      id TEXT PRIMARY KEY,
+                      issue_identifier TEXT NOT NULL,
+                      source_run_id TEXT NOT NULL UNIQUE,
+                      result_run_id TEXT NOT NULL UNIQUE,
+                      reviewer_identity TEXT NOT NULL,
+                      source_url TEXT NOT NULL,
+                      comments TEXT NOT NULL,
+                      requirements_snapshot_hash TEXT NOT NULL,
+                      plan_spec_hash TEXT,
+                      plan_spec TEXT,
+                      plan_approval_id TEXT,
+                      approval_json TEXT,
+                      source_final_message TEXT,
+                      source_review TEXT,
+                      source_review_history TEXT,
+                      workspace_diff TEXT NOT NULL,
+                      workspace_diff_hash TEXT NOT NULL,
+                      triage_decision TEXT,
+                      triage_output TEXT,
+                      status TEXT NOT NULL,
+                      claimed_at TEXT,
+                      claim_token TEXT,
+                      started_at TEXT,
+                      finished_at TEXT,
+                      created_at TEXT NOT NULL
+                    )
+                    """
+                )
+
+            Store(db_path)
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(human_review_actions)"
+                    ).fetchall()
+                }
+            self.assertTrue(
+                {
+                    "automation_plan_hash",
+                    "automation_development_diff_hash",
+                    "automation_repository_diff_hash",
+                    "automation_result_hash",
+                    "automation_plan",
+                    "automation_result",
+                }.issubset(columns)
+            )
+
     @staticmethod
     def _create_completed_source(
         store: Store,
@@ -412,7 +680,14 @@ class StoreHumanReviewTests(unittest.TestCase):
         return source, approval
 
     @staticmethod
-    def _create_action(store: Store, source, approval):
+    def _create_action(
+        store: Store,
+        source,
+        approval,
+        *,
+        automation_plan: AutomationPlan | None = None,
+        automation_result: str | None = None,
+    ):
         return store.create_human_review_action(
             source.id,
             reviewer_identity="reviewer@example.test",
@@ -424,6 +699,13 @@ class StoreHumanReviewTests(unittest.TestCase):
             source_review_history="## Attempt 1\nAPPROVE",
             workspace_diff="diff --git a/app.py b/app.py\n",
             workspace_diff_hash="d" * 64,
+            automation_plan_hash=(
+                automation_plan.content_hash() if automation_plan else None
+            ),
+            automation_plan=(
+                automation_plan.canonical_json(indent=2) if automation_plan else None
+            ),
+            automation_result=automation_result,
         )
 
     def test_action_and_child_are_created_atomically_with_frozen_lineage(self) -> None:
@@ -491,6 +773,131 @@ class StoreHumanReviewTests(unittest.TestCase):
                 store.list_recoverable_human_review_action_ids(), [action["id"]]
             )
 
+    def test_action_freezes_bound_automation_artifacts_and_copies_hash_to_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            source, approval = self._create_completed_source(store, root)
+            automation_plan = AutomationPlan.model_validate(
+                store_automation_plan_payload(
+                    issue_key=source.issue_identifier,
+                    requirements_snapshot_hash=source.issue_fingerprint or "",
+                )
+            )
+            source = store.update_run(
+                source.id,
+                automation_plan_hash=automation_plan.content_hash(),
+                automation_development_diff_hash=(
+                    automation_plan.development_workspace_diff_hash
+                ),
+                automation_repository_diff_hash="e" * 64,
+                automation_result_hash=automation_result_content_hash(
+                    "Added the focused automation scenario."
+                ),
+            )
+
+            action, child = store.create_human_review_action(
+                source.id,
+                reviewer_identity="reviewer@example.test",
+                source_url="https://github.example.test/org/repo/pull/42",
+                comments="Please tighten the automation assertion.",
+                plan_spec="# Plan\n- Keep the approved behavior stable.",
+                approval=approval,
+                source_review="APPROVE",
+                source_review_history="## Attempt 1\nAPPROVE",
+                workspace_diff="diff --git a/app.py b/app.py\n",
+                workspace_diff_hash="d" * 64,
+                automation_plan_hash=automation_plan.content_hash(),
+                automation_plan=automation_plan.canonical_json(indent=2),
+                automation_result="Added the focused automation scenario.",
+            )
+
+            self.assertEqual(
+                action["automation_plan_hash"],
+                automation_plan.content_hash(),
+            )
+            self.assertEqual(
+                action["automation_development_diff_hash"],
+                source.automation_development_diff_hash,
+            )
+            self.assertEqual(
+                action["automation_repository_diff_hash"],
+                source.automation_repository_diff_hash,
+            )
+            self.assertEqual(
+                action["automation_result_hash"],
+                source.automation_result_hash,
+            )
+            self.assertEqual(
+                action["automation_plan"],
+                automation_plan.canonical_json(indent=2),
+            )
+            self.assertEqual(
+                action["automation_result"],
+                "Added the focused automation scenario.",
+            )
+            self.assertEqual(
+                child.automation_plan_hash,
+                source.automation_plan_hash,
+            )
+            self.assertEqual(
+                child.automation_development_diff_hash,
+                source.automation_development_diff_hash,
+            )
+            self.assertEqual(
+                child.automation_repository_diff_hash,
+                source.automation_repository_diff_hash,
+            )
+            self.assertEqual(
+                child.automation_result_hash,
+                source.automation_result_hash,
+            )
+
+    def test_automation_context_mismatch_leaves_no_action_or_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            source, approval = self._create_completed_source(store, root)
+            automation_plan = AutomationPlan.model_validate(
+                store_automation_plan_payload(
+                    issue_key=source.issue_identifier,
+                    requirements_snapshot_hash=source.issue_fingerprint or "",
+                )
+            )
+            source = store.update_run(
+                source.id,
+                automation_plan_hash=automation_plan.content_hash(),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "AutomationPlan hash does not match",
+            ):
+                store.create_human_review_action(
+                    source.id,
+                    reviewer_identity="reviewer@example.test",
+                    source_url="https://github.example.test/org/repo/pull/42",
+                    comments="Please tighten the automation assertion.",
+                    plan_spec="# Plan\n- Keep the approved behavior stable.",
+                    approval=approval,
+                    source_review=None,
+                    source_review_history=None,
+                    workspace_diff="diff --git a/app.py b/app.py\n",
+                    workspace_diff_hash="d" * 64,
+                    automation_plan_hash="f" * 64,
+                    automation_plan=automation_plan.canonical_json(indent=2),
+                    automation_result="Added the focused automation scenario.",
+                )
+
+            self.assertEqual(
+                [run.id for run in store.list_runs_for_issue("T-1")],
+                [source.id],
+            )
+            self.assertEqual(
+                store.list_human_review_actions_for_issue("T-1"),
+                [],
+            )
+
     def test_rejections_leave_no_orphan_action_or_child_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -554,7 +961,31 @@ class StoreHumanReviewTests(unittest.TestCase):
             first_store = Store(root / "db.sqlite3")
             restarted_store = Store(root / "db.sqlite3")
             source, approval = self._create_completed_source(first_store, root)
-            action, child = self._create_action(first_store, source, approval)
+            automation_plan = AutomationPlan.model_validate(
+                store_automation_plan_payload(
+                    issue_key=source.issue_identifier,
+                    requirements_snapshot_hash=source.issue_fingerprint or "",
+                )
+            )
+            automation_result = "Added the focused automation scenario."
+            source = first_store.update_run(
+                source.id,
+                automation_plan_hash=automation_plan.content_hash(),
+                automation_development_diff_hash=(
+                    automation_plan.development_workspace_diff_hash
+                ),
+                automation_repository_diff_hash="e" * 64,
+                automation_result_hash=automation_result_content_hash(
+                    automation_result
+                ),
+            )
+            action, child = self._create_action(
+                first_store,
+                source,
+                approval,
+                automation_plan=automation_plan,
+                automation_result=automation_result,
+            )
             first_claimed_at = datetime(2026, 2, 1, tzinfo=timezone.utc)
 
             first_claim = first_store.claim_human_review_action(
@@ -596,6 +1027,25 @@ class StoreHumanReviewTests(unittest.TestCase):
                     now=first_claimed_at,
                 )
             )
+            advanced = first_store.update_owned_human_review_run(
+                action["id"],
+                child.id,
+                first_claim["claim_token"],
+                now=first_claimed_at,
+                plan_spec_hash="f" * 64,
+                automation_plan_hash="1" * 64,
+                automation_development_diff_hash="2" * 64,
+                automation_repository_diff_hash="3" * 64,
+                automation_result_hash="4" * 64,
+                plan_approval_id="approval-2",
+            )
+            assert advanced is not None
+            self.assertEqual(advanced.plan_spec_hash, "f" * 64)
+            self.assertEqual(advanced.automation_plan_hash, "1" * 64)
+            self.assertEqual(advanced.automation_development_diff_hash, "2" * 64)
+            self.assertEqual(advanced.automation_repository_diff_hash, "3" * 64)
+            self.assertEqual(advanced.automation_result_hash, "4" * 64)
+            self.assertEqual(advanced.plan_approval_id, "approval-2")
 
             expired_at = (
                 first_claimed_at
@@ -639,6 +1089,27 @@ class StoreHumanReviewTests(unittest.TestCase):
             recovered_child = restarted_store.get_run(child.id)
             assert recovered_child is not None
             self.assertEqual(recovered_child.status, "queued")
+            self.assertEqual(recovered_child.plan_spec_hash, action["plan_spec_hash"])
+            self.assertEqual(
+                recovered_child.automation_plan_hash,
+                action["automation_plan_hash"],
+            )
+            self.assertEqual(
+                recovered_child.automation_development_diff_hash,
+                action["automation_development_diff_hash"],
+            )
+            self.assertEqual(
+                recovered_child.automation_repository_diff_hash,
+                action["automation_repository_diff_hash"],
+            )
+            self.assertEqual(
+                recovered_child.automation_result_hash,
+                action["automation_result_hash"],
+            )
+            self.assertEqual(
+                recovered_child.plan_approval_id,
+                action["plan_approval_id"],
+            )
             self.assertFalse(
                 first_store.release_human_review_action(
                     action["id"], first_claim["claim_token"]
@@ -812,11 +1283,35 @@ class StoreRequirementsSnapshotIntegrityTests(unittest.TestCase):
                 row = conn.execute("SELECT snapshot_json FROM requirements_snapshots").fetchone()
                 assert row is not None
                 payload = json.loads(row[0])
-                payload["issue_url"] = "tampered"
+                payload["issue_id"] = "tampered"
                 conn.execute("UPDATE requirements_snapshots SET snapshot_json = ?", (json.dumps(payload),))
 
             with self.assertRaisesRegex(StoreIntegrityError, "canonical content hash"):
                 store.save_requirements_snapshot(snapshot)
+
+
+def store_automation_plan_payload(
+    *,
+    issue_key: str,
+    requirements_snapshot_hash: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "decision": "no_update_required",
+        "issue_key": issue_key,
+        "requirements_snapshot_hash": requirements_snapshot_hash,
+        "development_plan_spec_hash": "b" * 64,
+        "development_workspace_diff_hash": "c" * 64,
+        "automation_repository": "automation",
+        "repository_baseline_sha": "d" * 40,
+        "rationale": "Existing automation already covers the behavior.",
+        "mapped_scenarios": [],
+        "affected_file_changes": [],
+        "verification": [],
+        "risks": [],
+        "assumptions": [],
+        "open_questions": [],
+    }
 
 
 def make_issue() -> Issue:

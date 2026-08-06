@@ -118,10 +118,11 @@ class RequirementsArtifactTests(unittest.TestCase):
                 / f"{initial.content_hash}.json",
             )
             self.assertEqual(first.current.read_text(), first.historical.read_text())
-            self.assertEqual(
-                read_requirements_snapshot_artifact(first.current).content_hash,
-                initial.content_hash,
-            )
+            round_tripped = read_requirements_snapshot_artifact(first.current)
+            self.assertEqual(round_tripped.content_hash, initial.content_hash)
+            self.assertEqual(round_tripped.issue_url, "")
+            assert round_tripped.description is not None
+            self.assertIsNone(round_tripped.description.source.url)
 
             repeated = write_requirements_snapshot_artifacts(workspace, initial)
             self.assertFalse(repeated.history_created)

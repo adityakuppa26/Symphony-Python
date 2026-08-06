@@ -54,6 +54,7 @@ class CodexAttachmentAnalyzerTests(unittest.IsolatedAsyncioTestCase):
                 "--image",
             ):
                 self.assertIn(flag, arguments)
+            self.assertEqual(arguments[-2], "--")
             self.assertIn("untrusted content", arguments[-1])
             self.assertIn("do not enumerate absent roles", arguments[-1])
             for marker in ("[classification: current]", "[inferred]", "[contradiction]"):

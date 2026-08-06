@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -13,65 +12,14 @@ from .models import RequirementsSnapshot
 
 PLAN_SPEC_VERSION = "1.0"
 
-
-_CANONICAL_ROLE_ORDER = ("gc", "sub", "gc_as_sub")
-_CANONICAL_ROLE_LABELS = {
-    "gc": "GC",
-    "sub": "Sub",
-    "gc_as_sub": "GC acting as Sub",
-}
-_GC_AS_SUB_PATTERN = re.compile(
-    r"\b(?:gcs?|general[\s-]+contractors?)"
-    r"[\s-]*(?:acting[\s-]+as|as)"
-    r"[\s-]+(?:an?[\s-]+)?(?:subs?|subcontractors?)\b",
-    re.IGNORECASE,
+_ACTIVE_JIRA_SOURCE_TYPES = frozenset({"description", "custom_field", "comment"})
+_LEGACY_REQUIREMENTS_SCHEMA_VERSIONS = frozenset(
+    {
+        "jira-requirements/v1",
+        "jira-requirements/v2",
+        "jira-requirements/v3",
+    }
 )
-_GC_PATTERN = re.compile(
-    r"\b(?:gcs?|general[\s-]+contractors?)\b",
-    re.IGNORECASE,
-)
-_SUB_PATTERN = re.compile(
-    r"\b(?:subs?|subcontractors?)\b",
-    re.IGNORECASE,
-)
-_ROLE_LABEL_EXCLUSION_PATTERN = re.compile(
-    r"(?:\b(?:non|not|except|excluding|exclude|without)\b|\ball\s+(?:users?\s+)?except\b)",
-    re.IGNORECASE,
-)
-_ROLE_TOKEN_PATTERN_TEXT = (
-    r"(?:"
-    r"(?:gcs?|general[\s-]+contractors?)[\s-]*(?:acting[\s-]+as|as)"
-    r"[\s-]+(?:an?[\s-]+)?(?:subs?|subcontractors?)"
-    r"|gcs?|general[\s-]+contractors?|subs?|subcontractors?"
-    r")"
-)
-_COORDINATED_ABSENT_ROLE_PATTERN = re.compile(
-    rf"(?P<roles>{_ROLE_TOKEN_PATTERN_TEXT}"
-    rf"(?:\s*(?:,|/|&|\band\b|\bor\b)\s*{_ROLE_TOKEN_PATTERN_TEXT})+)"
-    r"\s*(?:(?:is|are)\s+)?"
-    r"(?:not\s+(?:shown|visible|displayed|present|applicable)|"
-    r"absent|missing|omitted|hidden)\b",
-    re.IGNORECASE,
-)
-_NO_COORDINATED_ROLE_PATTERN = re.compile(
-    rf"\bno\s+(?P<roles>{_ROLE_TOKEN_PATTERN_TEXT}"
-    rf"(?:\s*(?:,|/|&|\band\b|\bor\b)\s*{_ROLE_TOKEN_PATTERN_TEXT})+)"
-    r"\s+(?:(?:is|are)\s+)?(?:shown|visible|displayed|present|applicable)\b",
-    re.IGNORECASE,
-)
-_ABSENT_ROLE_SUFFIX_PATTERN = re.compile(
-    r"^\s*(?::|[-–—]|=)?\s*(?:(?:is|are)\s+)?"
-    r"(?:not\s+(?:shown|visible|displayed|present|applicable)|"
-    r"absent|missing|omitted|hidden)\b",
-    re.IGNORECASE,
-)
-_ABSENT_ROLE_PREFIX_PATTERN = re.compile(
-    r"(?:\bno|(?:not\s+(?:shown|visible|displayed|present)|absent|missing)"
-    r"(?:\s+for)?)\s*$",
-    re.IGNORECASE,
-)
-
-
 
 
 class PlanSpecError(ValueError):
@@ -84,6 +32,10 @@ class StrictPlanModel(BaseModel):
 
 class JiraSource(StrictPlanModel):
     issue_key: str = Field(min_length=1)
+    # Context-only source types remain parseable solely so an exact,
+    # already-approved pre-v4 PlanSpec can be integrity-checked during a
+    # verification-only migration resume. Current context validation never
+    # authorizes them.
     source_type: Literal[
         "description",
         "custom_field",
@@ -125,21 +77,8 @@ class RoleStateMatrixEntry(StrictPlanModel):
     @model_validator(mode="after")
     def require_traceability(self) -> RoleStateMatrixEntry:
         if not self.requirement_ids and not self.acceptance_criterion_ids:
-            raise ValueError("a role/state entry must reference a requirement or acceptance criterion")
-        detected_roles = _detect_canonical_roles(self.role)
-        if self.canonical_role in _CANONICAL_ROLE_ORDER:
-            if _ROLE_LABEL_EXCLUSION_PATTERN.search(self.role):
-                raise ValueError(
-                    "a role-specific matrix row cannot use a negated or exclusionary role label"
-                )
-            if detected_roles != {self.canonical_role}:
-                expected = _CANONICAL_ROLE_LABELS[self.canonical_role]
-                raise ValueError(
-                    f"role label must identify only its canonical_role {expected!r}"
-                )
-        elif detected_roles:
             raise ValueError(
-                "an all/other matrix row cannot use a GC, Sub, or GC-as-Sub role label"
+                "a role/state entry must reference a requirement or acceptance criterion"
             )
         return self
 
@@ -237,7 +176,7 @@ class PlanSpec(StrictPlanModel):
     requirements_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     baseline_repository_shas: list[RepositoryBaseline] = Field(min_length=1)
     requirements: list[PlanRequirement] = Field(min_length=1)
-    role_state_matrix: list[RoleStateMatrixEntry] = Field(min_length=1)
+    role_state_matrix: list[RoleStateMatrixEntry]
     affected_surface: AffectedSurface
     existing_precedents: list[ExistingPrecedent]
     simplest_implementation: str = Field(min_length=1)
@@ -267,17 +206,14 @@ class PlanSpec(StrictPlanModel):
         test_ids = [test.id for test in self.test_cases]
         _require_unique(test_ids, "test-case ID")
         mapped_acceptance_ids = [test.acceptance_criterion_id for test in self.test_cases]
-        _require_unique(mapped_acceptance_ids, "test acceptance-criterion mapping")
         _require_exact_members(
             mapped_acceptance_ids,
             acceptance_ids,
-            "test cases must map one-to-one to acceptance criteria",
+            "test cases must cover every acceptance criterion",
         )
 
         valid_requirement_ids = set(requirement_ids)
         valid_acceptance_ids = set(acceptance_ids)
-        matrix_requirement_ids: list[str] = []
-        matrix_acceptance_ids: list[str] = []
         for entry in self.role_state_matrix:
             _require_references(entry.requirement_ids, valid_requirement_ids, "role/state requirement")
             _require_references(
@@ -285,29 +221,26 @@ class PlanSpec(StrictPlanModel):
                 valid_acceptance_ids,
                 "role/state acceptance criterion",
             )
-            matrix_requirement_ids.extend(entry.requirement_ids)
-            matrix_acceptance_ids.extend(entry.acceptance_criterion_ids)
-        _require_exact_members(
-            matrix_requirement_ids,
-            requirement_ids,
-            "role/state matrix must reference every requirement",
-        )
-        _require_exact_members(
-            matrix_acceptance_ids,
-            acceptance_ids,
-            "role/state matrix must reference every acceptance criterion",
-        )
 
         repositories = self.affected_surface.repositories
+        normalized_repositories = [
+            _normalize_repository_identity(repository) for repository in repositories
+        ]
         _require_unique(repositories, "affected repository")
-        baseline_repositories = [baseline.repository for baseline in self.baseline_repository_shas]
+        baseline_repositories = [
+            baseline.repository for baseline in self.baseline_repository_shas
+        ]
+        normalized_baseline_repositories = [
+            _normalize_repository_identity(repository)
+            for repository in baseline_repositories
+        ]
         _require_unique(baseline_repositories, "baseline repository")
         _require_exact_members(
-            baseline_repositories,
-            repositories,
+            normalized_baseline_repositories,
+            normalized_repositories,
             "baseline repository SHAs must cover exactly the affected repositories",
         )
-        repository_set = set(repositories)
+        repository_set = set(normalized_repositories)
         impacts = (
             self.affected_surface.files
             + self.affected_surface.apis
@@ -316,12 +249,12 @@ class PlanSpec(StrictPlanModel):
             + self.affected_surface.translations
         )
         for impact in impacts:
-            if impact.repository not in repository_set:
+            if _normalize_repository_identity(impact.repository) not in repository_set:
                 raise ValueError(
                     f"affected surface {impact.target!r} references undeclared repository {impact.repository!r}"
                 )
         for precedent in self.existing_precedents:
-            if precedent.repository not in repository_set:
+            if _normalize_repository_identity(precedent.repository) not in repository_set:
                 raise ValueError(
                     f"existing precedent {precedent.path!r} references undeclared "
                     f"repository {precedent.repository!r}"
@@ -467,6 +400,122 @@ def parse_plan_spec(
     raise PlanSpecError("planning output must contain one complete JSON PlanSpec object")
 
 
+def parse_frozen_legacy_plan_spec(
+    message: str,
+    *,
+    expected_issue_key: str,
+    expected_snapshot_hash: str,
+    issue_type: str | None,
+    requirements_snapshot: RequirementsSnapshot,
+) -> PlanSpec:
+    """Validate an exact pre-v4 PlanSpec without promoting contextual sources.
+
+    Historical plans may contain context-only citations that were valid under
+    the old schema. They are accepted here only as non-authoritative extras:
+    every requirement and acceptance criterion must still retain a citation to
+    root Description, configured Acceptance Criteria, or a root comment after
+    those extras are removed. The original model is returned so its frozen
+    content hash remains unchanged.
+    """
+
+    if requirements_snapshot.schema_version not in _LEGACY_REQUIREMENTS_SCHEMA_VERSIONS:
+        raise PlanSpecError(
+            "legacy frozen PlanSpec validation requires a v1-v3 requirements snapshot"
+        )
+    if requirements_snapshot.calculate_content_hash() != expected_snapshot_hash:
+        raise PlanSpecError(
+            "legacy frozen requirements snapshot does not match its trusted hash"
+        )
+
+    plan = _parse_plan_spec_model(message)
+    authoritative_source_keys = _snapshot_source_keys(requirements_snapshot)
+
+    def authoritative_sources(sources: list[JiraSource]) -> list[JiraSource]:
+        return [
+            source
+            for source in sources
+            if (source.issue_key, source.source_type, source.source_id)
+            in authoritative_source_keys
+        ]
+
+    projected_requirements: list[PlanRequirement] = []
+    missing_authority: list[str] = []
+    for requirement in plan.requirements:
+        requirement_sources = authoritative_sources(requirement.jira_sources)
+        if not requirement_sources:
+            missing_authority.append(f"requirement {requirement.id}")
+        projected_criteria: list[AcceptanceCriterion] = []
+        for criterion in requirement.acceptance_criteria:
+            criterion_sources = authoritative_sources(criterion.jira_sources)
+            if not criterion_sources:
+                missing_authority.append(
+                    f"acceptance criterion {criterion.id}"
+                )
+            projected_criteria.append(
+                criterion.model_copy(update={"jira_sources": criterion_sources})
+            )
+        projected_requirements.append(
+            requirement.model_copy(
+                update={
+                    "jira_sources": requirement_sources,
+                    "acceptance_criteria": projected_criteria,
+                }
+            )
+        )
+    if missing_authority:
+        raise PlanSpecError(
+            "Frozen pre-v4 PlanSpec depends on non-authoritative Jira context; "
+            "return to planning: " + ", ".join(missing_authority)
+        )
+
+    projected_questions = [
+        question.model_copy(
+            update={"jira_sources": authoritative_sources(question.jira_sources)}
+        )
+        for question in plan.open_questions
+    ]
+    projected_plan = plan.model_copy(
+        update={
+            "requirements": projected_requirements,
+            "open_questions": projected_questions,
+        }
+    )
+    validate_plan_spec_context(
+        projected_plan,
+        expected_issue_key=expected_issue_key,
+        expected_snapshot_hash=expected_snapshot_hash,
+        issue_type=issue_type,
+        requirements_snapshot=requirements_snapshot,
+    )
+    return plan
+
+
+def _parse_plan_spec_model(message: str) -> PlanSpec:
+    """Parse only the stable PlanSpec model; context is validated by the caller."""
+
+    if not message or not message.strip():
+        raise PlanSpecError("PlanSpec output is empty")
+    validation_errors: list[str] = []
+    saw_object = False
+    for candidate in _json_candidates(message):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        saw_object = True
+        try:
+            return PlanSpec.model_validate(payload)
+        except ValidationError as exc:
+            validation_errors.append(_format_validation_error(exc))
+    if validation_errors:
+        raise PlanSpecError(f"invalid PlanSpec: {validation_errors[0]}")
+    if saw_object:
+        raise PlanSpecError("planning output contains JSON, but not a valid PlanSpec object")
+    raise PlanSpecError("planning output must contain one complete JSON PlanSpec object")
+
+
 def validate_plan_spec_context(
     plan: PlanSpec,
     *,
@@ -475,6 +524,25 @@ def validate_plan_spec_context(
     issue_type: str | None = None,
     requirements_snapshot: RequirementsSnapshot | None = None,
 ) -> None:
+    if (
+        requirements_snapshot is None
+        or requirements_snapshot.schema_version
+        not in _LEGACY_REQUIREMENTS_SCHEMA_VERSIONS
+    ):
+        _normalize_current_plan_repository_identities(plan)
+    unsupported_sources = sorted(
+        {
+            source.source_type
+            for source in _plan_sources(plan)
+            if source.source_type not in _ACTIVE_JIRA_SOURCE_TYPES
+        }
+    )
+    if unsupported_sources:
+        raise PlanSpecError(
+            "Current PlanSpec Jira sources must be root description, "
+            "custom_field, or comment evidence; unsupported source type(s): "
+            + ", ".join(unsupported_sources)
+        )
     if expected_issue_key and plan.issue_key != expected_issue_key:
         raise PlanSpecError(
             f"PlanSpec issue_key {plan.issue_key!r} does not match Jira issue {expected_issue_key!r}"
@@ -504,8 +572,6 @@ def validate_plan_spec_context(
             )
             raise PlanSpecError(f"PlanSpec references Jira sources absent from the current snapshot: {formatted}")
         _validate_current_decision_coverage(plan, requirements_snapshot)
-        _validate_complete_attachment_coverage(plan, requirements_snapshot)
-        _validate_required_role_matrix(plan, requirements_snapshot)
         _validate_epic_child_issue_keys(plan, requirements_snapshot)
 
 
@@ -600,246 +666,6 @@ def _plan_sources(plan: PlanSpec) -> list[JiraSource]:
     return sources
 
 
-def _active_plan_source_keys(plan: PlanSpec) -> set[tuple[str, str, str]]:
-    keys = {
-        (source.issue_key, source.source_type, source.source_id)
-        for requirement in plan.requirements
-        for source in requirement.jira_sources
-    }
-    keys.update(
-        (source.issue_key, source.source_type, source.source_id)
-        for requirement in plan.requirements
-        for criterion in requirement.acceptance_criteria
-        for source in criterion.jira_sources
-    )
-    return keys
-
-
-def _complete_snapshot_attachments(snapshot: RequirementsSnapshot) -> list[Any]:
-    attachments = list(snapshot.attachments)
-    related_issues = (
-        ([snapshot.parent] if snapshot.parent is not None else [])
-        + snapshot.children
-        + snapshot.linked_issues
-        + snapshot.dependencies
-    )
-    for related in related_issues:
-        attachments.extend(related.attachments)
-    return [
-        attachment
-        for attachment in attachments
-        if attachment.analysis.status == "complete"
-    ]
-
-
-def _validate_complete_attachment_coverage(
-    plan: PlanSpec,
-    snapshot: RequirementsSnapshot,
-) -> None:
-    required_sources = {
-        (
-            attachment.source.issue_identifier,
-            "attachment",
-            attachment.source.source_id,
-        )
-        for attachment in _complete_snapshot_attachments(snapshot)
-    }
-    active_sources = _active_plan_source_keys(plan)
-    missing_sources = sorted(
-        required_source
-        for required_source in required_sources
-        if not any(
-            active_source[:2] == required_source[:2]
-            and (
-                active_source[2] == required_source[2]
-                or active_source[2].startswith(f"{required_source[2]}#unit:")
-            )
-            for active_source in active_sources
-        )
-    )
-    if missing_sources:
-        formatted = ", ".join(
-            f"{issue_key}:{source_type}:{source_id}"
-            for issue_key, source_type, source_id in missing_sources
-        )
-        raise PlanSpecError(
-            "PlanSpec active requirements or acceptance criteria must cite every "
-            f"completely analyzed attachment: {formatted}"
-        )
-
-
-def _detect_canonical_roles(text: str) -> set[str]:
-    roles: set[str] = set()
-    if _GC_AS_SUB_PATTERN.search(text):
-        roles.add("gc_as_sub")
-    without_gc_as_sub = _GC_AS_SUB_PATTERN.sub(" ", text)
-    if _GC_PATTERN.search(without_gc_as_sub):
-        roles.add("gc")
-    if _SUB_PATTERN.search(without_gc_as_sub):
-        roles.add("sub")
-    return roles
-
-
-def _role_mention_is_absent(text: str, match: re.Match[str]) -> bool:
-    before = text[max(0, match.start() - 48) : match.start()]
-    after = text[match.end() : match.end() + 64]
-    if bool(
-        _ABSENT_ROLE_PREFIX_PATTERN.search(before)
-        or _ABSENT_ROLE_SUFFIX_PATTERN.match(after)
-    ):
-        return True
-    return any(
-        group.start("roles") <= match.start()
-        and match.end() <= group.end("roles")
-        for pattern in (
-            _COORDINATED_ABSENT_ROLE_PATTERN,
-            _NO_COORDINATED_ROLE_PATTERN,
-        )
-        for group in pattern.finditer(text)
-    )
-
-
-def _has_present_role_mention(text: str, pattern: re.Pattern[str]) -> bool:
-    return any(
-        not _role_mention_is_absent(text, match)
-        for match in pattern.finditer(text)
-    )
-
-
-def _detect_attachment_summary_roles(text: str) -> set[str]:
-    roles: set[str] = set()
-    if _has_present_role_mention(text, _GC_AS_SUB_PATTERN):
-        roles.add("gc_as_sub")
-    without_gc_as_sub = _GC_AS_SUB_PATTERN.sub(
-        lambda match: " " * len(match.group(0)),
-        text,
-    )
-    if _has_present_role_mention(without_gc_as_sub, _GC_PATTERN):
-        roles.add("gc")
-    if _has_present_role_mention(without_gc_as_sub, _SUB_PATTERN):
-        roles.add("sub")
-    return roles
-
-
-def _active_plan_citations(
-    plan: PlanSpec,
-) -> dict[tuple[str, str, str], dict[str, set[str]]]:
-    citations: dict[tuple[str, str, str], dict[str, set[str]]] = {}
-
-    def add(source: JiraSource, layer: str, item_id: str) -> None:
-        key = (source.issue_key, source.source_type, source.source_id)
-        citations.setdefault(
-            key,
-            {"requirement": set(), "acceptance_criterion": set()},
-        )[layer].add(item_id)
-
-    for requirement in plan.requirements:
-        for source in requirement.jira_sources:
-            add(source, "requirement", requirement.id)
-        for criterion in requirement.acceptance_criteria:
-            for source in criterion.jira_sources:
-                add(source, "acceptance_criterion", criterion.id)
-    return citations
-
-
-def _validate_required_role_matrix(
-    plan: PlanSpec,
-    snapshot: RequirementsSnapshot,
-) -> None:
-    citations = _active_plan_citations(plan)
-    entries_by_role: dict[str, list[RoleStateMatrixEntry]] = {
-        role: [] for role in _CANONICAL_ROLE_ORDER
-    }
-    for entry in plan.role_state_matrix:
-        if entry.canonical_role in entries_by_role:
-            entries_by_role[entry.canonical_role].append(entry)
-
-    missing: list[str] = []
-    missing_roles: set[str] = set()
-
-    def require_role_bindings(
-        *,
-        source_key: tuple[str, str, str],
-        roles: set[str],
-        layers: tuple[str, ...],
-    ) -> None:
-        source_citations = citations.get(source_key)
-        if source_citations is None:
-            return
-        for role in _CANONICAL_ROLE_ORDER:
-            if role not in roles:
-                continue
-            matching_entries = entries_by_role[role]
-            for layer in layers:
-                id_field = (
-                    "requirement_ids"
-                    if layer == "requirement"
-                    else "acceptance_criterion_ids"
-                )
-                represented_ids = {
-                    item_id
-                    for entry in matching_entries
-                    for item_id in getattr(entry, id_field)
-                }
-                missing_ids = sorted(source_citations[layer] - represented_ids)
-                if missing_ids:
-                    missing_roles.add(role)
-                    issue_key, source_type, source_id = source_key
-                    missing.append(
-                        f"{issue_key}:{source_type}:{source_id} requires "
-                        f"{_CANONICAL_ROLE_LABELS[role]} {layer} ID(s) "
-                        f"{', '.join(missing_ids)} (canonical Jira role: "
-                        f"{_CANONICAL_ROLE_LABELS[role]})"
-                    )
-
-    for decision in snapshot.current_requirements:
-        roles = _detect_canonical_roles(decision.text)
-        if not roles:
-            continue
-        if decision.kind == "requirement":
-            layers = ("requirement",)
-        elif decision.kind == "acceptance_criterion":
-            layers = ("acceptance_criterion",)
-        else:
-            layers = ("requirement", "acceptance_criterion")
-        for source in decision.sources:
-            require_role_bindings(
-                source_key=(
-                    source.issue_identifier,
-                    source.source_type,
-                    source.source_id,
-                ),
-                roles=roles,
-                layers=layers,
-            )
-
-    for attachment in _complete_snapshot_attachments(snapshot):
-        roles = _detect_attachment_summary_roles(attachment.analysis.summary)
-        if not roles:
-            continue
-        require_role_bindings(
-            source_key=(
-                attachment.source.issue_identifier,
-                "attachment",
-                attachment.source.source_id,
-            ),
-            roles=roles,
-            layers=("requirement", "acceptance_criterion"),
-        )
-
-    if missing:
-        role_summary = ", ".join(
-            _CANONICAL_ROLE_LABELS[role]
-            for role in _CANONICAL_ROLE_ORDER
-            if role in missing_roles
-        )
-        raise PlanSpecError(
-            "PlanSpec role_state_matrix must contain distinct entries for each "
-            f"source-citing ID. Required canonical Jira roles: {role_summary}. "
-            f"Details: {'; '.join(missing)}"
-        )
-
-
 def _validate_epic_child_issue_keys(
     plan: PlanSpec,
     snapshot: RequirementsSnapshot,
@@ -867,41 +693,38 @@ def _validate_epic_child_issue_keys(
 
 
 def _snapshot_source_keys(snapshot: RequirementsSnapshot) -> set[tuple[str, str, str]]:
-    keys: set[tuple[str, str, str]] = set()
+    root_issue = snapshot.issue_identifier
+    root_sources = []
+    if snapshot.description is not None and snapshot.description.planning_eligible:
+        root_sources.append(snapshot.description.source)
+    root_sources.extend(
+        artifact.source
+        for artifact in snapshot.custom_fields
+        if artifact.planning_eligible and artifact.kind == "acceptance_criterion"
+    )
+    root_sources.extend(
+        artifact.source
+        for artifact in snapshot.comments
+        if artifact.planning_eligible
+    )
+    base_keys = {
+        (source.issue_identifier, source.source_type, source.source_id)
+        for source in root_sources
+        if source.issue_identifier == root_issue
+        and source.source_type in _ACTIVE_JIRA_SOURCE_TYPES
+    }
+    keys = set(base_keys)
 
-    def add_source(source: Any, source_type: str) -> None:
-        if source is not None:
-            keys.add((source.issue_identifier, source_type, source.source_id))
+    def is_allowed_decision_source(source: Any) -> bool:
+        return source.issue_identifier == root_issue and any(
+            source.source_type == source_type
+            and (
+                source.source_id == source_id
+                or source.source_id.startswith(f"{source_id}#unit:")
+            )
+            for _, source_type, source_id in base_keys
+        )
 
-    def add_direct_source(source: Any) -> None:
-        if source is not None and source.source_type != "relation":
-            add_source(source, source.source_type)
-
-    def add_related_issue(relation: Any, relationship_type: str) -> None:
-        add_source(relation.source, relationship_type)
-        for artifact in relation.requirements:
-            add_source(artifact.source, artifact.source_type)
-        for comment in relation.comments:
-            add_source(comment.source, "comment")
-        for attachment in relation.attachments:
-            add_source(attachment.source, "attachment")
-
-    if snapshot.description:
-        add_source(snapshot.description.source, "description")
-    for artifact in snapshot.custom_fields:
-        add_source(artifact.source, "custom_field")
-    for artifact in snapshot.comments:
-        add_source(artifact.source, "comment")
-    for attachment in snapshot.attachments:
-        add_source(attachment.source, "attachment")
-    if snapshot.parent:
-        add_related_issue(snapshot.parent, "parent")
-    for relation in snapshot.children:
-        add_related_issue(relation, "child")
-    for relation in snapshot.linked_issues:
-        add_related_issue(relation, "linked_issue")
-    for relation in snapshot.dependencies:
-        add_related_issue(relation, "dependency")
     for decision in (
         snapshot.current_requirements
         + snapshot.superseded_requirements
@@ -909,11 +732,14 @@ def _snapshot_source_keys(snapshot: RequirementsSnapshot) -> set[tuple[str, str,
         + snapshot.unresolved_contradictions
     ):
         for source in decision.sources:
-            add_direct_source(source)
-    for value in snapshot.components:
-        keys.add((snapshot.issue_identifier, "component", value.id or value.name))
-    for value in snapshot.versions:
-        keys.add((snapshot.issue_identifier, "version", value.id or value.name))
+            if is_allowed_decision_source(source):
+                keys.add(
+                    (
+                        source.issue_identifier,
+                        source.source_type,
+                        source.source_id,
+                    )
+                )
     return keys
 
 
@@ -922,6 +748,11 @@ def _validate_current_decision_coverage(
     snapshot: RequirementsSnapshot,
 ) -> None:
     """Require active plan rows to cover current decisions in their matching layer."""
+
+    allowed_source_keys = _snapshot_source_keys(snapshot)
+    allow_base_artifact_citations = (
+        snapshot.schema_version in _LEGACY_REQUIREMENTS_SCHEMA_VERSIONS
+    )
 
     requirement_sources = {
         (source.issue_key, source.source_type, source.source_id)
@@ -938,7 +769,10 @@ def _validate_current_decision_coverage(
     current_source_keys = {
         (source.issue_identifier, source.source_type, source.source_id)
         for decision in snapshot.current_requirements
+        if decision.kind != "supporting_evidence"
         for source in decision.sources
+        if (source.issue_identifier, source.source_type, source.source_id)
+        in allowed_source_keys
     }
     non_current_sources: dict[tuple[str, str, str], set[str]] = {}
     for classification, decisions in (
@@ -948,6 +782,12 @@ def _validate_current_decision_coverage(
     ):
         for decision in decisions:
             for source in decision.sources:
+                if (
+                    source.issue_identifier,
+                    source.source_type,
+                    source.source_id,
+                ) not in allowed_source_keys:
+                    continue
                 key = (
                     source.issue_identifier,
                     source.source_type,
@@ -956,17 +796,38 @@ def _validate_current_decision_coverage(
                 non_current_sources.setdefault(key, set()).add(classification)
 
     promoted_sources = sorted(
-        (requirement_sources | acceptance_sources)
-        & (set(non_current_sources) - current_source_keys)
+        source_key
+        for source_key in requirement_sources | acceptance_sources
+        if any(
+            _source_keys_match_decision(
+                source_key,
+                non_current_key,
+                allow_base_artifact_citations=allow_base_artifact_citations,
+            )
+            for non_current_key in non_current_sources
+        )
+        and not any(
+            _source_keys_match_decision(
+                source_key,
+                current_key,
+                allow_base_artifact_citations=allow_base_artifact_citations,
+            )
+            for current_key in current_source_keys
+        )
     )
     if promoted_sources:
-        formatted = ", ".join(
-            (
-                f"{issue_key}:{source_type}:{source_id} "
-                f"({'/'.join(sorted(non_current_sources[(issue_key, source_type, source_id)]))})"
+        formatted_sources: list[str] = []
+        for issue_key, source_type, source_id in promoted_sources:
+            classifications = _classifications_for_source(
+                (issue_key, source_type, source_id),
+                non_current_sources,
+                allow_base_artifact_citations=allow_base_artifact_citations,
             )
-            for issue_key, source_type, source_id in promoted_sources
-        )
+            formatted_sources.append(
+                f"{issue_key}:{source_type}:{source_id} "
+                f"({'/'.join(sorted(classifications))})"
+            )
+        formatted = ", ".join(formatted_sources)
         raise PlanSpecError(
             "PlanSpec active requirements or acceptance criteria cite non-current Jira "
             f"decision sources: {formatted}"
@@ -979,21 +840,26 @@ def _validate_current_decision_coverage(
         decision_sources = {
             (source.issue_identifier, source.source_type, source.source_id)
             for source in decision.sources
+            if (source.issue_identifier, source.source_type, source.source_id)
+            in allowed_source_keys
         }
+        if not decision_sources:
+            continue
         cited_sources = (
             requirement_sources
             if decision.kind == "requirement"
             else acceptance_sources
         )
-        missing_sources = sorted(decision_sources - cited_sources)
-        if not decision_sources:
-            uncovered.append(f"{decision.id} (no Jira sources)")
-        elif missing_sources:
+        if not _source_sets_overlap(
+            cited_sources,
+            decision_sources,
+            allow_base_artifact_citations=allow_base_artifact_citations,
+        ):
             formatted_sources = ", ".join(
                 f"{issue_key}:{source_type}:{source_id}"
-                for issue_key, source_type, source_id in missing_sources
+                for issue_key, source_type, source_id in sorted(decision_sources)
             )
-            uncovered.append(f"{decision.id} (missing {formatted_sources})")
+            uncovered.append(f"{decision.id} (cite one of {formatted_sources})")
 
     if uncovered:
         raise PlanSpecError(
@@ -1004,18 +870,18 @@ def _validate_current_decision_coverage(
     current_requirement_sources = {
         (source.issue_identifier, source.source_type, source.source_id)
         for decision in snapshot.current_requirements
-        for source in decision.sources
         if decision.kind == "requirement"
-        or (
-            decision.kind == "supporting_evidence"
-            and source.source_type == "attachment"
-        )
+        for source in decision.sources
+        if (source.issue_identifier, source.source_type, source.source_id)
+        in allowed_source_keys
     }
     current_acceptance_sources = {
         (source.issue_identifier, source.source_type, source.source_id)
         for decision in snapshot.current_requirements
         if decision.kind == "acceptance_criterion"
         for source in decision.sources
+        if (source.issue_identifier, source.source_type, source.source_id)
+        in allowed_source_keys
     }
 
     def cites_current_decision(
@@ -1026,7 +892,11 @@ def _validate_current_decision_coverage(
             (source.issue_key, source.source_type, source.source_id)
             for source in sources
         }
-        return bool(source_keys & matching_sources)
+        return _source_sets_overlap(
+            source_keys,
+            matching_sources,
+            allow_base_artifact_citations=allow_base_artifact_citations,
+        )
 
     unanchored_requirements = [
         requirement.id
@@ -1055,8 +925,156 @@ def _validate_current_decision_coverage(
                 + ", ".join(unanchored_acceptance_criteria)
             )
         raise PlanSpecError(
-            "Every PlanRequirement and AcceptanceCriterion must cite a matching-layer current "
-            f"Jira decision source: {'; '.join(details)}"
+            "Every PlanRequirement and AcceptanceCriterion must cite a matching-layer "
+            f"current authoritative Jira decision source: {'; '.join(details)}"
+        )
+
+
+def _source_keys_refer_to_same_artifact(
+    left: tuple[str, str, str],
+    right: tuple[str, str, str],
+) -> bool:
+    """Preserve pre-v4 base-artifact/unit citation equivalence."""
+
+    if left[:2] != right[:2]:
+        return False
+    left_id = left[2]
+    right_id = right[2]
+    return (
+        left_id == right_id
+        or left_id.startswith(f"{right_id}#unit:")
+        or right_id.startswith(f"{left_id}#unit:")
+    )
+
+
+def _source_keys_match_decision(
+    left: tuple[str, str, str],
+    right: tuple[str, str, str],
+    *,
+    allow_base_artifact_citations: bool,
+) -> bool:
+    if not allow_base_artifact_citations:
+        return left == right
+    return _source_keys_refer_to_same_artifact(left, right)
+
+
+def _source_sets_overlap(
+    left: set[tuple[str, str, str]],
+    right: set[tuple[str, str, str]],
+    *,
+    allow_base_artifact_citations: bool,
+) -> bool:
+    return any(
+        _source_keys_match_decision(
+            left_key,
+            right_key,
+            allow_base_artifact_citations=allow_base_artifact_citations,
+        )
+        for left_key in left
+        for right_key in right
+    )
+
+
+def _classifications_for_source(
+    source_key: tuple[str, str, str],
+    classified_sources: dict[tuple[str, str, str], set[str]],
+    *,
+    allow_base_artifact_citations: bool,
+) -> set[str]:
+    return {
+        classification
+        for classified_key, classifications in classified_sources.items()
+        if _source_keys_match_decision(
+            source_key,
+            classified_key,
+            allow_base_artifact_citations=allow_base_artifact_citations,
+        )
+        for classification in classifications
+    }
+
+
+def _normalize_repository_identity(value: str) -> str:
+    """Return one stable POSIX identity for a workspace-relative repository."""
+
+    path = PurePosixPath(value.replace("\\", "/"))
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            f"repository {value!r} must be a workspace-relative path without '..'"
+        )
+    return path.as_posix()
+
+
+def _normalize_current_plan_repository_identities(plan: PlanSpec) -> None:
+    """Canonicalize current PlanSpec repository names and reject aliases."""
+
+    repositories = plan.affected_surface.repositories
+    normalized_repositories = [
+        _normalize_repository_identity(repository) for repository in repositories
+    ]
+    _reject_repository_aliases(
+        repositories,
+        normalized_repositories,
+        "affected repositories",
+    )
+
+    baseline_repositories = [
+        baseline.repository for baseline in plan.baseline_repository_shas
+    ]
+    normalized_baseline_repositories = [
+        _normalize_repository_identity(repository)
+        for repository in baseline_repositories
+    ]
+    _reject_repository_aliases(
+        baseline_repositories,
+        normalized_baseline_repositories,
+        "baseline repositories",
+    )
+    _require_exact_members(
+        normalized_baseline_repositories,
+        normalized_repositories,
+        "baseline repository SHAs must cover exactly the affected repositories",
+    )
+
+    plan.affected_surface.repositories = normalized_repositories
+    for baseline, normalized in zip(
+        plan.baseline_repository_shas,
+        normalized_baseline_repositories,
+        strict=True,
+    ):
+        baseline.repository = normalized
+    for impact in (
+        plan.affected_surface.files
+        + plan.affected_surface.apis
+        + plan.affected_surface.schemas
+        + plan.affected_surface.migrations
+        + plan.affected_surface.translations
+    ):
+        impact.repository = _normalize_repository_identity(impact.repository)
+    for precedent in plan.existing_precedents:
+        precedent.repository = _normalize_repository_identity(precedent.repository)
+
+
+def _reject_repository_aliases(
+    raw_values: list[str],
+    normalized_values: list[str],
+    label: str,
+) -> None:
+    aliases: dict[str, list[str]] = {}
+    for raw, normalized in zip(raw_values, normalized_values, strict=True):
+        aliases.setdefault(normalized, []).append(raw)
+    duplicates = {
+        normalized: values
+        for normalized, values in aliases.items()
+        if len(values) > 1
+    }
+    if duplicates:
+        details = "; ".join(
+            f"{normalized!r}: {', '.join(repr(value) for value in values)}"
+            for normalized, values in sorted(duplicates.items())
+        )
+        raise PlanSpecError(
+            f"{label} contain aliases that resolve to the same workspace-relative "
+            f"identity: {details}"
         )
 
 
