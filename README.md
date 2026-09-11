@@ -21,6 +21,11 @@ whatever the local `codex` CLI already uses.
 
 ## Commands
 
+Run these commands from `python/`. `WORKFLOW.md` configures the development
+orchestrator: planning, human approval, implementation, code review, and handoff.
+Test execution is optional, and later human feedback resumes the saved context.
+See the [Python workflow guide](python/README.md) for configuration and dashboard usage.
+
 ```bash
 python3 -m symphony_jira validate ./WORKFLOW.md
 python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100 --dry-run
@@ -28,4 +33,3 @@ python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100
 python3 -m symphony_jira run ./WORKFLOW.md
 python3 -m symphony_jira dashboard ./WORKFLOW.md --port 3333
 ```
-
