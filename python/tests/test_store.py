@@ -7,10 +7,6 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from symphony_jira.automation_plan import (
-    AutomationPlan,
-    automation_result_content_hash,
-)
 from symphony_jira.models import Issue, RequirementsSnapshot
 from symphony_jira.store import (
     HUMAN_INPUT_CLAIM_LEASE,
@@ -21,321 +17,33 @@ from symphony_jira.store import (
 
 
 class StoreHumanInputTests(unittest.TestCase):
-    def test_verification_bypass_input_persists_structured_integrity_bindings(self) -> None:
+    def test_dev_schema_keeps_existing_runs_without_recreating_retired_features(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            issue = make_issue()
-            run = store.create_run(issue, root / "workspace", branch_name=None)
-            run = store.update_run(
-                run.id,
-                status="blocked",
-                blocked_phase="verification",
-                verification_status="test_failed",
-                verification_output_path=str(root / "workspace" / "verification.json"),
-                verification_workspace_diff_hash="a" * 64,
-                verification_evidence_sha256="b" * 64,
-            )
+            database = root / "db.sqlite3"
+            store = Store(database)
+            run = store.create_run(make_issue(), root / "workspace", branch_name=None)
+            with sqlite3.connect(database) as conn:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )}
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+                self.assertNotIn("automation_plan_approvals", tables)
+                self.assertFalse(any(name.startswith("automation_") for name in columns))
+                self.assertTrue({"plan_spec_hash", "plan_approval_id", "verification_status"} <= columns)
+                # Old data stays on disk, while the active run model ignores it.
+                conn.execute("ALTER TABLE runs ADD COLUMN retired_context TEXT")
+                conn.execute("UPDATE runs SET retired_context = 'preserved' WHERE id = ?", (run.id,))
+            restarted = Store(database)
+            restored = restarted.get_run(run.id)
+            self.assertEqual(restored.workspace_path, run.workspace_path)
+            self.assertNotIn("retired_context", restored.model_dump())
+            with sqlite3.connect(database) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT retired_context FROM runs WHERE id = ?", (run.id,)
+                ).fetchone()[0], "preserved")
 
-            pending = store.add_verification_bypass_input(
-                "T-1",
-                run_id=run.id,
-                approver_identity="  operator@example.test  ",
-                workspace_diff_hash="a" * 64,
-                verification_evidence_sha256="B" * 64,
-                question="Tests failed",
-            )
-            claimed = store.claim_human_input(pending["id"])
 
-            self.assertEqual(pending["action"], "verification_bypass")
-            self.assertEqual(
-                pending["approver_identity"],
-                "operator@example.test",
-            )
-            self.assertEqual(pending["workspace_diff_hash"], "a" * 64)
-            self.assertEqual(
-                pending["verification_evidence_sha256"],
-                "b" * 64,
-            )
-            assert claimed is not None
-            self.assertEqual(claimed["action"], "verification_bypass")
-            self.assertEqual(
-                claimed["verification_evidence_sha256"],
-                "b" * 64,
-            )
-
-    def test_verification_bypass_input_is_transactionally_fenced_to_run_binding(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            run = store.create_run(
-                make_issue(),
-                root / "workspace",
-                branch_name=None,
-            )
-            run = store.update_run(
-                run.id,
-                status="blocked",
-                blocked_phase="verification",
-                verification_status="test_failed",
-                verification_output_path=str(root / "workspace" / "verification.json"),
-                verification_workspace_diff_hash="a" * 64,
-                verification_evidence_sha256="b" * 64,
-            )
-
-            with self.assertRaisesRegex(
-                ValueError,
-                "does not match the failed run integrity binding",
-            ):
-                store.add_verification_bypass_input(
-                    "T-1",
-                    run_id=run.id,
-                    approver_identity="operator@example.test",
-                    workspace_diff_hash="c" * 64,
-                    verification_evidence_sha256="b" * 64,
-                )
-
-            self.assertEqual(store.list_human_inputs(run_id=run.id), [])
-
-    def test_store_migrates_verification_integrity_binding_columns(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "legacy.sqlite3"
-            with sqlite3.connect(db_path) as conn:
-                conn.execute(
-                    """
-                    CREATE TABLE runs (
-                      id TEXT PRIMARY KEY,
-                      issue_id TEXT NOT NULL,
-                      issue_identifier TEXT NOT NULL,
-                      issue_fingerprint TEXT,
-                      workspace_path TEXT NOT NULL,
-                      status TEXT NOT NULL,
-                      attempt INTEGER NOT NULL,
-                      started_at TEXT NOT NULL,
-                      plan_spec_hash TEXT,
-                      plan_approval_id TEXT,
-                      finished_at TEXT,
-                      final_message TEXT,
-                      error TEXT,
-                      blocked_phase TEXT,
-                      branch_name TEXT,
-                      verification_status TEXT,
-                      verification_output_path TEXT
-                    )
-                    """
-                )
-
-            Store(db_path)
-
-            with sqlite3.connect(db_path) as conn:
-                columns = {
-                    row[1]
-                    for row in conn.execute("PRAGMA table_info(runs)").fetchall()
-                }
-                human_input_columns = {
-                    row[1]
-                    for row in conn.execute(
-                        "PRAGMA table_info(human_inputs)"
-                    ).fetchall()
-                }
-                automation_approval_columns = {
-                    row[1]
-                    for row in conn.execute(
-                        "PRAGMA table_info(automation_plan_approvals)"
-                    ).fetchall()
-                }
-            self.assertIn("verification_workspace_diff_hash", columns)
-            self.assertIn("verification_evidence_sha256", columns)
-            self.assertIn("automation_plan_hash", columns)
-            self.assertIn("automation_development_diff_hash", columns)
-            self.assertIn("automation_repository_diff_hash", columns)
-            self.assertIn("automation_result_hash", columns)
-            self.assertIn("automation_plan_approval_id", columns)
-            self.assertIn(
-                "automation_plan_approval_id",
-                human_input_columns,
-            )
-            self.assertTrue(
-                {
-                    "automation_plan_hash",
-                    "requirements_snapshot_hash",
-                    "development_plan_spec_hash",
-                    "development_plan_approval_id",
-                    "development_workspace_diff_hash",
-                    "automation_repository_diff_hash",
-                    "invalidated_at",
-                    "invalidation_reason",
-                }.issubset(automation_approval_columns)
-            )
-
-    def test_automation_approval_is_atomic_exact_and_resumable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            issue = make_issue()
-            run = store.create_run(issue, root / "workspace", branch_name=None)
-            requirements_hash = run.issue_fingerprint or ""
-            development_approval = store.add_plan_approval(
-                issue.identifier,
-                run_id=run.id,
-                approver_identity="dev-owner@example.test",
-                plan_spec_hash="a" * 64,
-                requirements_snapshot_hash=requirements_hash,
-            )
-            run = store.update_run(
-                run.id,
-                status="blocked",
-                blocked_phase="automation_planning_approval",
-                automation_plan_hash="b" * 64,
-                automation_development_diff_hash="c" * 64,
-                automation_repository_diff_hash="d" * 64,
-                automation_result_hash="e" * 64,
-            )
-
-            pending, approval = store.add_approved_automation_human_input(
-                issue.identifier,
-                run_id=run.id,
-                approver_identity="  automation-owner@example.test  ",
-                automation_plan_hash="B" * 64,
-                requirements_snapshot_hash=requirements_hash,
-                development_plan_spec_hash="a" * 64,
-                development_plan_approval_id=development_approval["id"],
-                development_workspace_diff_hash="c" * 64,
-                automation_repository_diff_hash="d" * 64,
-                question="Approve this exact AutomationPlan?",
-            )
-
-            persisted_run = store.get_run(run.id)
-            assert persisted_run is not None
-            self.assertEqual(
-                persisted_run.plan_approval_id,
-                development_approval["id"],
-            )
-            self.assertEqual(
-                persisted_run.automation_plan_approval_id,
-                approval["id"],
-            )
-            self.assertIsNone(persisted_run.automation_result_hash)
-            self.assertEqual(pending["action"], "automation_plan_approval")
-            self.assertIsNone(pending["approval_id"])
-            self.assertEqual(
-                pending["automation_plan_approval_id"],
-                approval["id"],
-            )
-            self.assertEqual(
-                approval["development_plan_approval_id"],
-                development_approval["id"],
-            )
-            self.assertEqual(
-                store.get_automation_plan_approval(approval["id"]),
-                approval,
-            )
-            self.assertEqual(
-                store.latest_automation_plan_approval_for_run(
-                    run.id,
-                    active_only=True,
-                ),
-                approval,
-            )
-            listed_input = store.list_human_inputs(run_id=run.id)[0]
-            self.assertEqual(
-                listed_input["automation_plan_hash"],
-                "b" * 64,
-            )
-            self.assertEqual(
-                listed_input["automation_plan_approval_id"],
-                approval["id"],
-            )
-            claimed = store.claim_human_input(pending["id"])
-            assert claimed is not None
-            reserved, status = store.reserve_human_resume(
-                issue,
-                root / "workspace",
-                input_id=pending["id"],
-                claim_token=claimed["claim_token"],
-                expected_predecessor_run_id=run.id,
-                branch_name=None,
-                attempt=2,
-            )
-            self.assertEqual(status, "reserved")
-            assert reserved is not None
-            self.assertEqual(
-                reserved.automation_plan_approval_id,
-                approval["id"],
-            )
-            self.assertEqual(
-                store.resolve_active_automation_plan_approval(
-                    reserved.id,
-                    automation_plan_hash="b" * 64,
-                    requirements_snapshot_hash=requirements_hash,
-                    development_plan_spec_hash="a" * 64,
-                    development_plan_approval_id=development_approval["id"],
-                    development_workspace_diff_hash="c" * 64,
-                    automation_repository_diff_hash="d" * 64,
-                ),
-                approval,
-            )
-            self.assertIsNone(
-                store.resolve_active_automation_plan_approval(
-                    reserved.id,
-                    automation_plan_hash="f" * 64,
-                    requirements_snapshot_hash=requirements_hash,
-                    development_plan_spec_hash="a" * 64,
-                    development_plan_approval_id=development_approval["id"],
-                    development_workspace_diff_hash="c" * 64,
-                    automation_repository_diff_hash="d" * 64,
-                )
-            )
-            invalidated = store.get_automation_plan_approval(approval["id"])
-            assert invalidated is not None
-            self.assertIn(
-                "AutomationPlan changed after approval",
-                invalidated["invalidation_reason"],
-            )
-
-    def test_automation_approval_rejects_the_wrong_phase_without_orphans(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            run = store.create_run(
-                make_issue(),
-                root / "workspace",
-                branch_name=None,
-            )
-            run = store.update_run(
-                run.id,
-                status="blocked",
-                blocked_phase="automation_planning",
-                plan_spec_hash="a" * 64,
-                automation_plan_hash="b" * 64,
-                automation_development_diff_hash="c" * 64,
-                automation_repository_diff_hash="d" * 64,
-            )
-
-            with self.assertRaisesRegex(
-                ValueError,
-                "not blocked for automation plan approval",
-            ):
-                store.add_approved_automation_human_input(
-                    "T-1",
-                    run_id=run.id,
-                    approver_identity="automation-owner@example.test",
-                    automation_plan_hash="b" * 64,
-                    requirements_snapshot_hash=run.issue_fingerprint or "",
-                    development_plan_spec_hash="a" * 64,
-                    development_plan_approval_id=None,
-                    development_workspace_diff_hash="c" * 64,
-                    automation_repository_diff_hash="d" * 64,
-                )
-
-            self.assertEqual(
-                store.list_automation_plan_approvals(run_id=run.id),
-                [],
-            )
-            self.assertEqual(store.list_human_inputs(run_id=run.id), [])
-            persisted_run = store.get_run(run.id)
-            assert persisted_run is not None
-            self.assertIsNone(persisted_run.automation_plan_approval_id)
 
     def test_only_latest_run_overall_is_actionable_even_if_older_run_finishes_later(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -506,233 +214,6 @@ class StoreHumanInputTests(unittest.TestCase):
 
             self.assertEqual(store.list_plan_approvals(run_id=run.id), [])
 
-    def test_atomic_resume_reservation_inherits_lineage_and_consumes_once(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            issue = make_issue()
-            predecessor = store.create_run(issue, root / "workspace", branch_name="codex/T-1")
-            predecessor = store.update_run(
-                predecessor.id,
-                status="blocked",
-                blocked_phase="implementation",
-                plan_spec_hash="a" * 64,
-                plan_approval_id="approval-1",
-                automation_plan_hash="b" * 64,
-                automation_development_diff_hash="c" * 64,
-                automation_repository_diff_hash="d" * 64,
-                automation_result_hash="e" * 64,
-            )
-            pending = store.add_human_input(
-                "T-1",
-                run_id=predecessor.id,
-                response="Use option A",
-            )
-            claimed = store.claim_human_input(pending["id"])
-            assert claimed is not None
-
-            reserved, status = store.reserve_human_resume(
-                issue,
-                root / "workspace",
-                input_id=pending["id"],
-                claim_token=claimed["claim_token"],
-                expected_predecessor_run_id=predecessor.id,
-                branch_name="codex/T-1",
-                attempt=2,
-            )
-
-            self.assertEqual(status, "reserved")
-            assert reserved is not None
-            self.assertEqual(reserved.status, "queued")
-            self.assertEqual(reserved.plan_spec_hash, "a" * 64)
-            self.assertEqual(reserved.plan_approval_id, "approval-1")
-            self.assertEqual(reserved.automation_plan_hash, "b" * 64)
-            self.assertEqual(
-                reserved.automation_development_diff_hash,
-                "c" * 64,
-            )
-            self.assertEqual(
-                reserved.automation_repository_diff_hash,
-                "d" * 64,
-            )
-            self.assertEqual(reserved.automation_result_hash, "e" * 64)
-            self.assertEqual(store.latest_run_for_issue("T-1").id, reserved.id)
-            persisted_input = store.list_human_inputs(run_id=predecessor.id)[0]
-            self.assertIsNotNone(persisted_input["consumed_at"])
-            self.assertIsNone(persisted_input["claim_token"])
-            self.assertIsNone(store.claim_human_input(pending["id"]))
-            self.assertEqual(store.list_recoverable_human_resume_run_ids(), [reserved.id])
-
-    def test_reserved_resume_is_recoverable_after_restart_and_stale_owner_is_fenced(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            first_store = Store(root / "db.sqlite3")
-            restarted_store = Store(root / "db.sqlite3")
-            issue = make_issue()
-            predecessor = first_store.create_run(issue, root / "workspace", branch_name=None)
-            predecessor = first_store.update_run(
-                predecessor.id,
-                status="blocked",
-                blocked_phase="implementation",
-                plan_spec_hash="a" * 64,
-                plan_approval_id="approval-1",
-                automation_plan_hash="b" * 64,
-                automation_development_diff_hash="c" * 64,
-                automation_repository_diff_hash="d" * 64,
-                automation_result_hash="e" * 64,
-            )
-            pending = first_store.add_human_input(
-                "T-1", run_id=predecessor.id, response="recover this exact response"
-            )
-            claimed = first_store.claim_human_input(pending["id"])
-            assert claimed is not None
-            reserved, status = first_store.reserve_human_resume(
-                issue,
-                root / "workspace",
-                input_id=pending["id"],
-                claim_token=claimed["claim_token"],
-                expected_predecessor_run_id=predecessor.id,
-                branch_name=None,
-                attempt=2,
-            )
-            self.assertEqual(status, "reserved")
-            assert reserved is not None
-            first_claimed_at = datetime.now(timezone.utc)
-            first_handoff = first_store.claim_human_resume_handoff(
-                reserved.id, now=first_claimed_at
-            )
-            assert first_handoff is not None
-            first_started = first_store.start_human_resume_run(
-                reserved.id,
-                first_handoff["handoff_claim_token"],
-                now=first_claimed_at,
-            )
-            assert first_started is not None
-            self.assertEqual(first_started.status, "running")
-            advanced = first_store.update_owned_human_resume_run(
-                reserved.id,
-                first_handoff["handoff_claim_token"],
-                now=first_claimed_at,
-                plan_spec_hash="f" * 64,
-                automation_plan_hash="1" * 64,
-                automation_development_diff_hash="2" * 64,
-                automation_repository_diff_hash="3" * 64,
-                automation_result_hash="4" * 64,
-                plan_approval_id="approval-2",
-            )
-            assert advanced is not None
-            self.assertEqual(advanced.plan_spec_hash, "f" * 64)
-            self.assertEqual(advanced.automation_plan_hash, "1" * 64)
-            self.assertEqual(advanced.automation_development_diff_hash, "2" * 64)
-            self.assertEqual(advanced.automation_repository_diff_hash, "3" * 64)
-            self.assertEqual(advanced.automation_result_hash, "4" * 64)
-            self.assertEqual(advanced.plan_approval_id, "approval-2")
-
-            self.assertIsNone(
-                restarted_store.claim_human_resume_handoff(
-                    reserved.id,
-                    now=first_claimed_at + HUMAN_RESUME_HANDOFF_LEASE - timedelta(seconds=1),
-                )
-            )
-            expired_at = (
-                first_claimed_at + HUMAN_RESUME_HANDOFF_LEASE + timedelta(seconds=1)
-            )
-            self.assertFalse(
-                first_store.renew_human_resume_handoff(
-                    reserved.id,
-                    first_handoff["handoff_claim_token"],
-                    now=expired_at,
-                )
-            )
-            self.assertIsNone(
-                first_store.update_owned_human_resume_run(
-                    reserved.id,
-                    first_handoff["handoff_claim_token"],
-                    now=expired_at,
-                    status="completed",
-                    finished_at=expired_at,
-                )
-            )
-            self.assertEqual(first_store.get_run(reserved.id).status, "running")
-            recovered = restarted_store.claim_human_resume_handoff(
-                reserved.id,
-                now=expired_at,
-            )
-            assert recovered is not None
-            self.assertEqual(recovered["response"], "recover this exact response")
-            self.assertEqual(recovered["predecessor_run_id"], predecessor.id)
-            self.assertEqual(recovered["resume_run_id"], reserved.id)
-            self.assertNotEqual(
-                recovered["handoff_claim_token"], first_handoff["handoff_claim_token"]
-            )
-            recovered_run = restarted_store.get_run(reserved.id)
-            assert recovered_run is not None
-            self.assertEqual(recovered_run.status, "queued")
-            self.assertEqual(recovered_run.plan_spec_hash, predecessor.plan_spec_hash)
-            self.assertEqual(
-                recovered_run.automation_plan_hash,
-                predecessor.automation_plan_hash,
-            )
-            self.assertEqual(
-                recovered_run.automation_development_diff_hash,
-                predecessor.automation_development_diff_hash,
-            )
-            self.assertEqual(
-                recovered_run.automation_repository_diff_hash,
-                predecessor.automation_repository_diff_hash,
-            )
-            self.assertEqual(
-                recovered_run.automation_result_hash,
-                predecessor.automation_result_hash,
-            )
-            self.assertEqual(
-                recovered_run.plan_approval_id,
-                predecessor.plan_approval_id,
-            )
-            self.assertFalse(
-                first_store.renew_human_resume_handoff(
-                    reserved.id, first_handoff["handoff_claim_token"]
-                )
-            )
-            self.assertIsNone(
-                first_store.update_owned_human_resume_run(
-                    reserved.id,
-                    first_handoff["handoff_claim_token"],
-                    status="completed",
-                    finished_at=datetime.now(timezone.utc),
-                )
-            )
-            recovered_started = restarted_store.start_human_resume_run(
-                reserved.id,
-                recovered["handoff_claim_token"],
-                now=expired_at,
-            )
-            assert recovered_started is not None
-            self.assertEqual(recovered_started.status, "running")
-            completed = restarted_store.update_owned_human_resume_run(
-                reserved.id,
-                recovered["handoff_claim_token"],
-                now=expired_at,
-                status="completed",
-                finished_at=expired_at,
-            )
-            assert completed is not None
-            self.assertEqual(completed.status, "completed")
-            self.assertIsNone(
-                restarted_store.update_owned_human_resume_run(
-                    reserved.id,
-                    recovered["handoff_claim_token"],
-                    now=expired_at,
-                    final_message="must not overwrite terminal state",
-                )
-            )
-            persisted = restarted_store.get_run(reserved.id)
-            assert persisted is not None
-            self.assertIsNone(persisted.final_message)
-            self.assertEqual(restarted_store.list_recoverable_human_resume_run_ids(), [])
-            retired_handoff = restarted_store.get_human_resume_handoff(reserved.id)
-            assert retired_handoff is not None
-            self.assertIsNone(retired_handoff["claim_token"])
 
     def test_atomic_resume_reservation_discards_stale_predecessor_without_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -789,63 +270,195 @@ class StoreHumanInputTests(unittest.TestCase):
             self.assertEqual(first_store.latest_run_for_issue("T-1").id, active.id)
 
 
-class StoreHumanReviewTests(unittest.TestCase):
-    def test_store_migrates_automation_context_columns_for_review_actions(self) -> None:
+    def test_atomic_resume_reservation_inherits_lineage_and_consumes_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "legacy.sqlite3"
-            with sqlite3.connect(db_path) as conn:
-                conn.execute(
-                    """
-                    CREATE TABLE human_review_actions (
-                      id TEXT PRIMARY KEY,
-                      issue_identifier TEXT NOT NULL,
-                      source_run_id TEXT NOT NULL UNIQUE,
-                      result_run_id TEXT NOT NULL UNIQUE,
-                      reviewer_identity TEXT NOT NULL,
-                      source_url TEXT NOT NULL,
-                      comments TEXT NOT NULL,
-                      requirements_snapshot_hash TEXT NOT NULL,
-                      plan_spec_hash TEXT,
-                      plan_spec TEXT,
-                      plan_approval_id TEXT,
-                      approval_json TEXT,
-                      source_final_message TEXT,
-                      source_review TEXT,
-                      source_review_history TEXT,
-                      workspace_diff TEXT NOT NULL,
-                      workspace_diff_hash TEXT NOT NULL,
-                      triage_decision TEXT,
-                      triage_output TEXT,
-                      status TEXT NOT NULL,
-                      claimed_at TEXT,
-                      claim_token TEXT,
-                      started_at TEXT,
-                      finished_at TEXT,
-                      created_at TEXT NOT NULL
-                    )
-                    """
-                )
-
-            Store(db_path)
-
-            with sqlite3.connect(db_path) as conn:
-                columns = {
-                    row[1]
-                    for row in conn.execute(
-                        "PRAGMA table_info(human_review_actions)"
-                    ).fetchall()
-                }
-            self.assertTrue(
-                {
-                    "automation_plan_hash",
-                    "automation_development_diff_hash",
-                    "automation_repository_diff_hash",
-                    "automation_result_hash",
-                    "automation_plan",
-                    "automation_result",
-                    "automation_plan_approval_id",
-                }.issubset(columns)
+            root = Path(tmp)
+            store = Store(root / "db.sqlite3")
+            issue = make_issue()
+            predecessor = store.create_run(issue, root / "workspace", branch_name="codex/T-1")
+            predecessor = store.update_run(
+                predecessor.id,
+                status="blocked",
+                blocked_phase="implementation",
+                plan_spec_hash="a" * 64,
+                plan_approval_id="approval-1",
             )
+            pending = store.add_human_input(
+                "T-1",
+                run_id=predecessor.id,
+                response="Use option A",
+            )
+            claimed = store.claim_human_input(pending["id"])
+            assert claimed is not None
+
+            reserved, status = store.reserve_human_resume(
+                issue,
+                root / "workspace",
+                input_id=pending["id"],
+                claim_token=claimed["claim_token"],
+                expected_predecessor_run_id=predecessor.id,
+                branch_name="codex/T-1",
+                attempt=2,
+            )
+
+            self.assertEqual(status, "reserved")
+            assert reserved is not None
+            self.assertEqual(reserved.status, "queued")
+            self.assertEqual(reserved.plan_spec_hash, "a" * 64)
+            self.assertEqual(reserved.plan_approval_id, "approval-1")
+            self.assertEqual(store.latest_run_for_issue("T-1").id, reserved.id)
+            persisted_input = store.list_human_inputs(run_id=predecessor.id)[0]
+            self.assertIsNotNone(persisted_input["consumed_at"])
+            self.assertIsNone(persisted_input["claim_token"])
+            self.assertIsNone(store.claim_human_input(pending["id"]))
+            self.assertEqual(store.list_recoverable_human_resume_run_ids(), [reserved.id])
+
+
+    def test_reserved_resume_is_recoverable_after_restart_and_stale_owner_is_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_store = Store(root / "db.sqlite3")
+            restarted_store = Store(root / "db.sqlite3")
+            issue = make_issue()
+            predecessor = first_store.create_run(issue, root / "workspace", branch_name=None)
+            predecessor = first_store.update_run(
+                predecessor.id,
+                status="blocked",
+                blocked_phase="implementation",
+                plan_spec_hash="a" * 64,
+                plan_approval_id="approval-1",
+            )
+            pending = first_store.add_human_input(
+                "T-1", run_id=predecessor.id, response="recover this exact response"
+            )
+            claimed = first_store.claim_human_input(pending["id"])
+            assert claimed is not None
+            reserved, status = first_store.reserve_human_resume(
+                issue,
+                root / "workspace",
+                input_id=pending["id"],
+                claim_token=claimed["claim_token"],
+                expected_predecessor_run_id=predecessor.id,
+                branch_name=None,
+                attempt=2,
+            )
+            self.assertEqual(status, "reserved")
+            assert reserved is not None
+            first_claimed_at = datetime.now(timezone.utc)
+            first_handoff = first_store.claim_human_resume_handoff(
+                reserved.id, now=first_claimed_at
+            )
+            assert first_handoff is not None
+            first_started = first_store.start_human_resume_run(
+                reserved.id,
+                first_handoff["handoff_claim_token"],
+                now=first_claimed_at,
+            )
+            assert first_started is not None
+            self.assertEqual(first_started.status, "running")
+            advanced = first_store.update_owned_human_resume_run(
+                reserved.id,
+                first_handoff["handoff_claim_token"],
+                now=first_claimed_at,
+                plan_spec_hash="f" * 64,
+                plan_approval_id="approval-2",
+            )
+            assert advanced is not None
+            self.assertEqual(advanced.plan_spec_hash, "f" * 64)
+            self.assertEqual(advanced.plan_approval_id, "approval-2")
+
+            self.assertIsNone(
+                restarted_store.claim_human_resume_handoff(
+                    reserved.id,
+                    now=first_claimed_at + HUMAN_RESUME_HANDOFF_LEASE - timedelta(seconds=1),
+                )
+            )
+            expired_at = (
+                first_claimed_at + HUMAN_RESUME_HANDOFF_LEASE + timedelta(seconds=1)
+            )
+            self.assertFalse(
+                first_store.renew_human_resume_handoff(
+                    reserved.id,
+                    first_handoff["handoff_claim_token"],
+                    now=expired_at,
+                )
+            )
+            self.assertIsNone(
+                first_store.update_owned_human_resume_run(
+                    reserved.id,
+                    first_handoff["handoff_claim_token"],
+                    now=expired_at,
+                    status="completed",
+                    finished_at=expired_at,
+                )
+            )
+            self.assertEqual(first_store.get_run(reserved.id).status, "running")
+            recovered = restarted_store.claim_human_resume_handoff(
+                reserved.id,
+                now=expired_at,
+            )
+            assert recovered is not None
+            self.assertEqual(recovered["response"], "recover this exact response")
+            self.assertEqual(recovered["predecessor_run_id"], predecessor.id)
+            self.assertEqual(recovered["resume_run_id"], reserved.id)
+            self.assertNotEqual(
+                recovered["handoff_claim_token"], first_handoff["handoff_claim_token"]
+            )
+            recovered_run = restarted_store.get_run(reserved.id)
+            assert recovered_run is not None
+            self.assertEqual(recovered_run.status, "queued")
+            self.assertEqual(recovered_run.plan_spec_hash, predecessor.plan_spec_hash)
+            self.assertEqual(
+                recovered_run.plan_approval_id,
+                predecessor.plan_approval_id,
+            )
+            self.assertFalse(
+                first_store.renew_human_resume_handoff(
+                    reserved.id, first_handoff["handoff_claim_token"]
+                )
+            )
+            self.assertIsNone(
+                first_store.update_owned_human_resume_run(
+                    reserved.id,
+                    first_handoff["handoff_claim_token"],
+                    status="completed",
+                    finished_at=datetime.now(timezone.utc),
+                )
+            )
+            recovered_started = restarted_store.start_human_resume_run(
+                reserved.id,
+                recovered["handoff_claim_token"],
+                now=expired_at,
+            )
+            assert recovered_started is not None
+            self.assertEqual(recovered_started.status, "running")
+            completed = restarted_store.update_owned_human_resume_run(
+                reserved.id,
+                recovered["handoff_claim_token"],
+                now=expired_at,
+                status="completed",
+                finished_at=expired_at,
+            )
+            assert completed is not None
+            self.assertEqual(completed.status, "completed")
+            self.assertIsNone(
+                restarted_store.update_owned_human_resume_run(
+                    reserved.id,
+                    recovered["handoff_claim_token"],
+                    now=expired_at,
+                    final_message="must not overwrite terminal state",
+                )
+            )
+            persisted = restarted_store.get_run(reserved.id)
+            assert persisted is not None
+            self.assertIsNone(persisted.final_message)
+            self.assertEqual(restarted_store.list_recoverable_human_resume_run_ids(), [])
+            retired_handoff = restarted_store.get_human_resume_handoff(reserved.id)
+            assert retired_handoff is not None
+            self.assertIsNone(retired_handoff["claim_token"])
+
+
+class StoreHumanReviewTests(unittest.TestCase):
 
     @staticmethod
     def _create_completed_source(
@@ -883,9 +496,6 @@ class StoreHumanReviewTests(unittest.TestCase):
         store: Store,
         source,
         approval,
-        *,
-        automation_plan: AutomationPlan | None = None,
-        automation_result: str | None = None,
     ):
         return store.create_human_review_action(
             source.id,
@@ -898,13 +508,6 @@ class StoreHumanReviewTests(unittest.TestCase):
             source_review_history="## Attempt 1\nAPPROVE",
             workspace_diff="diff --git a/app.py b/app.py\n",
             workspace_diff_hash="d" * 64,
-            automation_plan_hash=(
-                automation_plan.content_hash() if automation_plan else None
-            ),
-            automation_plan=(
-                automation_plan.canonical_json(indent=2) if automation_plan else None
-            ),
-            automation_result=automation_result,
         )
 
     def test_action_and_child_are_created_atomically_with_frozen_lineage(self) -> None:
@@ -972,130 +575,6 @@ class StoreHumanReviewTests(unittest.TestCase):
                 store.list_recoverable_human_review_action_ids(), [action["id"]]
             )
 
-    def test_action_freezes_bound_automation_artifacts_and_copies_hash_to_child(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            source, approval = self._create_completed_source(store, root)
-            automation_plan = AutomationPlan.model_validate(
-                store_automation_plan_payload(
-                    issue_key=source.issue_identifier,
-                    requirements_snapshot_hash=source.issue_fingerprint or "",
-                )
-            )
-            source = store.update_run(
-                source.id,
-                automation_plan_hash=automation_plan.content_hash(),
-                automation_development_diff_hash=(
-                    automation_plan.development_workspace_diff_hash
-                ),
-                automation_repository_diff_hash="e" * 64,
-                automation_result_hash=automation_result_content_hash(
-                    "Added the focused automation scenario."
-                ),
-            )
-
-            action, child = store.create_human_review_action(
-                source.id,
-                reviewer_identity="reviewer@example.test",
-                source_url="https://github.example.test/org/repo/pull/42",
-                comments="Please tighten the automation assertion.",
-                plan_spec="# Plan\n- Keep the approved behavior stable.",
-                approval=approval,
-                source_review="APPROVE",
-                source_review_history="## Attempt 1\nAPPROVE",
-                workspace_diff="diff --git a/app.py b/app.py\n",
-                workspace_diff_hash="d" * 64,
-                automation_plan_hash=automation_plan.content_hash(),
-                automation_plan=automation_plan.canonical_json(indent=2),
-                automation_result="Added the focused automation scenario.",
-            )
-
-            self.assertEqual(
-                action["automation_plan_hash"],
-                automation_plan.content_hash(),
-            )
-            self.assertEqual(
-                action["automation_development_diff_hash"],
-                source.automation_development_diff_hash,
-            )
-            self.assertEqual(
-                action["automation_repository_diff_hash"],
-                source.automation_repository_diff_hash,
-            )
-            self.assertEqual(
-                action["automation_result_hash"],
-                source.automation_result_hash,
-            )
-            self.assertEqual(
-                action["automation_plan"],
-                automation_plan.canonical_json(indent=2),
-            )
-            self.assertEqual(
-                action["automation_result"],
-                "Added the focused automation scenario.",
-            )
-            self.assertEqual(
-                child.automation_plan_hash,
-                source.automation_plan_hash,
-            )
-            self.assertEqual(
-                child.automation_development_diff_hash,
-                source.automation_development_diff_hash,
-            )
-            self.assertEqual(
-                child.automation_repository_diff_hash,
-                source.automation_repository_diff_hash,
-            )
-            self.assertEqual(
-                child.automation_result_hash,
-                source.automation_result_hash,
-            )
-
-    def test_automation_context_mismatch_leaves_no_action_or_child(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = Store(root / "db.sqlite3")
-            source, approval = self._create_completed_source(store, root)
-            automation_plan = AutomationPlan.model_validate(
-                store_automation_plan_payload(
-                    issue_key=source.issue_identifier,
-                    requirements_snapshot_hash=source.issue_fingerprint or "",
-                )
-            )
-            source = store.update_run(
-                source.id,
-                automation_plan_hash=automation_plan.content_hash(),
-            )
-
-            with self.assertRaisesRegex(
-                ValueError,
-                "AutomationPlan hash does not match",
-            ):
-                store.create_human_review_action(
-                    source.id,
-                    reviewer_identity="reviewer@example.test",
-                    source_url="https://github.example.test/org/repo/pull/42",
-                    comments="Please tighten the automation assertion.",
-                    plan_spec="# Plan\n- Keep the approved behavior stable.",
-                    approval=approval,
-                    source_review=None,
-                    source_review_history=None,
-                    workspace_diff="diff --git a/app.py b/app.py\n",
-                    workspace_diff_hash="d" * 64,
-                    automation_plan_hash="f" * 64,
-                    automation_plan=automation_plan.canonical_json(indent=2),
-                    automation_result="Added the focused automation scenario.",
-                )
-
-            self.assertEqual(
-                [run.id for run in store.list_runs_for_issue("T-1")],
-                [source.id],
-            )
-            self.assertEqual(
-                store.list_human_review_actions_for_issue("T-1"),
-                [],
-            )
 
     def test_rejections_leave_no_orphan_action_or_child_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1154,233 +633,6 @@ class StoreHumanReviewTests(unittest.TestCase):
                 store.list_human_review_actions_for_issue("T-1"), [action]
             )
 
-    def test_claim_start_triage_and_terminal_updates_are_token_fenced(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            first_store = Store(root / "db.sqlite3")
-            restarted_store = Store(root / "db.sqlite3")
-            source, approval = self._create_completed_source(first_store, root)
-            automation_plan = AutomationPlan.model_validate(
-                store_automation_plan_payload(
-                    issue_key=source.issue_identifier,
-                    requirements_snapshot_hash=source.issue_fingerprint or "",
-                )
-            )
-            automation_result = "Added the focused automation scenario."
-            source = first_store.update_run(
-                source.id,
-                automation_plan_hash=automation_plan.content_hash(),
-                automation_development_diff_hash=(
-                    automation_plan.development_workspace_diff_hash
-                ),
-                automation_repository_diff_hash="e" * 64,
-                automation_result_hash=automation_result_content_hash(
-                    automation_result
-                ),
-            )
-            action, child = self._create_action(
-                first_store,
-                source,
-                approval,
-                automation_plan=automation_plan,
-                automation_result=automation_result,
-            )
-            first_claimed_at = datetime(2026, 2, 1, tzinfo=timezone.utc)
-
-            first_claim = first_store.claim_human_review_action(
-                action["id"], now=first_claimed_at
-            )
-            self.assertIsNotNone(first_claim)
-            assert first_claim is not None
-            self.assertEqual(first_claim["status"], "queued")
-            self.assertTrue(first_claim["claim_token"])
-            self.assertIsNone(
-                restarted_store.claim_human_review_action(
-                    action["id"],
-                    now=(
-                        first_claimed_at
-                        + HUMAN_RESUME_HANDOFF_LEASE
-                        - timedelta(seconds=1)
-                    ),
-                )
-            )
-
-            started = first_store.start_human_review_run(
-                action["id"],
-                child.id,
-                first_claim["claim_token"],
-                now=first_claimed_at,
-            )
-            self.assertIsNotNone(started)
-            assert started is not None
-            self.assertEqual(started.status, "running")
-            persisted_running = first_store.get_human_review_action(action["id"])
-            assert persisted_running is not None
-            self.assertEqual(persisted_running["status"], "running")
-            self.assertTrue(
-                first_store.record_owned_human_review_triage(
-                    action["id"],
-                    first_claim["claim_token"],
-                    decision="code_changes",
-                    output='{"decision":"code_changes","reason":"test only"}',
-                    now=first_claimed_at,
-                )
-            )
-            advanced = first_store.update_owned_human_review_run(
-                action["id"],
-                child.id,
-                first_claim["claim_token"],
-                now=first_claimed_at,
-                plan_spec_hash="f" * 64,
-                automation_plan_hash="1" * 64,
-                automation_development_diff_hash="2" * 64,
-                automation_repository_diff_hash="3" * 64,
-                automation_result_hash="4" * 64,
-                plan_approval_id="approval-2",
-            )
-            assert advanced is not None
-            self.assertEqual(advanced.plan_spec_hash, "f" * 64)
-            self.assertEqual(advanced.automation_plan_hash, "1" * 64)
-            self.assertEqual(advanced.automation_development_diff_hash, "2" * 64)
-            self.assertEqual(advanced.automation_repository_diff_hash, "3" * 64)
-            self.assertEqual(advanced.automation_result_hash, "4" * 64)
-            self.assertEqual(advanced.plan_approval_id, "approval-2")
-
-            expired_at = (
-                first_claimed_at
-                + HUMAN_RESUME_HANDOFF_LEASE
-                + timedelta(seconds=1)
-            )
-            self.assertFalse(
-                first_store.renew_human_review_action(
-                    action["id"], first_claim["claim_token"], now=expired_at
-                )
-            )
-            self.assertFalse(
-                first_store.record_owned_human_review_triage(
-                    action["id"],
-                    first_claim["claim_token"],
-                    decision="plan_changes_required",
-                    output="stale owner must not overwrite triage",
-                    now=expired_at,
-                )
-            )
-            self.assertIsNone(
-                first_store.update_owned_human_review_run(
-                    action["id"],
-                    child.id,
-                    first_claim["claim_token"],
-                    now=expired_at,
-                    status="completed",
-                    final_message="stale owner must not complete",
-                )
-            )
-
-            recovered = restarted_store.claim_human_review_action(
-                action["id"], now=expired_at
-            )
-            self.assertIsNotNone(recovered)
-            assert recovered is not None
-            self.assertNotEqual(
-                recovered["claim_token"], first_claim["claim_token"]
-            )
-            self.assertEqual(recovered["status"], "queued")
-            recovered_child = restarted_store.get_run(child.id)
-            assert recovered_child is not None
-            self.assertEqual(recovered_child.status, "queued")
-            self.assertEqual(recovered_child.plan_spec_hash, action["plan_spec_hash"])
-            self.assertEqual(
-                recovered_child.automation_plan_hash,
-                action["automation_plan_hash"],
-            )
-            self.assertEqual(
-                recovered_child.automation_development_diff_hash,
-                action["automation_development_diff_hash"],
-            )
-            self.assertEqual(
-                recovered_child.automation_repository_diff_hash,
-                action["automation_repository_diff_hash"],
-            )
-            self.assertEqual(
-                recovered_child.automation_result_hash,
-                action["automation_result_hash"],
-            )
-            self.assertEqual(
-                recovered_child.plan_approval_id,
-                action["plan_approval_id"],
-            )
-            self.assertFalse(
-                first_store.release_human_review_action(
-                    action["id"], first_claim["claim_token"]
-                )
-            )
-            self.assertIsNone(
-                first_store.start_human_review_run(
-                    action["id"],
-                    child.id,
-                    first_claim["claim_token"],
-                    now=expired_at,
-                )
-            )
-
-            recovered_started = restarted_store.start_human_review_run(
-                action["id"],
-                child.id,
-                recovered["claim_token"],
-                now=expired_at,
-            )
-            self.assertIsNotNone(recovered_started)
-            self.assertTrue(
-                restarted_store.record_owned_human_review_triage(
-                    action["id"],
-                    recovered["claim_token"],
-                    decision="code_changes",
-                    output="recovered owner triage",
-                    now=expired_at,
-                )
-            )
-            completed = restarted_store.update_owned_human_review_run(
-                action["id"],
-                child.id,
-                recovered["claim_token"],
-                now=expired_at,
-                status="completed",
-                finished_at=expired_at,
-                final_message="Human review addressed.",
-                verification_status="passed",
-            )
-            self.assertIsNotNone(completed)
-            assert completed is not None
-            self.assertEqual(completed.status, "completed")
-            self.assertEqual(completed.final_message, "Human review addressed.")
-            self.assertEqual(completed.verification_status, "passed")
-
-            persisted_action = restarted_store.get_human_review_action(action["id"])
-            assert persisted_action is not None
-            self.assertEqual(persisted_action["status"], "completed")
-            self.assertEqual(persisted_action["triage_decision"], "code_changes")
-            self.assertEqual(persisted_action["triage_output"], "recovered owner triage")
-            self.assertEqual(persisted_action["finished_at"], expired_at.isoformat())
-            self.assertIsNone(persisted_action["claimed_at"])
-            self.assertIsNone(persisted_action["claim_token"])
-            self.assertEqual(
-                restarted_store.list_recoverable_human_review_action_ids(), []
-            )
-            self.assertIsNone(
-                restarted_store.update_owned_human_review_run(
-                    action["id"],
-                    child.id,
-                    recovered["claim_token"],
-                    now=expired_at,
-                    final_message="terminal state must not be overwritten",
-                )
-            )
-            terminal_child = restarted_store.get_run(child.id)
-            assert terminal_child is not None
-            self.assertEqual(
-                terminal_child.final_message,
-                "Human review addressed.",
-            )
 
     def test_completed_child_becomes_the_next_actionable_review_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1487,30 +739,6 @@ class StoreRequirementsSnapshotIntegrityTests(unittest.TestCase):
 
             with self.assertRaisesRegex(StoreIntegrityError, "canonical content hash"):
                 store.save_requirements_snapshot(snapshot)
-
-
-def store_automation_plan_payload(
-    *,
-    issue_key: str,
-    requirements_snapshot_hash: str,
-) -> dict[str, object]:
-    return {
-        "schema_version": "1.0",
-        "decision": "no_update_required",
-        "issue_key": issue_key,
-        "requirements_snapshot_hash": requirements_snapshot_hash,
-        "development_plan_spec_hash": "b" * 64,
-        "development_workspace_diff_hash": "c" * 64,
-        "automation_repository": "automation",
-        "repository_baseline_sha": "d" * 40,
-        "rationale": "Existing automation already covers the behavior.",
-        "mapped_scenarios": [],
-        "affected_file_changes": [],
-        "verification": [],
-        "risks": [],
-        "assumptions": [],
-        "open_questions": [],
-    }
 
 
 def make_issue() -> Issue:

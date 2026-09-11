@@ -7,10 +7,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .automation_plan import AutomationPlan, automation_result_content_hash
 from .models import (
     CodexEvent,
     Issue,
+    PlanningBaseline,
     RequirementsSnapshot,
     RunRecord,
     issue_description_fingerprint,
@@ -47,21 +47,16 @@ class Store:
                   attempt INTEGER NOT NULL,
                   started_at TEXT NOT NULL,
                   plan_spec_hash TEXT,
-                  automation_plan_hash TEXT,
-                  automation_development_diff_hash TEXT,
-                  automation_repository_diff_hash TEXT,
-                  automation_result_hash TEXT,
                   plan_approval_id TEXT,
-                  automation_plan_approval_id TEXT,
+                  planning_baseline TEXT,
+                  human_input_context TEXT,
                   finished_at TEXT,
                   final_message TEXT,
                   error TEXT,
                   blocked_phase TEXT,
                   branch_name TEXT,
                   verification_status TEXT,
-                  verification_output_path TEXT,
-                  verification_workspace_diff_hash TEXT,
-                  verification_evidence_sha256 TEXT
+                  verification_output_path TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS codex_events (
@@ -100,11 +95,9 @@ class Store:
                   question TEXT,
                   response TEXT NOT NULL,
                   approval_id TEXT,
-                  automation_plan_approval_id TEXT,
                   action TEXT NOT NULL DEFAULT 'response',
                   approver_identity TEXT,
                   workspace_diff_hash TEXT,
-                  verification_evidence_sha256 TEXT,
                   claimed_at TEXT,
                   claim_token TEXT,
                   consumed_at TEXT,
@@ -119,22 +112,7 @@ class Store:
                   plan_spec_hash TEXT NOT NULL,
                   requirements_snapshot_hash TEXT NOT NULL,
                   approved_at TEXT NOT NULL,
-                  invalidated_at TEXT,
-                  invalidation_reason TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS automation_plan_approvals (
-                  id TEXT PRIMARY KEY,
-                  issue_identifier TEXT NOT NULL,
-                  run_id TEXT NOT NULL,
-                  approver_identity TEXT NOT NULL,
-                  automation_plan_hash TEXT NOT NULL,
-                  requirements_snapshot_hash TEXT NOT NULL,
-                  development_plan_spec_hash TEXT NOT NULL,
-                  development_plan_approval_id TEXT,
-                  development_workspace_diff_hash TEXT NOT NULL,
-                  automation_repository_diff_hash TEXT NOT NULL,
-                  approved_at TEXT NOT NULL,
+                  workspace_diff_hash TEXT,
                   invalidated_at TEXT,
                   invalidation_reason TEXT
                 );
@@ -171,14 +149,7 @@ class Store:
                   requirements_snapshot_hash TEXT NOT NULL,
                   plan_spec_hash TEXT,
                   plan_spec TEXT,
-                  automation_plan_hash TEXT,
-                  automation_development_diff_hash TEXT,
-                  automation_repository_diff_hash TEXT,
-                  automation_result_hash TEXT,
-                  automation_plan TEXT,
-                  automation_result TEXT,
                   plan_approval_id TEXT,
-                  automation_plan_approval_id TEXT,
                   approval_json TEXT,
                   source_final_message TEXT,
                   source_review TEXT,
@@ -206,19 +177,11 @@ class Store:
 
                 CREATE INDEX IF NOT EXISTS idx_plan_approvals_run
                   ON plan_approvals (run_id, approved_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_automation_plan_approvals_run
-                  ON automation_plan_approvals (run_id, approved_at DESC);
                 """
             )
             self._ensure_column(conn, "runs", "issue_fingerprint", "TEXT")
             self._ensure_column(conn, "runs", "blocked_phase", "TEXT")
             self._ensure_column(conn, "human_inputs", "approval_id", "TEXT")
-            self._ensure_column(
-                conn,
-                "human_inputs",
-                "automation_plan_approval_id",
-                "TEXT",
-            )
             self._ensure_column(conn, "human_inputs", "claimed_at", "TEXT")
             self._ensure_column(conn, "human_inputs", "claim_token", "TEXT")
             self._ensure_column(
@@ -229,89 +192,12 @@ class Store:
             )
             self._ensure_column(conn, "human_inputs", "approver_identity", "TEXT")
             self._ensure_column(conn, "human_inputs", "workspace_diff_hash", "TEXT")
-            self._ensure_column(
-                conn,
-                "human_inputs",
-                "verification_evidence_sha256",
-                "TEXT",
-            )
             self._ensure_column(conn, "runs", "plan_spec_hash", "TEXT")
-            self._ensure_column(conn, "runs", "automation_plan_hash", "TEXT")
-            self._ensure_column(
-                conn,
-                "runs",
-                "automation_development_diff_hash",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "runs",
-                "automation_repository_diff_hash",
-                "TEXT",
-            )
-            self._ensure_column(conn, "runs", "automation_result_hash", "TEXT")
             self._ensure_column(conn, "runs", "plan_approval_id", "TEXT")
-            self._ensure_column(
-                conn,
-                "runs",
-                "automation_plan_approval_id",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "runs",
-                "verification_workspace_diff_hash",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "runs",
-                "verification_evidence_sha256",
-                "TEXT",
-            )
+            self._ensure_column(conn, "runs", "planning_baseline", "TEXT")
+            self._ensure_column(conn, "runs", "human_input_context", "TEXT")
+            self._ensure_column(conn, "plan_approvals", "workspace_diff_hash", "TEXT")
             self._ensure_column(conn, "human_review_actions", "plan_spec", "TEXT")
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_plan_hash",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_development_diff_hash",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_repository_diff_hash",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_result_hash",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_plan",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_result",
-                "TEXT",
-            )
-            self._ensure_column(
-                conn,
-                "human_review_actions",
-                "automation_plan_approval_id",
-                "TEXT",
-            )
 
     def save_requirements_snapshot(self, snapshot: RequirementsSnapshot) -> dict[str, Any]:
         issue_identifier = snapshot.issue_identifier.strip()
@@ -425,12 +311,7 @@ class Store:
         attempt: int = 1,
         status: str = "queued",
         plan_spec_hash: str | None = None,
-        automation_plan_hash: str | None = None,
-        automation_development_diff_hash: str | None = None,
-        automation_repository_diff_hash: str | None = None,
-        automation_result_hash: str | None = None,
         plan_approval_id: str | None = None,
-        automation_plan_approval_id: str | None = None,
         require_no_active_run: bool = False,
     ) -> RunRecord:
         if issue.requirements_snapshot is not None:
@@ -450,12 +331,7 @@ class Store:
             started_at=utc_now(),
             branch_name=branch_name,
             plan_spec_hash=plan_spec_hash,
-            automation_plan_hash=automation_plan_hash,
-            automation_development_diff_hash=automation_development_diff_hash,
-            automation_repository_diff_hash=automation_repository_diff_hash,
-            automation_result_hash=automation_result_hash,
             plan_approval_id=plan_approval_id,
-            automation_plan_approval_id=automation_plan_approval_id,
         )
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -489,9 +365,6 @@ class Store:
         source_review_history: str | None,
         workspace_diff: str,
         workspace_diff_hash: str,
-        automation_plan_hash: str | None = None,
-        automation_plan: str | None = None,
-        automation_result: str | None = None,
     ) -> tuple[dict[str, Any], RunRecord]:
         """Atomically freeze a completed review request and reserve its child run."""
 
@@ -499,9 +372,6 @@ class Store:
         review_source = source_url.strip()
         review_comments = comments.strip()
         diff_hash = workspace_diff_hash.strip()
-        supplied_automation_hash = str(automation_plan_hash or "").strip().lower() or None
-        automation_plan_text = str(automation_plan or "").strip()
-        automation_result_text = str(automation_result or "").strip()
         if not reviewer:
             raise ValueError("reviewer identity is required")
         if not review_source:
@@ -568,224 +438,26 @@ class Store:
             elif approval is not None:
                 raise ValueError("completed run has no approval identity")
 
-            source_automation_hash = (
-                str(source_run.automation_plan_hash or "").strip().lower() or None
-            )
-            source_development_diff_hash: str | None = None
-            source_repository_diff_hash: str | None = None
-            source_result_hash: str | None = None
-            if source_automation_hash is not None:
-                source_automation_hash = normalize_sha256(
-                    source_automation_hash,
-                    "completed run automation plan hash",
-                )
-                if supplied_automation_hash is None:
-                    raise ValueError(
-                        "completed run has no frozen AutomationPlan hash"
-                    )
-                supplied_automation_hash = normalize_sha256(
-                    supplied_automation_hash,
-                    "frozen AutomationPlan hash",
-                )
-                if supplied_automation_hash != source_automation_hash:
-                    raise ValueError(
-                        "frozen AutomationPlan hash does not match the completed run"
-                    )
-                if not automation_plan_text:
-                    raise ValueError(
-                        "completed run has no frozen AutomationPlan content"
-                    )
-                try:
-                    frozen_automation_plan = AutomationPlan.model_validate_json(
-                        automation_plan_text
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        "completed run frozen AutomationPlan content is invalid"
-                    ) from exc
-                if frozen_automation_plan.content_hash() != source_automation_hash:
-                    raise ValueError(
-                        "frozen AutomationPlan content does not match the completed run"
-                    )
-                source_development_diff_hash = normalize_sha256(
-                    str(source_run.automation_development_diff_hash or ""),
-                    "completed run automation development-diff hash",
-                )
-                if (
-                    frozen_automation_plan.development_workspace_diff_hash
-                    != source_development_diff_hash
-                ):
-                    raise ValueError(
-                        "frozen AutomationPlan development diff does not match the "
-                        "completed run"
-                    )
-                source_repository_diff_hash = normalize_sha256(
-                    str(source_run.automation_repository_diff_hash or ""),
-                    "completed run automation repository-diff hash",
-                )
-                if not automation_result_text:
-                    raise ValueError(
-                        "completed run has no frozen automation result"
-                    )
-                source_result_hash = normalize_sha256(
-                    str(source_run.automation_result_hash or ""),
-                    "completed run automation result hash",
-                )
-                if (
-                    automation_result_content_hash(automation_result_text)
-                    != source_result_hash
-                ):
-                    raise ValueError(
-                        "frozen automation result does not match the completed run"
-                    )
-                source_automation_approval_id = (
-                    str(source_run.automation_plan_approval_id or "").strip()
-                    or None
-                )
-                if source_automation_approval_id is not None:
-                    automation_approval_row = conn.execute(
-                        "SELECT * FROM automation_plan_approvals WHERE id = ?",
-                        (source_automation_approval_id,),
-                    ).fetchone()
-                    if automation_approval_row is None:
-                        raise ValueError(
-                            "completed run's persisted automation approval is missing"
-                        )
-                    frozen_automation_approval = dict(automation_approval_row)
-                    if frozen_automation_approval.get("invalidated_at"):
-                        raise ValueError(
-                            "completed run's persisted automation approval is no "
-                            "longer active"
-                        )
-                    if (
-                        frozen_automation_approval["issue_identifier"]
-                        != source_run.issue_identifier
-                        or frozen_automation_approval["automation_plan_hash"]
-                        != source_automation_hash
-                        or frozen_automation_approval[
-                            "requirements_snapshot_hash"
-                        ]
-                        != requirements_snapshot_hash
-                        or frozen_automation_approval[
-                            "development_plan_spec_hash"
-                        ]
-                        != plan_hash
-                        or frozen_automation_approval[
-                            "development_plan_approval_id"
-                        ]
-                        != approval_id
-                        or frozen_automation_approval[
-                            "development_workspace_diff_hash"
-                        ]
-                        != source_development_diff_hash
-                        or frozen_automation_approval[
-                            "automation_repository_diff_hash"
-                        ]
-                        != source_repository_diff_hash
-                    ):
-                        raise ValueError(
-                            "completed run's persisted automation approval does not "
-                            "match its exact automation and development bindings"
-                        )
-            elif (
-                supplied_automation_hash is not None
-                or automation_plan_text
-                or automation_result_text
-                or source_run.automation_development_diff_hash is not None
-                or source_run.automation_repository_diff_hash is not None
-                or source_run.automation_result_hash is not None
-                or source_run.automation_plan_approval_id is not None
-            ):
-                raise ValueError(
-                    "completed run has no automation-plan identity"
-                )
-
             result_run = RunRecord(
                 id=str(uuid.uuid4()),
                 issue_id=source_run.issue_id,
                 issue_identifier=source_run.issue_identifier,
                 issue_fingerprint=requirements_snapshot_hash,
                 workspace_path=source_run.workspace_path,
-                status="queued",
+                status='queued',
                 attempt=source_run.attempt + 1,
                 started_at=now,
                 branch_name=source_run.branch_name,
                 plan_spec_hash=plan_hash,
-                automation_plan_hash=source_automation_hash,
-                automation_development_diff_hash=(
-                    source_development_diff_hash
-                ),
-                automation_repository_diff_hash=(
-                    source_repository_diff_hash
-                ),
-                automation_result_hash=source_result_hash,
                 plan_approval_id=approval_id,
-                automation_plan_approval_id=(
-                    source_run.automation_plan_approval_id
-                ),
             )
             self._insert_run(conn, result_run)
             conn.execute(
                 """
-                INSERT INTO human_review_actions (
-                  id, issue_identifier, source_run_id, result_run_id,
-                  reviewer_identity, source_url, comments,
-                  requirements_snapshot_hash, plan_spec_hash, plan_spec,
-                  automation_plan_hash, automation_development_diff_hash,
-                  automation_repository_diff_hash, automation_result_hash,
-                  automation_plan, automation_result,
-                  plan_approval_id, automation_plan_approval_id,
-                  approval_json, source_final_message,
-                  source_review, source_review_history, workspace_diff,
-                  workspace_diff_hash, triage_decision, triage_output,
-                  status, claimed_at, claim_token, started_at, finished_at,
-                  created_at
-                )
-                VALUES (
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
+                INSERT INTO human_review_actions (id, issue_identifier, source_run_id, result_run_id, reviewer_identity, source_url, comments, requirements_snapshot_hash, plan_spec_hash, plan_spec, plan_approval_id, approval_json, source_final_message, source_review, source_review_history, workspace_diff, workspace_diff_hash, triage_decision, triage_output, status, claimed_at, claim_token, started_at, finished_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    action_id,
-                    source_run.issue_identifier,
-                    source_run.id,
-                    result_run.id,
-                    reviewer,
-                    review_source,
-                    review_comments,
-                    requirements_snapshot_hash,
-                    plan_hash,
-                    plan_text or None,
-                    source_automation_hash,
-                    source_development_diff_hash,
-                    source_repository_diff_hash,
-                    source_result_hash,
-                    automation_plan_text or None,
-                    automation_result_text or None,
-                    approval_id,
-                    source_run.automation_plan_approval_id,
-                    json.dumps(
-                        frozen_approval,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                    if frozen_approval is not None
-                    else None,
-                    source_run.final_message,
-                    source_review,
-                    source_review_history,
-                    workspace_diff,
-                    diff_hash,
-                    None,
-                    None,
-                    "queued",
-                    None,
-                    None,
-                    None,
-                    None,
-                    now.isoformat(),
-                ),
+                (action_id, source_run.issue_identifier, source_run.id, result_run.id, reviewer, review_source, review_comments, requirements_snapshot_hash, plan_hash, plan_text or None, approval_id, json.dumps(frozen_approval, ensure_ascii=False, sort_keys=True) if frozen_approval is not None else None, source_run.final_message, source_review, source_review_history, workspace_diff, diff_hash, None, None, 'queued', None, None, None, None, now.isoformat()),
             )
 
         action = self.get_human_review_action(action_id)
@@ -873,7 +545,7 @@ class Store:
             human_input = conn.execute(
                 """
                 SELECT id, issue_identifier, run_id, approval_id,
-                       automation_plan_approval_id, claim_token, consumed_at
+                       claim_token, consumed_at
                 FROM human_inputs
                 WHERE id = ?
                 """,
@@ -917,23 +589,6 @@ class Store:
             if approval_id and approval_id != predecessor.plan_approval_id:
                 raise StoreIntegrityError(
                     "human resume approval identity does not match its predecessor run"
-                )
-            automation_approval_id = human_input[
-                "automation_plan_approval_id"
-            ]
-            if approval_id and automation_approval_id:
-                raise StoreIntegrityError(
-                    "human resume input contains both development and automation "
-                    "approval identities"
-                )
-            if (
-                automation_approval_id
-                and automation_approval_id
-                != predecessor.automation_plan_approval_id
-            ):
-                raise StoreIntegrityError(
-                    "human resume automation approval identity does not match "
-                    "its predecessor run"
                 )
             requirements_fingerprint = issue_description_fingerprint(issue)
             if (
@@ -997,23 +652,12 @@ class Store:
                 issue_identifier=issue.identifier,
                 issue_fingerprint=requirements_fingerprint,
                 workspace_path=str(workspace_path),
-                status="queued",
+                status='queued',
                 attempt=attempt,
                 started_at=utc_now(),
                 branch_name=branch_name,
                 plan_spec_hash=predecessor.plan_spec_hash,
-                automation_plan_hash=predecessor.automation_plan_hash,
-                automation_development_diff_hash=(
-                    predecessor.automation_development_diff_hash
-                ),
-                automation_repository_diff_hash=(
-                    predecessor.automation_repository_diff_hash
-                ),
-                automation_result_hash=predecessor.automation_result_hash,
                 plan_approval_id=predecessor.plan_approval_id,
-                automation_plan_approval_id=(
-                    predecessor.automation_plan_approval_id
-                ),
             )
             self._insert_run(conn, record)
             conn.execute(
@@ -1089,11 +733,7 @@ class Store:
                 return None
             predecessor = conn.execute(
                 """
-                SELECT p.plan_spec_hash, p.automation_plan_hash,
-                       p.automation_development_diff_hash,
-                       p.automation_repository_diff_hash,
-                       p.automation_result_hash, p.plan_approval_id,
-                       p.automation_plan_approval_id
+                SELECT p.plan_spec_hash, p.plan_approval_id
                 FROM human_resume_handoffs AS h
                 JOIN runs AS p ON p.id = h.predecessor_run_id
                 WHERE h.resume_run_id = ?
@@ -1108,21 +748,12 @@ class Store:
                 """
                 UPDATE runs SET status = 'queued', finished_at = NULL, error = NULL,
                                 blocked_phase = NULL, plan_spec_hash = ?,
-                                automation_plan_hash = ?,
-                                automation_development_diff_hash = ?,
-                                automation_repository_diff_hash = ?,
-                                automation_result_hash = ?, plan_approval_id = ?,
-                                automation_plan_approval_id = ?
+                                plan_approval_id = ?
                 WHERE id = ? AND status = 'running'
                 """,
                 (
                     predecessor["plan_spec_hash"],
-                    predecessor["automation_plan_hash"],
-                    predecessor["automation_development_diff_hash"],
-                    predecessor["automation_repository_diff_hash"],
-                    predecessor["automation_result_hash"],
                     predecessor["plan_approval_id"],
-                    predecessor["automation_plan_approval_id"],
                     resume_run_id,
                 ),
             )
@@ -1135,26 +766,10 @@ class Store:
                        a.approver_identity AS plan_approver_identity,
                        a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
-                       a.invalidation_reason AS approval_invalidation_reason,
-                       aa.automation_plan_hash,
-                       aa.requirements_snapshot_hash
-                         AS automation_requirements_snapshot_hash,
-                       aa.development_plan_spec_hash,
-                       aa.development_plan_approval_id,
-                       aa.development_workspace_diff_hash,
-                       aa.automation_repository_diff_hash,
-                       aa.approver_identity
-                         AS automation_plan_approver_identity,
-                       aa.approved_at AS automation_approved_at,
-                       aa.invalidated_at
-                         AS automation_approval_invalidated_at,
-                       aa.invalidation_reason
-                         AS automation_approval_invalidation_reason
+                       a.invalidation_reason AS approval_invalidation_reason
                 FROM human_resume_handoffs AS h
                 JOIN human_inputs AS i ON i.id = h.input_id
                 LEFT JOIN plan_approvals AS a ON a.id = i.approval_id
-                LEFT JOIN automation_plan_approvals AS aa
-                  ON aa.id = i.automation_plan_approval_id
                 WHERE h.resume_run_id = ?
                 """,
                 (resume_run_id,),
@@ -1268,24 +883,7 @@ class Store:
         if lease <= timedelta(0):
             raise ValueError("human resume handoff claim lease must be positive")
         claim_time = now or utc_now()
-        allowed = {
-            "status",
-            "finished_at",
-            "final_message",
-            "error",
-            "blocked_phase",
-            "verification_status",
-            "verification_output_path",
-            "verification_workspace_diff_hash",
-            "verification_evidence_sha256",
-            "plan_spec_hash",
-            "automation_plan_hash",
-            "automation_development_diff_hash",
-            "automation_repository_diff_hash",
-            "automation_result_hash",
-            "plan_approval_id",
-            "automation_plan_approval_id",
-        }
+        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context'}
         updates = {key: value for key, value in fields.items() if key in allowed}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1405,21 +1003,12 @@ class Store:
                 UPDATE runs
                 SET status = 'queued', finished_at = NULL, error = NULL,
                     blocked_phase = NULL, plan_spec_hash = ?,
-                    automation_plan_hash = ?,
-                    automation_development_diff_hash = ?,
-                    automation_repository_diff_hash = ?,
-                    automation_result_hash = ?, plan_approval_id = ?,
-                    automation_plan_approval_id = ?
+                    plan_approval_id = ?
                 WHERE id = ? AND status = 'running'
                 """,
                 (
                     row["plan_spec_hash"],
-                    row["automation_plan_hash"],
-                    row["automation_development_diff_hash"],
-                    row["automation_repository_diff_hash"],
-                    row["automation_result_hash"],
                     row["plan_approval_id"],
-                    row["automation_plan_approval_id"],
                     row["result_run_id"],
                 ),
             )
@@ -1577,24 +1166,7 @@ class Store:
         if lease <= timedelta(0):
             raise ValueError("human review action claim lease must be positive")
         claim_time = now or utc_now()
-        allowed = {
-            "status",
-            "finished_at",
-            "final_message",
-            "error",
-            "blocked_phase",
-            "verification_status",
-            "verification_output_path",
-            "verification_workspace_diff_hash",
-            "verification_evidence_sha256",
-            "plan_spec_hash",
-            "automation_plan_hash",
-            "automation_development_diff_hash",
-            "automation_repository_diff_hash",
-            "automation_result_hash",
-            "plan_approval_id",
-            "automation_plan_approval_id",
-        }
+        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context'}
         updates = {key: value for key, value in fields.items() if key in allowed}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1657,24 +1229,7 @@ class Store:
         return run_from_row(row) if row else None
 
     def update_run(self, run_id: str, **fields: Any) -> RunRecord:
-        allowed = {
-            "status",
-            "finished_at",
-            "final_message",
-            "error",
-            "blocked_phase",
-            "verification_status",
-            "verification_output_path",
-            "verification_workspace_diff_hash",
-            "verification_evidence_sha256",
-            "plan_spec_hash",
-            "automation_plan_hash",
-            "automation_development_diff_hash",
-            "automation_repository_diff_hash",
-            "automation_result_hash",
-            "plan_approval_id",
-            "automation_plan_approval_id",
-        }
+        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context'}
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
             record = self.get_run(run_id)
@@ -1765,7 +1320,13 @@ class Store:
                 "INSERT INTO codex_events (run_id, sequence, event_type, raw_json, created_at) VALUES (?, ?, ?, ?, ?)",
                 (run_id, sequence, event_type, json.dumps(raw_json, sort_keys=True), created_at.isoformat()),
             )
-        return CodexEvent(run_id=run_id, sequence=sequence, event_type=event_type, raw_json=raw_json, created_at=created_at)
+        return CodexEvent(
+            run_id=run_id,
+            sequence=sequence,
+            event_type=event_type,
+            raw_json=raw_json,
+            created_at=created_at,
+        )
 
     def list_codex_events(self, run_id: str) -> list[CodexEvent]:
         with self._connect() as conn:
@@ -1841,22 +1402,7 @@ class Store:
         question: str | None = None,
         approval_id: str | None = None,
     ) -> dict[str, Any]:
-        record = {
-            "id": str(uuid.uuid4()),
-            "issue_identifier": issue_identifier,
-            "run_id": run_id,
-            "question": question,
-            "response": response,
-            "approval_id": approval_id,
-            "action": "response",
-            "approver_identity": None,
-            "workspace_diff_hash": None,
-            "verification_evidence_sha256": None,
-            "claimed_at": None,
-            "claim_token": None,
-            "consumed_at": None,
-            "created_at": utc_now().isoformat(),
-        }
+        record = {'id': str(uuid.uuid4()), 'issue_identifier': issue_identifier, 'run_id': run_id, 'question': question, 'response': response, 'approval_id': approval_id, 'action': 'response', 'approver_identity': None, 'workspace_diff_hash': None, 'claimed_at': None, 'claim_token': None, 'consumed_at': None, 'created_at': utc_now().isoformat()}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._assert_human_input_submission_allowed(
@@ -1866,153 +1412,60 @@ class Store:
             )
             conn.execute(
                 """
-                INSERT INTO human_inputs (
-                  id, issue_identifier, run_id, question, response, approval_id,
-                  action, approver_identity, workspace_diff_hash,
-                  verification_evidence_sha256, claimed_at, claim_token,
-                  consumed_at, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO human_inputs (id, issue_identifier, run_id, question, response, approval_id, action, approver_identity, workspace_diff_hash, claimed_at, claim_token, consumed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    record["id"],
-                    record["issue_identifier"],
-                    record["run_id"],
-                    record["question"],
-                    record["response"],
-                    record["approval_id"],
-                    record["action"],
-                    record["approver_identity"],
-                    record["workspace_diff_hash"],
-                    record["verification_evidence_sha256"],
-                    record["claimed_at"],
-                    record["claim_token"],
-                    record["consumed_at"],
-                    record["created_at"],
-                ),
+                (record['id'], record['issue_identifier'], record['run_id'], record['question'], record['response'], record['approval_id'], record['action'], record['approver_identity'], record['workspace_diff_hash'], record['claimed_at'], record['claim_token'], record['consumed_at'], record['created_at']),
             )
         return record
 
-    def add_verification_bypass_input(
-        self,
-        issue_identifier: str,
-        *,
-        run_id: str,
-        approver_identity: str,
-        workspace_diff_hash: str,
-        verification_evidence_sha256: str,
-        question: str | None = None,
-    ) -> dict[str, Any]:
-        """Atomically queue an explicit override bound to code and verification evidence."""
 
-        approver = " ".join(approver_identity.split())
-        if not approver:
-            raise ValueError("approver identity is required")
-        diff_hash = normalize_sha256(
-            workspace_diff_hash,
-            "workspace diff hash",
-        )
-        evidence_hash = normalize_sha256(
-            verification_evidence_sha256,
-            "verification evidence SHA-256",
-        )
-        record = {
-            "id": str(uuid.uuid4()),
-            "issue_identifier": issue_identifier,
-            "run_id": run_id,
-            "question": question,
-            "response": "Verification bypass approved.",
-            "approval_id": None,
-            "action": "verification_bypass",
-            "approver_identity": approver,
-            "workspace_diff_hash": diff_hash,
-            "verification_evidence_sha256": evidence_hash,
-            "claimed_at": None,
-            "claim_token": None,
-            "consumed_at": None,
-            "created_at": utc_now().isoformat(),
-        }
+    @staticmethod
+    def _approval_workspace_diff_hash(conn, run_id: str, plan_hash: str) -> str | None:
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise ValueError("approval run does not exist")
+        run = run_from_row(row)
+        if run.planning_baseline is None:
+            return None
+        if run.plan_spec_hash != plan_hash:
+            raise ValueError("retained workspace belongs to a different PlanSpec")
+        return run.planning_baseline.workspace_diff_hash
+
+    def latest_implementation_for_workspace(
+        self, issue_identifier: str, workspace_path: Path,
+    ) -> RunRecord | None:
+        """Find prior approved execution, including across failed replan attempts."""
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            self._assert_human_input_submission_allowed(
-                conn,
-                issue_identifier=issue_identifier,
-                run_id=run_id,
-            )
-            run = conn.execute(
+            row = conn.execute(
                 """
-                SELECT status, blocked_phase, verification_status,
-                       verification_output_path,
-                       verification_workspace_diff_hash,
-                       verification_evidence_sha256
-                FROM runs
-                WHERE id = ? AND issue_identifier = ?
-                """,
-                (run_id, issue_identifier),
-            ).fetchone()
-            if (
-                run is None
-                or run["status"] != "blocked"
-                or run["blocked_phase"]
-                not in {"verification", "verification_environment"}
-                or run["verification_status"]
-                in {None, "passed", "not_configured"}
-                or not str(run["verification_output_path"] or "").strip()
-            ):
-                raise ValueError(
-                    "run is not blocked with retained failed verification evidence"
-                )
-            try:
-                persisted_diff_hash = normalize_sha256(
-                    str(run["verification_workspace_diff_hash"] or ""),
-                    "persisted verification workspace diff hash",
-                )
-                persisted_evidence_hash = normalize_sha256(
-                    str(run["verification_evidence_sha256"] or ""),
-                    "persisted verification evidence SHA-256",
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "failed run has no valid verification-time integrity binding"
-                ) from exc
-            if (
-                diff_hash != persisted_diff_hash
-                or evidence_hash != persisted_evidence_hash
-            ):
-                raise ValueError(
-                    "verification bypass does not match the failed run integrity binding"
-                )
-            conn.execute(
-                """
-                INSERT INTO human_inputs (
-                  id, issue_identifier, run_id, question, response, approval_id,
-                  action, approver_identity, workspace_diff_hash,
-                  verification_evidence_sha256, claimed_at, claim_token,
-                  consumed_at, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(
-                    record[key]
-                    for key in (
-                        "id",
-                        "issue_identifier",
-                        "run_id",
-                        "question",
-                        "response",
-                        "approval_id",
-                        "action",
-                        "approver_identity",
-                        "workspace_diff_hash",
-                        "verification_evidence_sha256",
-                        "claimed_at",
-                        "claim_token",
-                        "consumed_at",
-                        "created_at",
+                SELECT r.* FROM runs AS r
+                JOIN plan_approvals AS a ON a.id = r.plan_approval_id
+                WHERE r.issue_identifier = ? AND r.workspace_path = ?
+                  AND a.issue_identifier = r.issue_identifier
+                  AND a.plan_spec_hash = r.plan_spec_hash
+                  AND a.requirements_snapshot_hash = r.issue_fingerprint
+                  AND r.id != a.run_id
+                  AND r.status IN ('blocked', 'completed', 'failed', 'cancelled')
+                  AND (
+                    r.status = 'completed'
+                    OR r.blocked_phase IN ('implementation', 'review', 'development_review',
+                                           'verification', 'verification_environment')
+                    OR r.error LIKE 'Review requires changing the validated PlanSpec.%'
+                    OR EXISTS (
+                        SELECT 1 FROM codex_events AS e WHERE e.run_id = r.id
+                        AND e.event_type LIKE 'development_implementation.%'
                     )
-                ),
-            )
-        return record
+                    OR EXISTS (
+                        SELECT 1 FROM human_review_actions AS h WHERE h.result_run_id = r.id
+                        AND h.triage_decision = 'plan_changes_required'
+                    )
+                  )
+                ORDER BY r.started_at DESC LIMIT 1
+                """,
+                (issue_identifier, str(workspace_path)),
+            ).fetchone()
+        return run_from_row(row) if row else None
 
     def add_approved_human_input(
         self,
@@ -2047,22 +1500,7 @@ class Store:
             "invalidated_at": None,
             "invalidation_reason": None,
         }
-        human_input = {
-            "id": str(uuid.uuid4()),
-            "issue_identifier": issue_identifier,
-            "run_id": run_id,
-            "question": question,
-            "response": "Approved.",
-            "approval_id": approval["id"],
-            "action": "plan_approval",
-            "approver_identity": approver,
-            "workspace_diff_hash": None,
-            "verification_evidence_sha256": None,
-            "claimed_at": None,
-            "claim_token": None,
-            "consumed_at": None,
-            "created_at": now,
-        }
+        human_input = {'id': str(uuid.uuid4()), 'issue_identifier': issue_identifier, 'run_id': run_id, 'question': question, 'response': 'Approved.', 'approval_id': approval['id'], 'action': 'plan_approval', 'approver_identity': approver, 'workspace_diff_hash': None, 'claimed_at': None, 'claim_token': None, 'consumed_at': None, 'created_at': now}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._assert_human_input_submission_allowed(
@@ -2070,6 +1508,8 @@ class Store:
                 issue_identifier=issue_identifier,
                 run_id=run_id,
             )
+            approval["workspace_diff_hash"] = self._approval_workspace_diff_hash(conn, run_id, plan_hash)
+            human_input["workspace_diff_hash"] = approval["workspace_diff_hash"]
             conn.execute(
                 """
                 UPDATE plan_approvals
@@ -2083,9 +1523,9 @@ class Store:
                 INSERT INTO plan_approvals (
                   id, issue_identifier, run_id, approver_identity,
                   plan_spec_hash, requirements_snapshot_hash, approved_at,
-                  invalidated_at, invalidation_reason
+                  invalidated_at, invalidation_reason, workspace_diff_hash
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 tuple(approval[key] for key in (
                     "id",
@@ -2097,6 +1537,7 @@ class Store:
                     "approved_at",
                     "invalidated_at",
                     "invalidation_reason",
+                    "workspace_diff_hash",
                 )),
             )
             cursor = conn.execute(
@@ -2111,13 +1552,8 @@ class Store:
                 raise ValueError("approval run does not exist or belongs to another issue")
             conn.execute(
                 """
-                INSERT INTO human_inputs (
-                  id, issue_identifier, run_id, question, response, approval_id,
-                  action, approver_identity, workspace_diff_hash,
-                  verification_evidence_sha256, claimed_at, claim_token,
-                  consumed_at, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO human_inputs (id, issue_identifier, run_id, question, response, approval_id, action, approver_identity, workspace_diff_hash, claimed_at, claim_token, consumed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 tuple(human_input[key] for key in (
                     "id",
@@ -2129,7 +1565,6 @@ class Store:
                     "action",
                     "approver_identity",
                     "workspace_diff_hash",
-                    "verification_evidence_sha256",
                     "claimed_at",
                     "claim_token",
                     "consumed_at",
@@ -2138,278 +1573,6 @@ class Store:
             )
         return human_input, approval
 
-    def add_approved_automation_human_input(
-        self,
-        issue_identifier: str,
-        *,
-        run_id: str,
-        approver_identity: str,
-        automation_plan_hash: str,
-        requirements_snapshot_hash: str,
-        development_plan_spec_hash: str,
-        development_plan_approval_id: str | None,
-        development_workspace_diff_hash: str,
-        automation_repository_diff_hash: str,
-        question: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Atomically bind an exact automation approval to its resume input."""
-
-        approver = " ".join(approver_identity.split())
-        issue_key = issue_identifier.strip()
-        plan_hash = normalize_sha256(
-            automation_plan_hash,
-            "automation plan hash",
-        )
-        requirements_hash = normalize_sha256(
-            requirements_snapshot_hash,
-            "requirements snapshot hash",
-        )
-        development_plan_hash = normalize_sha256(
-            development_plan_spec_hash,
-            "development PlanSpec hash",
-        )
-        development_diff_hash = normalize_sha256(
-            development_workspace_diff_hash,
-            "development workspace diff hash",
-        )
-        repository_diff_hash = normalize_sha256(
-            automation_repository_diff_hash,
-            "automation repository diff hash",
-        )
-        development_approval_id = (
-            str(development_plan_approval_id or "").strip() or None
-        )
-        if not issue_key:
-            raise ValueError("issue identifier is required")
-        if not approver:
-            raise ValueError("approver identity is required")
-
-        now = utc_now().isoformat()
-        approval = {
-            "id": str(uuid.uuid4()),
-            "issue_identifier": issue_key,
-            "run_id": run_id,
-            "approver_identity": approver,
-            "automation_plan_hash": plan_hash,
-            "requirements_snapshot_hash": requirements_hash,
-            "development_plan_spec_hash": development_plan_hash,
-            "development_plan_approval_id": development_approval_id,
-            "development_workspace_diff_hash": development_diff_hash,
-            "automation_repository_diff_hash": repository_diff_hash,
-            "approved_at": now,
-            "invalidated_at": None,
-            "invalidation_reason": None,
-        }
-        human_input = {
-            "id": str(uuid.uuid4()),
-            "issue_identifier": issue_key,
-            "run_id": run_id,
-            "question": question,
-            "response": "Automation plan approved.",
-            "approval_id": None,
-            "automation_plan_approval_id": approval["id"],
-            "action": "automation_plan_approval",
-            "approver_identity": approver,
-            "workspace_diff_hash": None,
-            "verification_evidence_sha256": None,
-            "claimed_at": None,
-            "claim_token": None,
-            "consumed_at": None,
-            "created_at": now,
-        }
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            self._assert_human_input_submission_allowed(
-                conn,
-                issue_identifier=issue_key,
-                run_id=run_id,
-            )
-            run = conn.execute(
-                """
-                SELECT status, blocked_phase, issue_fingerprint,
-                       plan_spec_hash, plan_approval_id,
-                       automation_plan_hash,
-                       automation_development_diff_hash,
-                       automation_repository_diff_hash
-                FROM runs
-                WHERE id = ? AND issue_identifier = ?
-                """,
-                (run_id, issue_key),
-            ).fetchone()
-            if run is None:
-                raise ValueError(
-                    "automation approval run does not exist or belongs to another issue"
-                )
-            if (
-                run["status"] != "blocked"
-                or run["blocked_phase"] != "automation_planning_approval"
-            ):
-                raise ValueError(
-                    "run is not blocked for automation plan approval"
-                )
-            expected_run_bindings = (
-                (
-                    "requirements snapshot",
-                    run["issue_fingerprint"],
-                    requirements_hash,
-                ),
-                (
-                    "development PlanSpec",
-                    run["plan_spec_hash"],
-                    development_plan_hash,
-                ),
-                (
-                    "AutomationPlan",
-                    run["automation_plan_hash"],
-                    plan_hash,
-                ),
-                (
-                    "development workspace diff",
-                    run["automation_development_diff_hash"],
-                    development_diff_hash,
-                ),
-                (
-                    "automation repository diff",
-                    run["automation_repository_diff_hash"],
-                    repository_diff_hash,
-                ),
-            )
-            for label, persisted, expected in expected_run_bindings:
-                try:
-                    normalized_persisted = normalize_sha256(
-                        str(persisted or ""),
-                        f"persisted {label} hash",
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        f"run has no exact persisted {label} binding"
-                    ) from exc
-                if normalized_persisted != expected:
-                    raise ValueError(
-                        f"automation approval {label} does not match the run binding"
-                    )
-
-            persisted_development_approval_id = (
-                str(run["plan_approval_id"] or "").strip() or None
-            )
-            if persisted_development_approval_id != development_approval_id:
-                raise ValueError(
-                    "automation approval development plan approval identity does "
-                    "not match the run binding"
-                )
-            if development_approval_id is not None:
-                development_approval = conn.execute(
-                    "SELECT * FROM plan_approvals WHERE id = ?",
-                    (development_approval_id,),
-                ).fetchone()
-                if (
-                    development_approval is None
-                    or development_approval["invalidated_at"] is not None
-                    or development_approval["issue_identifier"] != issue_key
-                    or development_approval["plan_spec_hash"]
-                    != development_plan_hash
-                    or development_approval["requirements_snapshot_hash"]
-                    != requirements_hash
-                ):
-                    raise ValueError(
-                        "automation approval is not bound to the exact active "
-                        "development plan approval"
-                    )
-
-            conn.execute(
-                """
-                UPDATE automation_plan_approvals
-                SET invalidated_at = ?, invalidation_reason = ?
-                WHERE run_id = ? AND invalidated_at IS NULL
-                """,
-                (now, "superseded by a newer approval", run_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO automation_plan_approvals (
-                  id, issue_identifier, run_id, approver_identity,
-                  automation_plan_hash, requirements_snapshot_hash,
-                  development_plan_spec_hash, development_plan_approval_id,
-                  development_workspace_diff_hash,
-                  automation_repository_diff_hash, approved_at,
-                  invalidated_at, invalidation_reason
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(
-                    approval[key]
-                    for key in (
-                        "id",
-                        "issue_identifier",
-                        "run_id",
-                        "approver_identity",
-                        "automation_plan_hash",
-                        "requirements_snapshot_hash",
-                        "development_plan_spec_hash",
-                        "development_plan_approval_id",
-                        "development_workspace_diff_hash",
-                        "automation_repository_diff_hash",
-                        "approved_at",
-                        "invalidated_at",
-                        "invalidation_reason",
-                    )
-                ),
-            )
-            cursor = conn.execute(
-                """
-                UPDATE runs
-                SET automation_plan_hash = ?,
-                    automation_development_diff_hash = ?,
-                    automation_repository_diff_hash = ?,
-                    automation_result_hash = NULL,
-                    automation_plan_approval_id = ?
-                WHERE id = ? AND issue_identifier = ?
-                """,
-                (
-                    plan_hash,
-                    development_diff_hash,
-                    repository_diff_hash,
-                    approval["id"],
-                    run_id,
-                    issue_key,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise StoreIntegrityError(
-                    "automation approval run disappeared during its atomic update"
-                )
-            conn.execute(
-                """
-                INSERT INTO human_inputs (
-                  id, issue_identifier, run_id, question, response, approval_id,
-                  automation_plan_approval_id, action, approver_identity,
-                  workspace_diff_hash, verification_evidence_sha256,
-                  claimed_at, claim_token, consumed_at, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(
-                    human_input[key]
-                    for key in (
-                        "id",
-                        "issue_identifier",
-                        "run_id",
-                        "question",
-                        "response",
-                        "approval_id",
-                        "automation_plan_approval_id",
-                        "action",
-                        "approver_identity",
-                        "workspace_diff_hash",
-                        "verification_evidence_sha256",
-                        "claimed_at",
-                        "claim_token",
-                        "consumed_at",
-                        "created_at",
-                    )
-                ),
-            )
-        return human_input, approval
 
     def add_plan_approval(
         self,
@@ -2443,6 +1606,8 @@ class Store:
             "invalidation_reason": None,
         }
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record["workspace_diff_hash"] = self._approval_workspace_diff_hash(conn, run_id, plan_hash)
             conn.execute(
                 """
                 UPDATE plan_approvals
@@ -2456,9 +1621,9 @@ class Store:
                 INSERT INTO plan_approvals (
                   id, issue_identifier, run_id, approver_identity,
                   plan_spec_hash, requirements_snapshot_hash, approved_at,
-                  invalidated_at, invalidation_reason
+                  invalidated_at, invalidation_reason, workspace_diff_hash
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -2470,6 +1635,7 @@ class Store:
                     record["approved_at"],
                     record["invalidated_at"],
                     record["invalidation_reason"],
+                    record["workspace_diff_hash"],
                 ),
             )
             conn.execute(
@@ -2575,184 +1741,95 @@ class Store:
         )
         return None
 
-    def list_automation_plan_approvals(
-        self,
-        run_id: str | None = None,
-        limit: int = 100,
+
+    def human_input_history(
+        self, issue_identifier: str, *, through: datetime,
     ) -> list[dict[str, Any]]:
+        """All operator input for one issue, in order, without lease credentials."""
+        cutoff = through.isoformat()
         with self._connect() as conn:
-            if run_id:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM automation_plan_approvals
-                    WHERE run_id = ?
-                    ORDER BY approved_at DESC
-                    LIMIT ?
-                    """,
-                    (run_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM automation_plan_approvals
-                    ORDER BY approved_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-        return [dict(row) for row in rows]
-
-    def latest_automation_plan_approval_for_run(
-        self,
-        run_id: str,
-        *,
-        active_only: bool = False,
-    ) -> dict[str, Any] | None:
-        predicate = " AND invalidated_at IS NULL" if active_only else ""
-        with self._connect() as conn:
-            row = conn.execute(
-                f"""
-                SELECT * FROM automation_plan_approvals
-                WHERE run_id = ?{predicate}
-                ORDER BY approved_at DESC
-                LIMIT 1
-                """,
-                (run_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def get_automation_plan_approval(
-        self,
-        approval_id: str,
-    ) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM automation_plan_approvals WHERE id = ?",
-                (approval_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def invalidate_automation_plan_approval(
-        self,
-        approval_id: str,
-        reason: str,
-    ) -> dict[str, Any] | None:
-        invalidation_reason = reason.strip()
-        if not invalidation_reason:
-            raise ValueError("invalidation reason is required")
-        with self._connect() as conn:
-            conn.execute(
+            inputs = conn.execute(
                 """
-                UPDATE automation_plan_approvals
-                SET invalidated_at = ?, invalidation_reason = ?
-                WHERE id = ? AND invalidated_at IS NULL
+                SELECT h.id, h.run_id, h.created_at,
+                       COALESCE(NULLIF(h.question, ''), r.error) AS question, h.response,
+                       h.action, h.approver_identity, h.approval_id,
+                       r.blocked_phase AS phase, r.issue_fingerprint AS snapshot_hash,
+                       a.plan_spec_hash, a.approved_at, a.invalidated_at
+                FROM human_inputs AS h
+                JOIN runs AS r ON r.id = h.run_id
+                LEFT JOIN plan_approvals AS a ON a.id = h.approval_id
+                WHERE h.issue_identifier = ? AND h.created_at <= ?
+                ORDER BY h.created_at, h.rowid
                 """,
-                (utc_now().isoformat(), invalidation_reason, approval_id),
-            )
-            row = conn.execute(
-                "SELECT * FROM automation_plan_approvals WHERE id = ?",
-                (approval_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def invalidate_active_automation_plan_approvals_for_issue(
-        self,
-        issue_identifier: str,
-        reason: str,
-    ) -> int:
-        invalidation_reason = reason.strip()
-        if not invalidation_reason:
-            raise ValueError("invalidation reason is required")
-        with self._connect() as conn:
-            cursor = conn.execute(
+                (issue_identifier, cutoff),
+            ).fetchall()
+            reviews = conn.execute(
                 """
-                UPDATE automation_plan_approvals
-                SET invalidated_at = ?, invalidation_reason = ?
-                WHERE issue_identifier = ? AND invalidated_at IS NULL
+                SELECT id, source_run_id, result_run_id, created_at, comments,
+                       reviewer_identity, source_url, requirements_snapshot_hash,
+                       plan_spec_hash, triage_decision
+                FROM human_review_actions
+                WHERE issue_identifier = ? AND created_at <= ?
+                ORDER BY created_at, rowid
                 """,
-                (
-                    utc_now().isoformat(),
-                    invalidation_reason,
-                    issue_identifier,
-                ),
-            )
-        return cursor.rowcount
-
-    def resolve_active_automation_plan_approval(
-        self,
-        run_id: str,
-        *,
-        automation_plan_hash: str,
-        requirements_snapshot_hash: str,
-        development_plan_spec_hash: str,
-        development_plan_approval_id: str | None,
-        development_workspace_diff_hash: str,
-        automation_repository_diff_hash: str,
-    ) -> dict[str, Any] | None:
-        run = self.get_run(run_id)
-        approval: dict[str, Any] | None = None
-        if run is not None and run.automation_plan_approval_id:
-            approval = self.get_automation_plan_approval(
-                run.automation_plan_approval_id
-            )
-            if approval is not None and approval["invalidated_at"] is not None:
-                approval = None
-        if approval is None:
-            approval = self.latest_automation_plan_approval_for_run(
-                run_id,
-                active_only=True,
-            )
-        if approval is None:
-            return None
-
-        expected = {
-            "automation_plan_hash": normalize_sha256(
-                automation_plan_hash,
-                "automation plan hash",
-            ),
-            "requirements_snapshot_hash": normalize_sha256(
-                requirements_snapshot_hash,
-                "requirements snapshot hash",
-            ),
-            "development_plan_spec_hash": normalize_sha256(
-                development_plan_spec_hash,
-                "development PlanSpec hash",
-            ),
-            "development_plan_approval_id": (
-                str(development_plan_approval_id or "").strip() or None
-            ),
-            "development_workspace_diff_hash": normalize_sha256(
-                development_workspace_diff_hash,
-                "development workspace diff hash",
-            ),
-            "automation_repository_diff_hash": normalize_sha256(
-                automation_repository_diff_hash,
-                "automation repository diff hash",
-            ),
-        }
-        labels = {
-            "automation_plan_hash": "AutomationPlan",
-            "requirements_snapshot_hash": "requirements snapshot",
-            "development_plan_spec_hash": "development PlanSpec",
-            "development_plan_approval_id": "development plan approval",
-            "development_workspace_diff_hash": "development workspace diff",
-            "automation_repository_diff_hash": "automation repository diff",
-        }
-        changed = [
-            labels[field]
-            for field, expected_value in expected.items()
-            if approval[field] != expected_value
+                (issue_identifier, cutoff),
+            ).fetchall()
+            approvals = conn.execute(
+                """
+                SELECT a.* FROM plan_approvals AS a
+                WHERE a.issue_identifier = ? AND a.approved_at <= ?
+                  AND NOT EXISTS (SELECT 1 FROM human_inputs AS h WHERE h.approval_id = a.id)
+                ORDER BY a.approved_at, a.rowid
+                """,
+                (issue_identifier, cutoff),
+            ).fetchall()
+        history = [
+            {
+                "id": f"human-input:{row['id']}",
+                "kind": "plan_approval" if row["action"] == "plan_approval" else "operator_feedback",
+                "source_run_id": row["run_id"],
+                "phase": row["phase"],
+                "created_at": row["created_at"],
+                "author": row["approver_identity"] or "operator (identity not recorded)",
+                "question": row["question"],
+                "text": row["response"],
+                "requirements_snapshot_hash": row["snapshot_hash"],
+                "plan_spec_hash": row["plan_spec_hash"],
+                "approval_id": row["approval_id"],
+                "approved_at": row["approved_at"],
+                "approval_invalidated_at": row["invalidated_at"],
+            }
+            for row in inputs
         ]
-        if run is not None and approval["issue_identifier"] != run.issue_identifier:
-            changed.append("issue identity")
-        if not changed:
-            return approval
-
-        self.invalidate_automation_plan_approval(
-            str(approval["id"]),
-            f"{' and '.join(changed)} changed after approval",
-        )
-        return None
+        history.extend({
+            "id": f"human-review:{row['id']}",
+            "kind": "code_review_feedback",
+            "source_run_id": row["source_run_id"],
+            "result_run_id": row["result_run_id"],
+            "phase": "human_review",
+            "created_at": row["created_at"],
+            "author": row["reviewer_identity"],
+            "source_url": row["source_url"],
+            "text": row["comments"],
+            "requirements_snapshot_hash": row["requirements_snapshot_hash"],
+            "plan_spec_hash": row["plan_spec_hash"],
+            "triage_decision": row["triage_decision"],
+        } for row in reviews)
+        history.extend({
+            "id": f"plan-approval:{row['id']}",
+            "kind": "plan_approval",
+            "source_run_id": row["run_id"],
+            "phase": "planning_approval",
+            "created_at": row["approved_at"],
+            "author": row["approver_identity"],
+            "text": "Approved the exact PlanSpec.",
+            "requirements_snapshot_hash": row["requirements_snapshot_hash"],
+            "plan_spec_hash": row["plan_spec_hash"],
+            "approval_id": row["id"],
+            "approved_at": row["approved_at"],
+            "approval_invalidated_at": row["invalidated_at"],
+        } for row in approvals)
+        return sorted(history, key=lambda entry: (entry["created_at"], entry["id"]))
 
     def list_human_inputs(self, run_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -2763,25 +1840,9 @@ class Store:
                            a.approver_identity AS plan_approver_identity,
                            a.approved_at,
                            a.invalidated_at AS approval_invalidated_at,
-                           a.invalidation_reason AS approval_invalidation_reason,
-                           aa.automation_plan_hash,
-                           aa.requirements_snapshot_hash
-                             AS automation_requirements_snapshot_hash,
-                           aa.development_plan_spec_hash,
-                           aa.development_plan_approval_id,
-                           aa.development_workspace_diff_hash,
-                           aa.automation_repository_diff_hash,
-                           aa.approver_identity
-                             AS automation_plan_approver_identity,
-                           aa.approved_at AS automation_approved_at,
-                           aa.invalidated_at
-                             AS automation_approval_invalidated_at,
-                           aa.invalidation_reason
-                             AS automation_approval_invalidation_reason
+                           a.invalidation_reason AS approval_invalidation_reason
                     FROM human_inputs AS h
                     LEFT JOIN plan_approvals AS a ON a.id = h.approval_id
-                    LEFT JOIN automation_plan_approvals AS aa
-                      ON aa.id = h.automation_plan_approval_id
                     WHERE h.run_id = ?
                     ORDER BY h.created_at DESC
                     LIMIT ?
@@ -2795,25 +1856,9 @@ class Store:
                            a.approver_identity AS plan_approver_identity,
                            a.approved_at,
                            a.invalidated_at AS approval_invalidated_at,
-                           a.invalidation_reason AS approval_invalidation_reason,
-                           aa.automation_plan_hash,
-                           aa.requirements_snapshot_hash
-                             AS automation_requirements_snapshot_hash,
-                           aa.development_plan_spec_hash,
-                           aa.development_plan_approval_id,
-                           aa.development_workspace_diff_hash,
-                           aa.automation_repository_diff_hash,
-                           aa.approver_identity
-                             AS automation_plan_approver_identity,
-                           aa.approved_at AS automation_approved_at,
-                           aa.invalidated_at
-                             AS automation_approval_invalidated_at,
-                           aa.invalidation_reason
-                             AS automation_approval_invalidation_reason
+                           a.invalidation_reason AS approval_invalidation_reason
                     FROM human_inputs AS h
                     LEFT JOIN plan_approvals AS a ON a.id = h.approval_id
-                    LEFT JOIN automation_plan_approvals AS aa
-                      ON aa.id = h.automation_plan_approval_id
                     ORDER BY h.created_at DESC
                     LIMIT ?
                     """,
@@ -2829,25 +1874,9 @@ class Store:
                        a.approver_identity AS plan_approver_identity,
                        a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
-                       a.invalidation_reason AS approval_invalidation_reason,
-                       aa.automation_plan_hash,
-                       aa.requirements_snapshot_hash
-                         AS automation_requirements_snapshot_hash,
-                       aa.development_plan_spec_hash,
-                       aa.development_plan_approval_id,
-                       aa.development_workspace_diff_hash,
-                       aa.automation_repository_diff_hash,
-                       aa.approver_identity
-                         AS automation_plan_approver_identity,
-                       aa.approved_at AS automation_approved_at,
-                       aa.invalidated_at
-                         AS automation_approval_invalidated_at,
-                       aa.invalidation_reason
-                         AS automation_approval_invalidation_reason
+                       a.invalidation_reason AS approval_invalidation_reason
                 FROM human_inputs AS h
                 LEFT JOIN plan_approvals AS a ON a.id = h.approval_id
-                LEFT JOIN automation_plan_approvals AS aa
-                  ON aa.id = h.automation_plan_approval_id
                 WHERE h.consumed_at IS NULL
                 ORDER BY h.created_at
                 LIMIT ?
@@ -2864,25 +1893,9 @@ class Store:
                        a.approver_identity AS plan_approver_identity,
                        a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
-                       a.invalidation_reason AS approval_invalidation_reason,
-                       aa.automation_plan_hash,
-                       aa.requirements_snapshot_hash
-                         AS automation_requirements_snapshot_hash,
-                       aa.development_plan_spec_hash,
-                       aa.development_plan_approval_id,
-                       aa.development_workspace_diff_hash,
-                       aa.automation_repository_diff_hash,
-                       aa.approver_identity
-                         AS automation_plan_approver_identity,
-                       aa.approved_at AS automation_approved_at,
-                       aa.invalidated_at
-                         AS automation_approval_invalidated_at,
-                       aa.invalidation_reason
-                         AS automation_approval_invalidation_reason
+                       a.invalidation_reason AS approval_invalidation_reason
                 FROM human_inputs AS h
                 LEFT JOIN plan_approvals AS a ON a.id = h.approval_id
-                LEFT JOIN automation_plan_approvals AS aa
-                  ON aa.id = h.automation_plan_approval_id
                 WHERE h.issue_identifier = ?
                   AND h.consumed_at IS NULL
                 ORDER BY h.created_at DESC
@@ -2927,25 +1940,9 @@ class Store:
                        a.approver_identity AS plan_approver_identity,
                        a.approved_at,
                        a.invalidated_at AS approval_invalidated_at,
-                       a.invalidation_reason AS approval_invalidation_reason,
-                       aa.automation_plan_hash,
-                       aa.requirements_snapshot_hash
-                         AS automation_requirements_snapshot_hash,
-                       aa.development_plan_spec_hash,
-                       aa.development_plan_approval_id,
-                       aa.development_workspace_diff_hash,
-                       aa.automation_repository_diff_hash,
-                       aa.approver_identity
-                         AS automation_plan_approver_identity,
-                       aa.approved_at AS automation_approved_at,
-                       aa.invalidated_at
-                         AS automation_approval_invalidated_at,
-                       aa.invalidation_reason
-                         AS automation_approval_invalidation_reason
+                       a.invalidation_reason AS approval_invalidation_reason
                 FROM human_inputs AS h
                 LEFT JOIN plan_approvals AS a ON a.id = h.approval_id
-                LEFT JOIN automation_plan_approvals AS aa
-                  ON aa.id = h.automation_plan_approval_id
                 WHERE h.id = ?
                 """,
                 (input_id,),
@@ -3019,7 +2016,7 @@ class Store:
             raise ValueError("run is not the latest actionable blocked run for this issue")
         pending = conn.execute(
             """
-            SELECT id, run_id, approval_id, automation_plan_approval_id
+            SELECT id, run_id, approval_id
             FROM human_inputs
             WHERE issue_identifier = ? AND consumed_at IS NULL
             ORDER BY created_at
@@ -3063,28 +2060,6 @@ class Store:
                     retired_at,
                     "superseded by human input for a newer run",
                     *approval_ids,
-                ),
-            )
-        automation_approval_ids = [
-            str(row["automation_plan_approval_id"])
-            for row in pending
-            if row["automation_plan_approval_id"] is not None
-        ]
-        if automation_approval_ids:
-            approval_placeholders = ",".join(
-                "?" for _ in automation_approval_ids
-            )
-            conn.execute(
-                f"""
-                UPDATE automation_plan_approvals
-                SET invalidated_at = ?, invalidation_reason = ?
-                WHERE id IN ({approval_placeholders})
-                  AND invalidated_at IS NULL
-                """,
-                (
-                    retired_at,
-                    "superseded by human input for a newer run",
-                    *automation_approval_ids,
                 ),
             )
 
@@ -3187,18 +2162,8 @@ class Store:
     def _insert_run(conn: sqlite3.Connection, record: RunRecord) -> None:
         conn.execute(
             """
-            INSERT INTO runs (
-              id, issue_id, issue_identifier, issue_fingerprint,
-              workspace_path, status, attempt,
-              started_at, plan_spec_hash, automation_plan_hash,
-              automation_development_diff_hash, automation_repository_diff_hash,
-              automation_result_hash,
-              plan_approval_id, automation_plan_approval_id,
-              finished_at, final_message, error, blocked_phase, branch_name,
-              verification_status, verification_output_path,
-              verification_workspace_diff_hash, verification_evidence_sha256
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runs (id, issue_id, issue_identifier, issue_fingerprint, workspace_path, status, attempt, started_at, plan_spec_hash, plan_approval_id, finished_at, final_message, error, blocked_phase, branch_name, verification_status, verification_output_path, planning_baseline, human_input_context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             run_values(record),
         )
@@ -3237,13 +2202,9 @@ def human_review_action_from_row(row: sqlite3.Row) -> dict[str, Any]:
 def human_input_from_row(row: sqlite3.Row) -> dict[str, Any]:
     human_input = dict(row)
     plan_approver = human_input.pop("plan_approver_identity", None)
-    automation_plan_approver = human_input.pop(
-        "automation_plan_approver_identity",
-        None,
-    )
     if not human_input.get("approver_identity"):
         human_input["approver_identity"] = (
-            automation_plan_approver or plan_approver
+            plan_approver
         )
     return human_input
 
@@ -3268,12 +2229,7 @@ def run_values(record: RunRecord) -> tuple[Any, ...]:
         record.attempt,
         record.started_at.isoformat(),
         record.plan_spec_hash,
-        record.automation_plan_hash,
-        record.automation_development_diff_hash,
-        record.automation_repository_diff_hash,
-        record.automation_result_hash,
         record.plan_approval_id,
-        record.automation_plan_approval_id,
         serialize_value(record.finished_at),
         record.final_message,
         record.error,
@@ -3281,47 +2237,39 @@ def run_values(record: RunRecord) -> tuple[Any, ...]:
         record.branch_name,
         record.verification_status,
         record.verification_output_path,
-        record.verification_workspace_diff_hash,
-        record.verification_evidence_sha256,
+        serialize_value(record.planning_baseline),
+        record.human_input_context,
     )
 
 
 def serialize_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, PlanningBaseline):
+        return value.model_dump_json()
     return value
 
 
 def run_from_row(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
-        id=row["id"],
-        issue_id=row["issue_id"],
-        issue_identifier=row["issue_identifier"],
-        issue_fingerprint=row["issue_fingerprint"],
-        workspace_path=row["workspace_path"],
-        status=row["status"],
-        attempt=row["attempt"],
-        started_at=datetime.fromisoformat(row["started_at"]),
-        plan_spec_hash=row["plan_spec_hash"],
-        automation_plan_hash=row["automation_plan_hash"],
-        automation_development_diff_hash=row[
-            "automation_development_diff_hash"
-        ],
-        automation_repository_diff_hash=row[
-            "automation_repository_diff_hash"
-        ],
-        automation_result_hash=row["automation_result_hash"],
-        plan_approval_id=row["plan_approval_id"],
-        automation_plan_approval_id=row["automation_plan_approval_id"],
-        finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
-        final_message=row["final_message"],
-        error=row["error"],
-        blocked_phase=row["blocked_phase"],
-        branch_name=row["branch_name"],
-        verification_status=row["verification_status"],
-        verification_output_path=row["verification_output_path"],
-        verification_workspace_diff_hash=row[
-            "verification_workspace_diff_hash"
-        ],
-        verification_evidence_sha256=row["verification_evidence_sha256"],
+        id=row['id'],
+        issue_id=row['issue_id'],
+        issue_identifier=row['issue_identifier'],
+        issue_fingerprint=row['issue_fingerprint'],
+        workspace_path=row['workspace_path'],
+        status=row['status'],
+        attempt=row['attempt'],
+        started_at=datetime.fromisoformat(row['started_at']),
+        plan_spec_hash=row['plan_spec_hash'],
+        plan_approval_id=row['plan_approval_id'],
+        finished_at=datetime.fromisoformat(row['finished_at']) if row['finished_at'] else None,
+        final_message=row['final_message'],
+        error=row['error'],
+        blocked_phase=row['blocked_phase'],
+        branch_name=row['branch_name'],
+        verification_status=row['verification_status'],
+        verification_output_path=row['verification_output_path'],
+        human_input_context=row['human_input_context'],
+        planning_baseline=(PlanningBaseline.model_validate_json(row['planning_baseline'])
+                           if row['planning_baseline'] else None),
     )

@@ -7,6 +7,76 @@ run data in SQLite, and posts Jira comments from the Python orchestrator.
 It does not require `OPENAI_API_KEY` or `CODEX_API_KEY`. Codex authentication is
 whatever the local `codex` CLI already uses.
 
+## Development workflow
+
+`WORKFLOW.md` is the single supported workflow. Symphony inspects Jira requirements
+and the relevant application code, plans the smallest correct change using existing
+patterns, waits for human plan approval, implements, runs an independent code review
+and correction loop, and hands off. Changes to approved scope require a new plan
+and approval.
+
+The development handler owns changes in `foyr2`, `cpm`, and `pi`. Workspaces remain
+under `~/codex-workspaces/development`; run history, approvals, and review context
+remain in `.symphony/development.sqlite3`. Issues are selected with `codex-ready`.
+Run the polling process and dashboard against the same workflow:
+
+```sh
+python3 -m symphony_jira run ./WORKFLOW.md
+python3 -m symphony_jira dashboard ./WORKFLOW.md --port 3333
+```
+
+After handoff, submit **Address Human Review** on the completed run. Symphony
+resumes the same workspace using the frozen Jira snapshot, PlanSpec, approval,
+previous final response, review history, and current diff. Process restarts retain
+this context in the database. In-scope corrections re-enter implementation and
+review; scope changes return to planning and approval.
+
+When review sends an implementation back to planning, Symphony preserves its
+tracked, staged, and untracked changes. The revised planner receives the previous
+approved plan, implementation report, review, and exact workspace diff. The
+dashboard shows that retained diff with the revised plan. Approval binds both;
+changes during planning, before approval, or before execution require replanning.
+Initial planning still requires a clean worktree. Failed replan attempts retain
+the earlier approved execution history so retrying does not require discarding code.
+
+All phases receive the accumulated dashboard human input for the issue, including
+planning clarifications, explicit overrides, approval records, and later code-review
+feedback. Symphony freezes this history per run and restores it after a process
+restart; each new run accumulates the additional input. The history is attached at
+the shared Codex dispatch point, so plan repairs and implementation/review corrections
+receive it as well. It is separate from the excluded Jira comments.
+
+Explicit operator decisions accepted before the applicable plan approval govern the
+specific points they resolve. Review must not re-raise a waived criterion merely
+because the original Jira wording differs. New post-approval scope changes still
+require replanning and approval. The dashboard exposes the exact accumulated context
+used by each run for inspection.
+
+Running tests is optional. `hooks.verify` defaults to null; configured trusted
+checks record their result in the dashboard as advisory. Failed, unavailable, or
+unconfigured checks do not block handoff or require a bypass approval. Concrete
+code defects still require review corrections. Reports distinguish passed, failed,
+and unrun tests. Old `verify_required` settings are normalized to false.
+
+The dashboard shows all five workflow stages, highlights the next human action,
+keeps plan/review summaries readable, and pauses refresh while reading or editing.
+Existing stored data and workspaces are not deleted by startup; retired feature
+columns are no longer used, and new databases create only the development schema.
+
+## Jira comments excluded from planning
+
+The checked-in workflow sets `tracker.requirements.include_comments: false`.
+Jira comments are not fetched for the requirements package and embedded comments
+are discarded. Only Description and configured Acceptance Criteria define new
+planning scope. Comment-only edits or comment API failures cannot change the new
+requirements hash or block planning. The prompt does not include a comment summary.
+Dashboard human code-review feedback and saved review context remain available.
+
+The configuration option defaults to true for older custom workflows. Previously
+saved snapshots retain their original hashes and approval bindings; changing this
+policy can require replanning a previously approved, comment-bearing snapshot.
+The evidence mechanics below also describe those older snapshots.
+
 ## Canonical Jira requirements
 
 For each hydrated issue Symphony builds a versioned requirements snapshot. The
@@ -256,106 +326,11 @@ approval time, PlanSpec hash, and requirements snapshot hash.
 
 Review decisions distinguish code corrections from a wrong plan. `changes_required`
 is limited to code-only work within the exact validated PlanSpec.
-`automation_plan_changes_required` retains that approved development PlanSpec and
-reruns only the derived post-development automation planning/update lane.
 `plan_changes_required` means required behavior, scope, requirements/acceptance
 criteria, architecture, or affected surfaces make that PlanSpec wrong; Symphony
 invalidates approval and blocks in planning for replan and reapproval. `approve`
 continues normally. Empty or unrecognized review output is invalid and blocks; it
 never defaults to approval.
-
-## Post-development automation updates
-
-The optional `automation` phase extends the existing flow without adding another
-approval gate:
-
-1. Symphony captures canonical Jira requirements and validates the development
-   PlanSpec through the existing planning and approval flow.
-2. Codex implements the approved development change in the development repositories.
-3. A separate read-only planning pass compares those requirements and that exact
-   PlanSpec with the development result and actual code diff, then inspects the
-   existing automation repository.
-4. Codex applies the focused automation plan only in the automation checkout, or
-   records a justified no-op when no automation-code update is relevant.
-5. The configured verification hook runs across the prepared checkouts. In the
-   checked-in workflow it is required and runs `git diff --check` for the development
-   and automation repositories.
-6. Configured runtime verification runs only for development repositories named by
-   the exact development PlanSpec; the automation checkout is deliberately not a
-   runtime mapping.
-7. The independent review receives both exact plans and the combined workspace
-   changes. An approved run then reports completion and performs the configured Jira
-   handoff.
-
-Development and automation have separate human approval boundaries. The automation
-plan is derived from the approved development contract and resulting development
-change; its approval cannot expand product behavior, replace development approval,
-or authorize edits to a development repository.
-An explicit no-op is a successful automation outcome, not a reason to manufacture
-tests, broad cleanup, or speculative coverage.
-
-The `verification` commands listed in an AutomationPlan are declarative plan content.
-Codex is asked to run a bounded listed check when it is locally available and report
-the result, but Symphony does not dispatch those model-authored command strings.
-Only trusted `hooks.verify` and configured runtime profiles are orchestrator-executed;
-in the checked-in workflow, the required hook covers automation with
-`git diff --check`, while runtime profiles remain development-only. The dashboard
-shows durable progress through development planning, human approval, development
-implementation, development review, automation planning, human approval, automation
-implementation, and automation review, plus concise bound plan/result artifacts
-alongside each run. A validated automation plan is persisted and approved before its
-writable pass starts, so approval resumes the exact plan without rerunning planning.
-If required verification cannot access its configured runtime, the dashboard offers
-an explicit, identity-bound override that preserves the failed evidence and continues
-to the pending review. The override never silently turns a failed test into a pass.
-
-No live automation environment is configured for the automation phase. Planning and
-implementation use only Jira, the validated development PlanSpec and diff, and
-checked-in automation sources/fixtures. Missing credentials, live fixture values, or
-an environment-only test selector are reported as unavailable verification rather
-than escalated as product questions. Plans may not make source changes depend on
-querying a deployment or derive authoritative expectations from the system under test.
-
-Automation is disabled by default for backwards compatibility. Configure it at the
-top level of `WORKFLOW.md`:
-
-```yaml
-automation:
-  enabled: true
-  workspace_subdir: automation
-  require_plan_approval: true
-  planning_prompt: |
-    Plan the smallest relevant automation update from the canonical requirements,
-    approved development PlanSpec, development result, and actual development diff.
-    If no automation change is relevant, return a justified no-op. Do not edit files.
-  implementation_prompt: |
-    Apply the automation plan only in automation/. If it is a no-op, leave the
-    checkout unchanged and report why.
-  output_plan_file: .symphony/codex-automation-plan.md
-  output_result_file: .symphony/codex-automation-final.md
-  review_after_run: true
-  max_review_iterations: 10
-  output_review_file: .symphony/codex-automation-review.md
-  output_review_history_file: .symphony/codex-automation-review-history.md
-```
-
-`workspace_subdir` and every automation output path must be a non-empty, safe
-workspace-relative POSIX path; absolute paths, parent traversal, backslashes, and the
-workspace root itself are rejected. When automation is enabled, its output paths must
-be distinct, outside the automation checkout, and different from every configured
-Codex artifact path. The checkout cannot use the reserved `.symphony/` tree or
-overlap a runtime repository. Planning, implementation, and review prompts must be
-nonblank.
-The checked-in workflow enables this phase and prepares `automation/` from
-`/home/adkuppa/CPM` at `master` on a branch named exactly for the Jira key. The clone
-copies Git objects instead of hard-linking them and removes the local source checkout
-as a Git remote, so workspace Git operations cannot write through to the uppercase
-source repository. Symphony rejects an automation checkout with any configured Git
-remote. Its hook also bootstraps that checkout for retained workspaces
-created before automation was enabled, without replacing any existing path, and
-removes a retained local-source origin when present. The plan and result artifacts
-remain under the workspace-level `.symphony/` directory so the automation repository
-stays limited to relevant source changes.
 
 ## Addressing human review after completion
 
@@ -423,143 +398,27 @@ Epics must choose one of two strategies in PlanSpec:
 - `single_change` explains why the Epic is bounded and always requires explicit
   approval of that exact PlanSpec, even if the global approval gate is disabled.
 
-## Local runtime verification
+## Optional host-side development verification
 
-Symphony can verify a changed checkout or start it for manual inspection through a
-host-owned Podman Compose runtime. The runtime is configured in `WORKFLOW.md`, but
-Compose remains the owner of the service definitions, images, ports, and volumes.
-For example:
+The trusted targeted verifier remains available when operators choose to run it.
+Set `hooks.use_development_verification_request: true` and configure a hook:
 
 ```yaml
-runtime:
-  enabled: true
-  required: true
-  shutdown_after_handoff: true
-  shutdown_grace_seconds: 120
-  command: ["/usr/bin/podman", "compose"]
-  project_directory: "/path/to/compost"
-  compose_file: "/path/to/compost/docker-compose.yml"
-  env_file: "/path/to/compost/.env"
-  project_name: compost
-  lock_file: "~/.local/state/symphony/compost.lock"
-  lock_timeout_seconds: 900
-  preview_timeout_seconds: 900
-  repositories:
-    cpm:
-      workspace_subdir: cpm
-      source_env: CPM_SRC
-      service: cpm
-      mount_target: /TexturaWD/textura
-      dependencies: [oracledb19, memcached]
-      container_workdir: /TexturaWD/textura
-      verification_profile: cpm_pytest
-  verification_profiles:
-    cpm_pytest:
-      argv: ["pytest"]
-      default_args: ["Test/unit"]
-      environment: {}
-      timeout_seconds: 3600
+hooks:
+  verify: |
+    /home/adkuppa/Symphony-Python/python/.venv/bin/python -m symphony_jira.development_verification \
+      --workspace "{{ workspace_path }}" \
+      --request "{{ verification_request_path }}" \
+      --sha256 "{{ verification_request_hash }}" \
+      --entrypoint /home/adkuppa/Symphony-Python/python/scripts/test.sh
+  use_development_verification_request: true
 ```
 
-Each repository maps a workspace subdirectory to the environment variable and
-container mount already used by Compose. For every invocation, Symphony overlays
-those source variables in the child process environment, renders the effective
-Compose configuration, and confirms that the configured service mount resolves to
-the selected workspace checkout before it starts anything. It never rewrites the
-runtime `.env` file. The profile command is fixed in trusted workflow configuration;
-provided `--target-arg` values replace the profile's `default_args` and are appended
-to its fixed `argv`. Verification force-recreates the configured workspace-bearing
-dependencies and target service together, waits for Compose health checks, and then
-uses `compose exec -T` to run the profile inside the target service.
-For a dependency that bind-mounts a replaceable workspace checkout, list it in
-the repository's `force_recreate_dependencies` as well as `dependencies`; Symphony
-includes it immediately before the target service in the same force-recreate call,
-while Compose reuses transitive database and cache dependencies. Preview `start`
-and `stop` reject `--target-arg`.
-
-The machine-wide `lock_file` serializes verification, preview, and shutdown
-operations because a shared Compose project can have fixed container names, ports,
-networks, and volumes. This is a single runtime lane, not per-issue Compose
-isolation. Commands, bounded output, and errors are recorded under
-`<workspace>/.symphony/runtime/`.
-
-Runtime subprocesses do not inherit the configured Jira credential variables or
-standard `JIRA_*`, `*_JIRA_TOKEN`, and `*_JIRA_EMAIL` variables. Retained runtime
-logs and manifests are owner-only, no-follow files; bounded logs preserve the most
-recent command evidence with an explicit truncation marker. Verification manifests
-bind the exact bytes of both the hook log and every runtime-check log by SHA-256.
-
-Operators can exercise the same runtime without Jira credentials or a Codex
-preflight:
-
-```bash
-python3 -m symphony_jira runtime ./WORKFLOW.md verify \
-  --workspace /path/to/codex-workspaces/ICPM-73100 \
-  --repository cpm
-
-python3 -m symphony_jira runtime ./WORKFLOW.md verify \
-  --workspace /path/to/codex-workspaces/ICPM-73100 \
-  --repository cpm \
-  --source-repository cpm \
-  --source-repository foyr2 \
-  --target-arg Test/unit
-
-python3 -m symphony_jira runtime ./WORKFLOW.md start \
-  --workspace /path/to/codex-workspaces/ICPM-73100 \
-  --repository cpm
-
-python3 -m symphony_jira runtime ./WORKFLOW.md stop \
-  --workspace /path/to/codex-workspaces/ICPM-73100 \
-  --repository cpm
-
-python3 -m symphony_jira runtime ./WORKFLOW.md shutdown \
-  --workspace /path/to/codex-workspaces/ICPM-73100 \
-  --repository cpm \
-  --repository foyr2
-```
-
-When `--source-repository` is omitted, all configured repository source variables
-are bound to their checkouts in the selected workspace. Repeat it to choose an
-explicit subset. Repeat `--target-arg` for multiple verification arguments; use the
-`--target-arg=-q` form when an argument begins with `-`.
-
-The command emits one compact JSON result. Verification reports `passed`,
-`test_failed`, or `environment_blocked`; preview actions report `started`, `stopped`,
-or `environment_blocked`; and shutdown reports `stopped` or
-`environment_blocked`. Only `passed`, `started`, and `stopped` exit successfully for
-their corresponding action. An environment block means the runtime could not be
-safely configured or executed, while a test failure means the configured test
-process ran and failed. `stop` remains a target-only preview operation for exactly
-one `--repository`; `shutdown` accepts repeated repositories and includes their
-configured/transitive Compose dependency closure.
-
-On Ubuntu hosts using Podman's legacy CNI `dnsname` plugin, an error containing
-`cni plugin dnsname failed: permission denied` can mean AppArmor blocked the
-plugin's SIGHUP reload of `dnsmasq`. Keep the exception signal-specific: add
-`signal (receive) set=(hup) peer=podman,` to
-`/etc/apparmor.d/local/usr.sbin.dnsmasq`, then reload the main profile with
-`sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.dnsmasq`. This is a host
-administrator action; Symphony reports the blocker and does not weaken security
-policy or retry the mutating Compose command automatically.
-
-During an orchestrated Jira run, Symphony verifies only repositories named by the
-exact trusted PlanSpec. When runtime verification runs, it writes a run-specific
-`<run-id>-verification.json` manifest under `<workspace>/.symphony/runtime/` with
-the PlanSpec binding, affected repositories, hook outcome, runtime check statuses,
-sanitized command arguments, and log paths. An enabled runtime is required by
-default; `runtime.required: true` makes `test_failed` block in verification and
-`environment_blocked` block in verification-environment. Set it to `false` only
-when runtime verification should remain advisory.
-
-With `runtime.shutdown_after_handoff: true`, Symphony gracefully stops the
-PlanSpec-selected services and their configured/transitive Compose dependency
-closure only after the run has completed and Jira handoff has succeeded. Blocked or
-failed runs retain their services for diagnosis and manual verification. Shutdown
-uses Compose `stop` with the configured `shutdown_grace_seconds`; it does not run
-`down`, remove containers, delete volumes, or change the runtime `.env` file. This
-preserves shared databases, networks, and other runtime state while releasing the
-run's service closure. Operators can invoke the same bounded teardown explicitly
-with the `runtime ... shutdown` command shown above.
+Ask implementation to write `.symphony/development-verification-request.json` with
+`schema_version: "1.0"` and `targets` containing each PlanSpec repository plus its
+focused `test_args`. The request cannot choose an executable or shell command.
+Symphony validates the selectors and uses the fixed repository runner. Missing or
+failed requests remain advisory; the dashboard retains the result and evidence.
 
 ## Commands
 
@@ -569,6 +428,4 @@ python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100 --dry-run
 python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100
 python3 -m symphony_jira run ./WORKFLOW.md
 python3 -m symphony_jira dashboard ./WORKFLOW.md --port 3333
-python3 -m symphony_jira runtime ./WORKFLOW.md verify --workspace /path/to/workspace --repository cpm
-python3 -m symphony_jira runtime ./WORKFLOW.md shutdown --workspace /path/to/workspace --repository cpm
 ```

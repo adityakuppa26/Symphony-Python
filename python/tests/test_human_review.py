@@ -51,17 +51,6 @@ class HumanReviewTests(unittest.TestCase):
             ("plan_changes_required", "The API contract changes."),
         )
 
-    def test_classify_human_review_triage_can_replan_only_automation(self) -> None:
-        self.assertEqual(
-            classify_human_review_triage(
-                '{"decision":"automation_plan_changes_required",'
-                '"reason":"Use the existing page object instead."}'
-            ),
-            (
-                "automation_plan_changes_required",
-                "Use the existing page object instead.",
-            ),
-        )
 
     def test_classify_human_review_triage_rejects_invalid_output(self) -> None:
         with self.subTest("not JSON"):
@@ -306,14 +295,14 @@ class HumanReviewTests(unittest.TestCase):
             artifacts.mkdir(parents=True)
             outside = root / "outside.md"
             outside.write_text("do not change", encoding="utf-8")
-            artifact = artifacts / "codex-automation-final.md"
+            artifact = artifacts / "codex-final.md"
             artifact.symlink_to(outside)
 
             write_frozen_text_artifact(
                 workspace,
-                ".symphony/codex-automation-final.md",
+                ".symphony/codex-final.md",
                 "safe result",
-                label="automation result",
+                label="implementation result",
             )
 
             self.assertEqual(outside.read_text(encoding="utf-8"), "do not change")
@@ -332,11 +321,11 @@ class HumanReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(HumanReviewContextError, "safely write"):
                 write_frozen_text_artifact(
                     workspace,
-                    ".symphony/codex-automation-final.md",
+                    ".symphony/codex-final.md",
                     "unsafe result",
-                    label="automation result",
+                    label="implementation result",
                 )
-            self.assertFalse((outside / "codex-automation-final.md").exists())
+            self.assertFalse((outside / "codex-final.md").exists())
 
     def test_runtime_manifest_evidence_binds_hook_log_exact_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -455,9 +444,6 @@ class HumanReviewTests(unittest.TestCase):
             "requirements_snapshot_hash": snapshot.calculate_content_hash(),
             "plan_spec_hash": "b" * 64,
             "plan_spec": '{"decision":"ready_for_approval"}',
-            "automation_plan_hash": "c" * 64,
-            "automation_plan": '{"decision":"update_required"}',
-            "automation_result": "Added the focused browser regression.",
             "approval": {
                 "approved_by": "Grace Approver",
                 "approval_id": "approval-3",
@@ -491,9 +477,6 @@ class HumanReviewTests(unittest.TestCase):
             '"issue_identifier": "T-7"',
             "b" * 64,
             '{"decision":"ready_for_approval"}',
-            "c" * 64,
-            '{"decision":"update_required"}',
-            "Added the focused browser regression.",
             '"approved_by": "Grace Approver"',
             "Implemented the approved plan.",
             '{"decision":"approve"}',
@@ -511,11 +494,6 @@ class HumanReviewTests(unittest.TestCase):
             "Please reuse parse_widget and add a regression test.",
             "b" * 64,
             '{"decision":"ready_for_approval"}',
-            "c" * 64,
-            '{"decision":"update_required"}',
-            "Added the focused browser regression.",
-            "Do not edit the configured automation checkout",
-            "automation_plan_changes_required",
             '"decision":"plan_changes_required"',
         ):
             self.assertIn(expected, implementation_prompt)

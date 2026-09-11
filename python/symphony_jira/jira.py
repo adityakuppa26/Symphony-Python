@@ -318,6 +318,8 @@ class JiraClient:
         if not include_comments:
             fields.remove("comment")
             fields.remove("attachment")
+        elif not self.config.requirements.include_comments:
+            fields.remove("comment")
         configured_fields = list(
             dict.fromkeys(
                 self.config.requirements.custom_fields
@@ -335,7 +337,7 @@ class JiraClient:
 
         comments: list[IssueComment] | None = None
         evidence_incomplete_reasons: list[str] = []
-        if include_comments:
+        if include_comments and self.config.requirements.include_comments:
             comments, comment_incomplete_reasons = await self._get_all_comments(key)
             evidence_incomplete_reasons.extend(comment_incomplete_reasons)
 
@@ -931,7 +933,11 @@ class JiraClient:
                         issue_url=issue_url,
                         authority=self.config.requirements.attachment_authority,
                     )
-                    comments, comment_reasons = await self._get_all_comments(identifier)
+                    comments, comment_reasons = (
+                        await self._get_all_comments(identifier)
+                        if self.config.requirements.include_comments
+                        else ([], [])
+                    )
                     attachments = raw_attachments
                     provenance_reasons = list(
                         dict.fromkeys(
@@ -1060,6 +1066,8 @@ def normalize_issue(
 ) -> Issue:
     config = requirements_config or JiraRequirementsConfig()
     classifier = requirement_classifier or MarkerRequirementClassifier()
+    if not config.include_comments:
+        comments = []
     comments_were_supplied = comments is not None
     raw_fields = payload.get("fields")
     fields = raw_fields if isinstance(raw_fields, Mapping) else {}
@@ -1214,13 +1222,19 @@ def normalize_issue(
     return issue
 
 
-def _contextualize_related_requirements(related: RelatedIssue) -> RelatedIssue:
+def _contextualize_related_requirements(
+    related: RelatedIssue, *, include_comments: bool = True,
+) -> RelatedIssue:
     requirements = [
         artifact.model_copy(update={"planning_eligible": False})
         for artifact in related.requirements
         if artifact.source_type != "attachment"
+        and (include_comments or artifact.source_type != "comment")
     ]
-    return related.model_copy(update={"requirements": requirements})
+    return related.model_copy(update={
+        "requirements": requirements,
+        "comments": related.comments if include_comments else [],
+    })
 
 
 def build_requirements_snapshot(
@@ -1335,21 +1349,26 @@ def build_requirements_snapshot(
             ),
         )
         for comment in issue.comments
-        if comment.body
+        if config.include_comments and comment.body
     ]
     snapshot_parent = (
-        _contextualize_related_requirements(issue.parent)
+        _contextualize_related_requirements(
+            issue.parent, include_comments=config.include_comments,
+        )
         if issue.parent is not None
         else None
     )
     snapshot_children = [
-        _contextualize_related_requirements(related) for related in issue.children
+        _contextualize_related_requirements(related, include_comments=config.include_comments)
+        for related in issue.children
     ]
     snapshot_linked_issues = [
-        _contextualize_related_requirements(related) for related in issue.linked_issues
+        _contextualize_related_requirements(related, include_comments=config.include_comments)
+        for related in issue.linked_issues
     ]
     snapshot_dependencies = [
-        _contextualize_related_requirements(related) for related in issue.dependencies
+        _contextualize_related_requirements(related, include_comments=config.include_comments)
+        for related in issue.dependencies
     ]
     related_issues = (
         ([snapshot_parent] if snapshot_parent is not None else [])
@@ -1919,6 +1938,8 @@ def hydrate_related_issue_context(
     attachments: list[IssueAttachment] | None = None,
     provenance_incomplete_reasons: list[str] | None = None,
 ) -> RelatedIssue:
+    if not config.include_comments:
+        comments = []
     raw_fields = payload.get("fields")
     fields = raw_fields if isinstance(raw_fields, Mapping) else {}
     names = payload.get("names") or {}

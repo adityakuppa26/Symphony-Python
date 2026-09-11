@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import symphony_jira.requirements_artifacts as requirements_artifacts
 from symphony_jira.config import WorkflowConfig
+from symphony_jira.workflow import WorkflowDefinition
 from symphony_jira.models import (
     Issue,
     RequirementArtifact,
@@ -613,8 +614,11 @@ class RequirementsArtifactTests(unittest.TestCase):
             baseline = requirement_issue("GC behavior")
             current = requirement_issue("GC and Sub behavior")
             store = SnapshotStore()
-            workflow = SimpleNamespace(
-                config=WorkflowConfig(workspace={"root": workspace / "workspaces"})
+            workflow = WorkflowDefinition(
+                path=workspace / "WORKFLOW.md",
+                raw_config={},
+                config=WorkflowConfig(workspace={"root": workspace / "workspaces"}),
+                prompt_template="",
             )
             orchestrator = SingleIssueOrchestrator(
                 workflow,  # type: ignore[arg-type]

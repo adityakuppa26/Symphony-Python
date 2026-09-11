@@ -763,15 +763,6 @@ Exact validated PlanSpec hash:
 Exact validated PlanSpec:
 {action.get("plan_spec") or "No PlanSpec was configured."}
 
-Exact frozen AutomationPlan hash:
-{action.get("automation_plan_hash") or "none"}
-
-Exact frozen AutomationPlan:
-{action.get("automation_plan") or "No automation phase was bound to this run."}
-
-Frozen automation result:
-{action.get("automation_result") or "No automation result was bound to this run."}
-
 Exact frozen approval:
 {json.dumps(action.get("approval"), ensure_ascii=False, indent=2, sort_keys=True)}
 
@@ -789,16 +780,15 @@ Submission-time workspace diff:
 
 Inspect the live workspace diff as needed and compare it with the frozen context above.
 Return exactly one JSON object:
-- {{"decision":"code_changes","reason":"..."}} when the comments are code-only and fit the exact PlanSpec and, for automation code, the exact AutomationPlan.
-- {{"decision":"automation_plan_changes_required","reason":"..."}} when only the
-  derived AutomationPlan must change while the approved development PlanSpec remains exact.
+- {{"decision":"code_changes","reason":"..."}} when the comments are code-only and fit the exact PlanSpec.
 - {{"decision":"plan_changes_required","reason":"..."}} when behavior, scope, architecture,
   acceptance criteria, affected surfaces, compatibility, or non-goals must change.
 - {{"decision":"needs_human","question":"..."}} only when the boundary cannot be determined safely.
 
-Product behavior or acceptance criteria absent from the frozen Jira snapshot require
-plan_changes_required and authoritative Jira evidence; do not treat pasted review prose
-as a new product requirement."""
+Honor accumulated explicit human decisions already accepted with the approved PlanSpec.
+New feedback that changes the approved scope requires plan_changes_required and a new
+plan approval; pasted code-review proposals do not automatically override an existing
+operator decision or create a new product requirement."""
 
 
 def build_human_review_implementation_prompt(
@@ -811,7 +801,7 @@ def build_human_review_implementation_prompt(
 
 Symphony is addressing a human review of completed run {action["source_run_id"]}.
 This is not a Jira requirements update. The exact frozen requirements snapshot,
-PlanSpec, AutomationPlan when present, and approval remain authoritative.
+PlanSpec, approval, and accepted accumulated human decisions remain authoritative.
 
 Human review action: {action["id"]}
 Reviewer: {action["reviewer_identity"]}
@@ -821,7 +811,7 @@ Pasted code-review comments:
 {action["comments"]}
 
 Read the retained workspace and current git diff. Apply only code-level feedback that
-fits the exact validated PlanSpec. Run relevant verification. Do not change the PlanSpec.
+fits the exact validated PlanSpec. Run relevant verification when available and report unavailable checks as not run; verification is advisory. Do not change the PlanSpec.
 
 Exact validated PlanSpec hash:
 {action.get("plan_spec_hash") or "none"}
@@ -829,26 +819,10 @@ Exact validated PlanSpec hash:
 Exact validated PlanSpec:
 {action.get("plan_spec") or "No PlanSpec was configured."}
 
-Exact frozen AutomationPlan hash:
-{action.get("automation_plan_hash") or "none"}
-
-Exact frozen AutomationPlan:
-{action.get("automation_plan") or "No automation phase was bound to this run."}
-
-Frozen automation result:
-{action.get("automation_result") or "No automation result was bound to this run."}
-
-Do not edit the configured automation checkout in this development pass. If the
-feedback affects automation, return automation_plan_changes_required so Symphony
-can route it through the isolated automation planning and implementation lane.
-
 If any requested change would alter behavior, scope, architecture, acceptance criteria,
 affected surfaces, compatibility, non-goals, or the development PlanSpec, do not edit
 for that request. Return:
 {{"decision":"plan_changes_required","reason":"<why the approved plan must change>"}}
-
-If only the derived automation plan must change, do not edit for that request. Return:
-{{"decision":"automation_plan_changes_required","reason":"<why automation must be replanned>"}}
 
 Otherwise leave a concise final report with files changed, verification, how each pasted
 comment was addressed, and residual risk."""
@@ -875,13 +849,6 @@ def classify_human_review_triage(message: str) -> tuple[str, str]:
         "code_only",
     }:
         return "code_changes", reason
-    if normalized in {
-        "automation_plan_changes_required",
-        "automation_plan_change_required",
-        "automation_replan",
-        "automation_replanning_required",
-    }:
-        return "automation_plan_changes_required", reason
     if normalized in {
         "plan_changes_required",
         "plan_change_required",

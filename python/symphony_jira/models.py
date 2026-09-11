@@ -258,6 +258,15 @@ class Issue(BaseModel):
     raw: dict[str, Any] | None = None
 
 
+class PlanningBaseline(BaseModel):
+    """The exact retained implementation inspected during a revised planning pass."""
+
+    source_run_id: str
+    repositories: list[str]
+    workspace_diff_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workspace_diff: str
+
+
 class RunRecord(BaseModel):
     id: str
     issue_id: str
@@ -268,12 +277,9 @@ class RunRecord(BaseModel):
     attempt: int
     started_at: datetime
     plan_spec_hash: str | None = None
-    automation_plan_hash: str | None = None
-    automation_development_diff_hash: str | None = None
-    automation_repository_diff_hash: str | None = None
-    automation_result_hash: str | None = None
     plan_approval_id: str | None = None
-    automation_plan_approval_id: str | None = None
+    planning_baseline: PlanningBaseline | None = None
+    human_input_context: str | None = None
     finished_at: datetime | None = None
     final_message: str | None = None
     error: str | None = None
@@ -281,8 +287,6 @@ class RunRecord(BaseModel):
     branch_name: str | None = None
     verification_status: str | None = None
     verification_output_path: str | None = None
-    verification_workspace_diff_hash: str | None = None
-    verification_evidence_sha256: str | None = None
 
 
 class CodexEvent(BaseModel):
