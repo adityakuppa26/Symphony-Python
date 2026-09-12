@@ -53,7 +53,9 @@ class IndependentWorkflowTests(unittest.TestCase):
         self.assertEqual(config.workspace.managed_repositories, [Path('foyr2'), Path('cpm'), Path('pi')])
         self.assertIn('--skip-git-repo-check', config.codex.args)
         self.assertFalse(config.hooks.verify_required)
-        self.assertIsNone(config.hooks.verify)
+        self.assertIn('scripts/runtime.sh', config.hooks.verify)
+        self.assertTrue(config.hooks.use_development_verification_request)
+        self.assertTrue(config.codex.select_tests_after_implementation)
         self.assertTrue(config.codex.require_plan_approval)
         self.assertTrue(config.codex.review_after_run)
 

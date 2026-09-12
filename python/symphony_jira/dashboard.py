@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .dashboard_client import DASHBOARD_SCRIPT
 from .human_review import (
     HumanReviewContextError,
     capture_workspace_diff,
@@ -399,6 +400,7 @@ def build_state(
     return {
         "workflow_path": str(workflow.path),
         "workflow_kind": workflow.config.kind,
+        "verification_configured": bool(workflow.config.hooks.verify),
         "jira_jql": workflow.config.tracker.jql,
         "poll_interval_seconds": workflow.config.polling.interval_seconds,
         "workspace_root": str(workflow.config.workspace.root),
@@ -590,6 +592,7 @@ def prepare_human_review_context(
         plan_spec,
         workspace_path,
         require_clean=False,
+        allow_descendant_head=True,
     )
     if baseline_error:
         raise HumanReviewContextError(
@@ -711,6 +714,7 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
                 event_types=tuple(event.event_type for event in events),
                 approval_required=workflow.config.codex.require_plan_approval,
                 review_required=workflow.config.codex.review_after_run,
+                verification_configured=bool(workflow.config.hooks.verify),
             ),
             "elapsed_seconds": elapsed_seconds(run),
             "plan_path": str(plan_path),
@@ -774,6 +778,8 @@ def infer_phase(run: RunRecord, latest_event_type: str | None) -> str:
         return "queued"
     if run.status == "running":
         event_type = str(latest_event_type or "").strip().lower()
+        if run.verification_status == "running" or event_type.startswith("test_selection."):
+            return "Verification"
         if event_type.startswith("development_review."):
             return "Development Review"
         if event_type.startswith("plan"):
@@ -806,6 +812,7 @@ def development_workflow_progress(
     event_types: tuple[str, ...] = (),
     approval_required: bool = False,
     review_required: bool = False,
+    verification_configured: bool = False,
 ) -> str:
     """Keep the development gates visible, including the completed handoff."""
     review_seen = any(
@@ -813,19 +820,25 @@ def development_workflow_progress(
         for event in event_types
     )
     completed = run.status == "completed"
-    implemented = review_seen or current_phase == "Development Review" or completed
+    implemented = review_seen or current_phase in {"Development Review", "Verification"} or completed
     approved = bool(run.plan_approval_id) or implemented or current_phase == "Development Implementation"
     planned = bool(run.plan_spec_hash) or approved or current_phase == "Dev Approval"
     stages = (
         ("Planning", "Development Planning", planned, True),
         ("Human approval", "Dev Approval", approved, approval_required),
         ("Implementation", "Development Implementation", implemented, True),
+        *((("Tests", "Verification", run.verification_status not in {None, "running"}, True),)
+          if verification_configured else ()),
         ("Code review", "Development Review", completed and review_required, review_required),
         ("Handoff", "completed", completed, True),
     )
     result = []
     for label, phase, done, required in stages:
-        if current_phase == phase and run.status == "blocked":
+        if phase == "Verification" and run.verification_status in {
+            "failed", "environment_error", "partial", "not_run", "stale",
+        }:
+            status = run.verification_status.replace("_", " ")
+        elif current_phase == phase and run.status == "blocked":
             status = "awaiting approval" if phase == "Dev Approval" else "blocked"
         elif current_phase == phase and run.status == "running":
             status = "running"
@@ -863,6 +876,10 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     running = render_issue_chips(state["running_issues"])
     queued = render_issue_chips(state["queued_issues"])
     blocked = render_issue_chips(state["blocked_issues"])
+    verification_step = (
+        '<strong>Tests</strong><span aria-hidden="true">→</span>'
+        if state.get("verification_configured") else ""
+    )
     if not rows:
         rows = '<tr><td colspan="6" class="empty-state">No runs yet. Issues matching the workflow settings will appear here.</td></tr>'
 
@@ -909,10 +926,12 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     .badge-completed, .badge-passed {{ background: #e8f7ee; color: #167a45; }}
     .badge-running {{ background: #e8f1ff; color: #1d63c6; }}
     .badge-blocked, .badge-failed {{ background: #feeeee; color: #c12b2b; }}
+    .badge-environment-error, .badge-stale, .badge-partial {{ background: #fff4d6; color: #9a5b00; }}
     .badge-awaiting-approval {{ background: #fff4d6; color: #9a5b00; }}
     .badge-queued, .badge-pending, .badge-not-configured {{ background: #f1f4f8; color: #64748b; }}
     .phase-name {{ font-size: 0.84rem; font-weight: 720; }}
     .blocked-label {{ margin-top: 0.35rem; color: #b42318; font-size: 0.73rem; font-weight: 700; }}
+    .waiting-label {{ margin-top: 0.35rem; color: #805000; font-size: 0.73rem; font-weight: 700; }}
     .pipeline {{ margin-top: 0.4rem; }}
     .pipeline summary {{ color: #64748b; font-size: 0.72rem; font-weight: 650; }}
     .stage-list {{ display: grid; gap: 0.35rem; margin: 0.6rem 0 0; padding: 0; list-style: none; min-width: 11rem; }}
@@ -920,6 +939,8 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     .stage-done {{ background: #e8f7ee; color: #167a45; }}
     .stage-running {{ background: #e8f1ff; color: #1d63c6; }}
     .stage-blocked {{ background: #feeeee; color: #c12b2b; }}
+    .stage-failed {{ background: #feeeee; color: #c12b2b; }}
+    .stage-environment-error, .stage-partial, .stage-stale {{ background: #fff4d6; color: #9a5b00; }}
     .stage-awaiting-approval {{ background: #fff4d6; color: #805000; }}
     .details-stack {{ display: grid; gap: 0.42rem; min-width: 16rem; }}
     .attempt-history-list {{ list-style: none; padding: 0; margin: 0.6rem 0 0; }}
@@ -974,6 +995,20 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
       .stage-list {{ grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); }}
       details {{ max-width: 100%; }}
     }}
+    [hidden] {{ display: none !important; }}
+    .alert-controls {{ margin-top: 1rem; padding: 1rem; border: 1px solid #dfe6ef; border-radius: 12px; background: white; }}
+    .alert-buttons, .case-tools {{ display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }}
+    .volume-control {{ display: flex; align-items: center; gap: 0.5rem; }}
+    .volume-control input {{ width: 7rem; padding: 0; }}
+    .volume-control output {{ min-width: 3rem; }}
+    .attention-banner {{ margin-top: 0.8rem; padding: 0.8rem 1rem; border-radius: 9px; background: #e8f7ee; font-size: 0.87rem; }}
+    .attention-banner a {{ margin-left: 0.7rem; color: #1d4ed8; }}
+    .needs-attention {{ background: #fff4d6; border-left: 4px solid #a96800; }}
+    .case-tools {{ margin-bottom: 0.8rem; }}
+    select {{ padding: 0.6rem; border: 1px solid #aab8c9; border-radius: 7px; background: white; font: inherit; }}
+    .badge-input-needed, .badge-approval-needed {{ background: #fff4d6; color: #805000; }}
+    .badge-handed-off {{ background: #e8f7ee; color: #167a45; }}
+    .badge-resume-queued {{ background: #e8f1ff; color: #1d63c6; }}
   </style>
 </head>
 <body>
@@ -985,14 +1020,15 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     <nav class="workflow-guide" aria-label="Development workflow">
       <strong>Planning</strong><span aria-hidden="true">→</span>
       <strong>Human approval</strong><span aria-hidden="true">→</span>
-      <strong>Implementation</strong><span aria-hidden="true">↔</span>
+      <strong>Implementation</strong><span aria-hidden="true">→</span>
+      {verification_step}
       <strong>Code review</strong><span aria-hidden="true">→</span>
       <strong>Handoff</strong>
     </nav>
     <div class="grid">
       {render_queue_panel("Running", state["running_issues"], running, "running")}
       {render_queue_panel("Queued", state["queued_issues"], queued, "queued")}
-      {render_queue_panel("Blocked", state["blocked_issues"], blocked, "blocked")}
+      {render_queue_panel("Needs your input", state["blocked_issues"], blocked, "blocked")}
     </div>
     <details class="settings">
       <summary>Workflow settings</summary>
@@ -1002,26 +1038,28 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
         <div><strong>Workspace</strong><br><code>{escape(state["workspace_root"])}</code><br><code>{escape(state["workflow_path"])}</code></div>
       </div>
     </details>
+    <section class="alert-controls" aria-label="Human input notifications">
+      <div class="alert-buttons">
+        <button id="sound-toggle" type="button" aria-pressed="false">Enable sound</button>
+        <label class="volume-control" for="alert-volume">Volume <input id="alert-volume" type="range" min="0" max="100" step="5" value="50"><output id="volume-value" for="alert-volume">50%</output></label>
+        <button id="desktop-toggle" class="secondary-button" type="button">Enable desktop alerts</button>
+      </div>
+      <p class="preview">Sound requires enabling in each tab. Keep this dashboard open for alerts. <span id="alert-status" role="status">Connecting…</span></p>
+    </section>
+    <div id="attention-banner" class="attention-banner" role="status"><strong id="attention-summary">Checking for human input…</strong> <a href="/">Load latest cases</a></div>
     <h2>Recent cases</h2>
+    <div class="case-tools">
+      <label>Find a case<input id="case-search" type="search" placeholder="Search issue key"></label>
+      <label>Show<select id="case-filter"><option value="all">All cases</option><option value="attention">Needs your input</option><option value="running">Running</option><option value="queued">Queued to resume</option><option value="completed">Handed off</option><option value="failed">Failed</option></select></label>
+      <span id="case-count" class="muted" role="status"></span>
+    </div>
     <div class="table-shell"><table>
       <thead><tr><th>Issue</th><th>Status</th><th>Phase</th><th>Verification</th><th>Elapsed</th><th>Details</th></tr></thead>
       <tbody>{rows}</tbody>
     </table></div>
   </main>
   <script type="text/javascript">
-    let interacting = false;
-    const pauseRefresh = () => {{
-      interacting = true;
-      document.getElementById("refresh-status").textContent = "Refresh paused while you read or edit";
-    }};
-    document.addEventListener("input", pauseRefresh);
-    document.addEventListener("click", (event) => {{
-      if (event.target.closest("summary")) pauseRefresh();
-    }});
-    document.addEventListener("keydown", (event) => {{
-      if (event.target.closest("summary") && ["Enter", " "].includes(event.key)) pauseRefresh();
-    }});
-    setInterval(() => {{ if (!interacting && !document.hidden) window.location.reload(); }}, 60000);
+    {DASHBOARD_SCRIPT}
   </script>
 </body>
 </html>"""
@@ -1046,20 +1084,45 @@ def render_run_row(
     blocked_phase = workflow_phase_label(run, display_blocked_phase(run))
     current_phase = workflow_phase_label(run, str(run.get("current_phase") or ""))
     phase_cell = f'<div class="phase-name">{escape(current_phase)}</div>'
-    if blocked_phase:
-        phase_cell += f'<div class="blocked-label">Blocked: {escape(blocked_phase)}</div>'
+    if blocked_phase and not run.get("human_input_submitted"):
+        if run.get("human_input_actionable"):
+            phase_cell += '<div class="waiting-label">Waiting for your response</div>'
+        else:
+            phase_cell += f'<div class="blocked-label">Blocked: {escape(blocked_phase)}</div>'
     phase_cell += render_phase_progress(phase_progress)
     status = display_status(run)
     verification = str(run.get("verification_status") or "not configured")
-    verification_note = '<div class="verification-note">Advisory · does not block handoff</div>'
+    verification_explanation = {
+        "failed": "Some tests failed. Review the verification output.",
+        "environment_error": "Test setup or runtime unavailable.",
+        "partial": "Some coverage was skipped.",
+        "not_run": "No tests were executed.",
+        "stale": "Code changed; results no longer match.",
+        "passed": "Selected tests passed.",
+        "running": "Selecting or running focused tests.",
+    }.get(verification, "Tests are not configured for this run.")
+    verification_note = (
+        f'<div class="verification-note">{escape(verification_explanation)}</div>'
+        '<div class="verification-note">Advisory · does not block handoff</div>'
+    )
+    if run.get("verification_output_path"):
+        verification_note += (
+            '<details class="verification-note"><summary>Result location</summary>'
+            f'<code>{escape(run["verification_output_path"])}</code></details>'
+        )
     attempts_note = (
         f' · {len(earlier_attempts) + 1} recent attempts' if earlier_attempts else ""
     )
     details = render_run_details(run, final_message)
     if earlier_attempts:
         details += render_attempt_history(earlier_attempts)
+    filter_status = (
+        "attention" if run.get("human_input_actionable") else
+        "queued" if run.get("human_input_submitted") else str(run.get("status") or "")
+    )
+    case_search = str(run.get("issue_identifier") or "").lower()
     return (
-        f'<tr class="run-{status_class(status)}">'
+        f'<tr class="run-{status_class(status)}" data-case="{escape(case_search)}" data-filter="{escape(filter_status)}">'
         f'<td data-label="Issue"><div class="issue-key">{escape(run.get("issue_identifier"))}</div>'
         f'<div class="issue-meta">attempt {escape(run.get("attempt"))}{attempts_note}</div></td>'
         f'<td data-label="Status">{render_badge(status)}</td>'
@@ -1650,8 +1713,14 @@ def display_blocked_phase(run: dict[str, Any]) -> str:
 
 
 def display_status(run: dict[str, Any]) -> str:
+    if run.get("human_input_submitted"):
+        return "resume queued"
+    if run.get("human_input_actionable") and run.get("blocked_phase") != "planning_approval":
+        return "input needed"
+    if run.get("status") == "completed":
+        return "handed off"
     if run.get("status") == "blocked" and run.get("blocked_phase") == "planning_approval":
-        return "plan completed"
+        return "approval needed"
     return str(run.get("status") or "")
 
 

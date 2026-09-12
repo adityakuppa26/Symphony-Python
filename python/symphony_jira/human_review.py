@@ -34,6 +34,7 @@ class HumanReviewContextError(RuntimeError):
 class WorkspaceDiffSnapshot:
     content: str
     content_hash: str
+    changed_repositories: tuple[str, ...] = ()
 
 
 def capture_workspace_diff(
@@ -49,6 +50,7 @@ def capture_workspace_diff(
     workspace_root = workspace_path.resolve()
     digest = hashlib.sha256()
     sections: list[str] = []
+    changed_repositories: list[str] = []
     baseline_shas = (
         {
             baseline.repository.strip(): baseline.sha
@@ -87,10 +89,15 @@ def capture_workspace_diff(
         actual_head = actual_head_output.decode("ascii", errors="strict").strip()
         baseline_sha = baseline_shas.get(repository_name)
         if baseline_sha is not None and actual_head != baseline_sha:
-            raise HumanReviewContextError(
-                f"review repository {repository_name!r} moved from approved HEAD "
-                f"{baseline_sha} to {actual_head or 'unknown'}"
-            )
+            ancestor = _run_git_bytes(
+                repository_path, ["merge-base", baseline_sha, actual_head],
+                timeout_seconds=timeout_seconds,
+            ).decode("ascii").strip()
+            if ancestor.lower() != baseline_sha.lower():
+                raise HumanReviewContextError(
+                    f"review repository {repository_name!r} no longer descends from "
+                    f"approved HEAD {baseline_sha}: current HEAD is {actual_head}"
+                )
 
         status_output = _run_git_bytes(
             repository_path,
@@ -103,7 +110,7 @@ def capture_workspace_diff(
         )
         diff_output = _run_git_bytes(
             repository_path,
-            ["diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+            ["diff", "--binary", "--no-ext-diff", baseline_sha or "HEAD", "--"],
             timeout_seconds=timeout_seconds,
         )
         _validate_captured_size(
@@ -137,6 +144,8 @@ def capture_workspace_diff(
             for entry in _nul_paths(status_output)
             if not _status_entry_is_symphony_artifact(entry)
         ]
+        if status_lines or diff_output or untracked_paths:
+            changed_repositories.append(repository_name)
         digest.update(b"\0status\0")
         for entry in status_lines:
             digest.update(entry.encode("utf-8", errors="surrogateescape"))
@@ -177,7 +186,10 @@ def capture_workspace_diff(
         content.encode("utf-8", errors="surrogateescape"),
         "frozen workspace diff",
     )
-    return WorkspaceDiffSnapshot(content=content, content_hash=digest.hexdigest())
+    return WorkspaceDiffSnapshot(
+        content=content, content_hash=digest.hexdigest(),
+        changed_repositories=tuple(changed_repositories),
+    )
 
 
 def issue_from_frozen_snapshot(

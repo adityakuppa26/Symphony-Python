@@ -1,35 +1,54 @@
-# Symphony
+# Symphony Jira
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
+A Python development orchestrator that turns Jira requirements into reviewed code
+using the local Codex CLI.
 
-[![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
+The workflow is **planning → human approval → implementation → focused tests →
+code review → handoff**. Verification is advisory. Later human feedback resumes
+the existing implementation with its saved plan, requirements, and review context.
 
-_In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
+## Run
 
-> [!WARNING]
-> Symphony is a low-key engineering preview for testing in trusted environments.
+The application lives in `python/`; existing command and configuration paths are
+unchanged. From that directory, using its configured virtual environment:
 
-# Symphony Jira Python MVP
-
-It uses Jira REST credentials from `WORKFLOW.md`, prepares a per-issue local
-workspace, runs the locally installed `codex` CLI with `codex exec --json`, stores
-run data in SQLite, and posts Jira comments from the Python orchestrator.
-
-It does not require `OPENAI_API_KEY` or `CODEX_API_KEY`. Codex authentication is
-whatever the local `codex` CLI already uses.
-
-## Commands
-
-Run these commands from `python/`. `WORKFLOW.md` configures the development
-orchestrator: planning, human approval, implementation, code review, and handoff.
-Test execution is optional, and later human feedback resumes the saved context.
-See the [Python workflow guide](python/README.md) for configuration and dashboard usage.
-
-```bash
-python3 -m symphony_jira validate ./WORKFLOW.md
-python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100 --dry-run
-python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100
-python3 -m symphony_jira run ./WORKFLOW.md
-python3 -m symphony_jira dashboard ./WORKFLOW.md --port 3333
+```sh
+cd python
+.venv/bin/python -m symphony_jira validate ./WORKFLOW.md
+.venv/bin/python -m symphony_jira run ./WORKFLOW.md
 ```
+
+Run the dashboard in another terminal:
+
+```sh
+cd python
+.venv/bin/python -m symphony_jira dashboard ./WORKFLOW.md --port 3333
+```
+
+See the [Python workflow guide](python/README.md) for setup, Jira configuration,
+approvals, feedback, and host test execution. The active configuration and agent
+instructions are in [WORKFLOW.md](python/WORKFLOW.md).
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `python/symphony_jira/` | CLI, Jira ingestion, orchestration, planning, saved context, dashboard, and verification |
+| `python/symphony_jira/handlers/development.py` | Development planning, implementation, and review policy |
+| `python/scripts/` | Host-side test runtime and container adapters |
+| `python/tests/` | Python regression tests and browser-client behavior checks |
+| `python/pyproject.toml`, `python/uv.lock` | Python package metadata and dependency lock |
+| `python/WORKFLOW.md` | Development workflow configuration and prompts |
+
+Local run data, approvals, artifacts, and caches live in `python/.symphony/` and
+are excluded from version control. Preserve this directory when continuing
+existing cases.
+
+## Check changes
+
+```sh
+cd python
+.venv/bin/python -m pytest -q
+```
+
+The project retains its [Apache 2.0 license](LICENSE) and [copyright notice](NOTICE).

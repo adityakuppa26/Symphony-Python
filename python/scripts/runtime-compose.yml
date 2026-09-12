@@ -1,0 +1,23 @@
+# Layered over Compost by Symphony only. The original images and files are unchanged.
+services:
+  ibis:
+    volumes:
+      - ${SYMPHONY_RUNTIME_SCRIPTS}/runtime-dependencies.py:/symphony-runtime/runtime-dependencies.py:ro
+      - ${SYMPHONY_RUNTIME_CACHE}:/symphony-cache:ro
+      - ${SYMPHONY_RUNTIME_SCRIPTS}/ibis-runtime.sh:/symphony-runtime/ibis-runtime.sh:ro
+    environment:
+      SYMPHONY_HTTP_PROXY: ${HTTP_PROXY:-}
+      SYMPHONY_HTTPS_PROXY: ${HTTPS_PROXY:-}
+      SYMPHONY_NO_PROXY: ${NO_PROXY:-}
+    command: ["/bin/bash", "/symphony-runtime/ibis-runtime.sh"]
+  foyr:
+    volumes:
+      - ${SYMPHONY_RUNTIME_SCRIPTS}/runtime-dependencies.py:/symphony-runtime/runtime-dependencies.py:ro
+      - ${SYMPHONY_RUNTIME_CACHE}:/symphony-cache:ro
+      - ${SYMPHONY_RUNTIME_SCRIPTS}/foyr-runtime.sh:/symphony-runtime/foyr-runtime.sh:ro
+      - ${SYMPHONY_RUNTIME_SCRIPTS}/foyr-frontend-tests.sh:/symphony-runtime/foyr-frontend-tests.sh:ro
+    environment:
+      SYMPHONY_HTTP_PROXY: ${HTTP_PROXY:-}
+      SYMPHONY_HTTPS_PROXY: ${HTTPS_PROXY:-}
+      SYMPHONY_NO_PROXY: ${NO_PROXY:-}
+    command: ["/bin/bash", "/symphony-runtime/foyr-runtime.sh"]

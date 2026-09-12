@@ -921,7 +921,9 @@ class OrchestratorTests(unittest.TestCase):
                     workflow,
                     issue,
                     store,
+                    commit_implementation=True,
                 )
+                self.assertIn("+committed implementation", action["workspace_diff"])
                 jira = FakeJira(issue)
                 runner = CompletedReviewCodexRunner("code_changes")
                 polling = PollingOrchestrator(
@@ -2438,6 +2440,8 @@ def create_completed_review_action(
     workflow,
     issue: Issue,
     store: Store,
+    *,
+    commit_implementation: bool = False,
 ):
     frozen_issue = hydrated_test_issue(issue)
     workspace_path = root / "workspaces" / issue.identifier
@@ -2501,6 +2505,11 @@ def create_completed_review_action(
         final_message="Original implementation completed.",
         verification_status="passed",
     )
+    if commit_implementation:
+        repository = workspace_path / "repo"
+        (repository / "implemented.txt").write_text("committed implementation\n")
+        subprocess.run(["git", "-C", str(repository), "add", "implemented.txt"], check=True)
+        commit_test_git_repository(repository, "implementation completed")
     action, result_run = store.create_human_review_action(
         source_run.id,
         reviewer_identity="reviewer@example.test",

@@ -13,6 +13,7 @@ from .codex_runner import CodexRunner, CodexRunResult
 from .config import CodexConfig, WorkflowConfig
 from .handlers import workflow_handler
 from .development_verification import (
+    DevelopmentVerificationRequest,
     read_development_verification_request,
 )
 from .human_review import (
@@ -502,6 +503,7 @@ Apply explicit human decisions using the shared human decision policy."""
         blocked_phase: str | None = None
         verification_status: str | None = None
         verification_output_path: str | None = None
+        verification_feedback = ""
         review_message: str | None = None
         trusted_development_plan: PlanSpec | None = None
 
@@ -976,6 +978,7 @@ Apply explicit human decisions using the shared human decision policy."""
                     issue=issue,
                     requirements_snapshot_hash=requirements_snapshot_hash,
                     legacy_frozen_plan=False,
+                    allow_descendant_head=True,
                 )
                 if plan_change:
                     if active_plan_approval_id:
@@ -1117,11 +1120,25 @@ Apply explicit human decisions using the shared human decision policy."""
                         request_path: str | None = None
                         request_hash: str | None = None
                         request_error: str | None = None
+                        selected_request: DevelopmentVerificationRequest | None = None
                         if self.config.hooks.use_development_verification_request:
                             request_path = (
                                 self.config.codex.output_development_verification_request_file
                             )
+                            if self.config.codex.select_tests_after_implementation:
+                                selected_request, total_event_offset, request_error = await self._select_development_tests(
+                                    issue=issue, run_id=run.id, workspace_path=workspace.path,
+                                    plan=trusted_development_plan, plan_message=plan_message,
+                                    implementation_message=final_message, event_offset=total_event_offset,
+                                )
+                                if selected_request is not None:
+                                    affected_repositories = tuple(
+                                        sorted({target.repository for target in selected_request.targets}
+                                               | {target.repository for target in selected_request.skipped})
+                                    )
                             try:
+                                if request_error:
+                                    raise ValueError(request_error)
                                 request, request_hash = (
                                     read_development_verification_request(
                                         workspace.path,
@@ -1149,6 +1166,13 @@ Apply explicit human decisions using the shared human decision policy."""
                                 label="development verification selection error",
                             )
                         else:
+                            update_current_run(run.id, verification_status="running")
+                            if selected_request is not None:
+                                write_frozen_text_artifact(
+                                    workspace.path, self.config.codex.output_development_verification_result_file,
+                                    json.dumps({"status": "running", "workspace_diff_hash": selected_request.workspace_diff_hash}),
+                                    label="pending verification result",
+                                )
                             verify = await self._run_verification_hook(
                                 "verify",
                                 self.config.hooks.verify,
@@ -1165,6 +1189,35 @@ Apply explicit human decisions using the shared human decision policy."""
                                 "passed" if verify.succeeded else "failed"
                             )
                             verification_output_path = str(verify.log_path)
+                            output_excerpt = verify.output if len(verify.output) <= 24000 else (
+                                verify.output[:12000] + "\n[Middle of host output omitted; see the full hook log.]\n" + verify.output[-12000:]
+                            )
+                            verification_feedback = self.redact(output_excerpt) or ""
+                            if selected_request is not None:
+                                try:
+                                    report = json.loads(read_frozen_text_artifact(
+                                        workspace.path, self.config.codex.output_development_verification_result_file,
+                                        label="host verification result", required=True,
+                                    ) or "{}")
+                                    if report.get("workspace_diff_hash") != selected_request.workspace_diff_hash or report.get("status") not in {
+                                        "passed", "failed", "environment_error", "partial", "not_run", "stale",
+                                    }:
+                                        raise ValueError("host verification result is missing or not bound to the selected code")
+                                    if report["status"] == "passed" and not verify.succeeded:
+                                        raise ValueError("host verification command failed despite a passing report")
+                                    verification_status = str(report["status"])
+                                    archive_path = f".symphony/verification/{run.id}-{generation_pass}.json"
+                                    write_frozen_text_artifact(workspace.path, archive_path,
+                                        json.dumps({**report, "output": verification_feedback}, indent=2),
+                                        label="run verification evidence")
+                                    verification_output_path = str(workspace.path / archive_path)
+                                    verification_feedback = json.dumps(report, indent=2) + "\n\n" + verification_feedback
+                                except (HumanReviewContextError, ValueError) as exc:
+                                    verification_status = "environment_error"
+                                    verification_feedback = f"{exc}\n{verification_feedback}"
+
+                        if request_error:
+                            verification_feedback = request_error
 
                         update_current_run(
                             run.id,
@@ -1236,6 +1289,7 @@ Apply explicit human decisions using the shared human decision policy."""
                     issue=issue,
                     requirements_snapshot_hash=requirements_snapshot_hash,
                     legacy_frozen_plan=False,
+                    allow_descendant_head=True,
                 )
                 if plan_change:
                     if active_plan_approval_id:
@@ -1274,6 +1328,10 @@ Apply explicit human decisions using the shared human decision policy."""
                     plan_message=plan_message,
                     requirements_snapshot_hash=requirements_snapshot_hash,
                     plan_artifact_path=self.config.codex.output_plan_file if plan_message else None,
+                    verification_feedback=(
+                        f"Status: {verification_status}\n{verification_feedback}"
+                        if verification_status != "not_configured" else None
+                    ),
                 )
                 review_output_file = (
                     self.config.codex.output_review_file
@@ -1493,6 +1551,96 @@ Apply explicit human decisions using the shared human decision policy."""
         assert stored_run is not None
         return OnceResult(issue=issue, prompt=prompt, run=stored_run, workspace=workspace, dry_run=False)
 
+    async def _select_development_tests(
+        self, *, issue: Issue, run_id: str, workspace_path: Path,
+        plan: PlanSpec | None, plan_message: str | None,
+        implementation_message: str | None, event_offset: int,
+    ) -> tuple[DevelopmentVerificationRequest | None, int, str | None]:
+        """Select tests from the actual implemented diff, then freeze the request."""
+        if plan is None:
+            return None, event_offset, "Test selection requires the approved PlanSpec"
+        try:
+            before = capture_workspace_diff(workspace_path, plan,
+                managed_repositories=managed_workspace_repositories(self.config))
+            changed = before.changed_repositories
+            if not set(changed) <= set(plan.affected_surface.repositories):
+                raise ValueError("Implemented changes include repositories outside the approved PlanSpec")
+            if not changed:
+                request = DevelopmentVerificationRequest(schema_version="1.0", targets=[])
+            else:
+                prompt = f"""Select focused development tests for Jira issue {issue.identifier}.
+
+This is a read-only test-selection pass after implementation. Inspect the actual
+changes and nearby existing tests. Factor in the approved PlanSpec and accumulated
+human decisions, including explicitly waived criteria. Do not edit application code,
+start services, invoke Podman, install dependencies, or run tests yourself. Symphony
+will prepare the services and execute your request outside the Codex sandbox.
+
+Cover exactly these changed repositories with targets or justified skipped entries:
+{json.dumps(changed)}
+Choose existing focused test files/classes/functions that exercise the implemented
+behavior. Include regression tests added or changed by implementation. Avoid whole
+repository suites. Select Python tests with suite=python and literal pytest arguments;
+CPM currently supports focused paths under Test/unit/ in the cpm container only.
+CPM api/ tests require a separate ibis runtime and functional tests require testdb;
+neither is configured for this milestone. Record missing coverage instead of routing
+those tests to cpm. For Foyr select Python files under tests/. Use explicit relative
+test paths (optionally ::Class::test), with -k/-m filters or concise pytest output flags.
+for Foyr browser JavaScript tests choose suite=karma with one selector relative to
+foyr/web/karma_test (for example cpm/home/homeTest.js). The host runner prepares
+compiled frontend tests when dependencies/assets/browser are available. A missing
+runtime is an environment result, never a product clarification or reason to edit code.
+If a changed surface lacks an applicable test, report the gap in a skipped entry;
+do not label backend-only coverage as complete verification of frontend changes.
+
+Return exactly one JSON object with schema_version=1.0, targets, and optionally skipped.
+Enabled suites for this workflow: {json.dumps(self.config.codex.development_test_suites)}.
+Do not request disabled suites; record the uncovered behavior in skipped entries.
+Each target: repository, suite (one of the enabled suites), test_args (array), reason (why it covers
+the changed behavior). Each skipped entry: repository, reason. No shell commands.
+The host will add the code-hash binding; do not infer verification success.
+
+Approved PlanSpec:
+{plan_message}
+
+Implementation report:
+{implementation_message or "none"}
+
+Actual workspace diff (SHA-256 {before.content_hash}):
+{before.content}
+"""
+                config = read_only_codex_config(self.config.codex).model_copy(update={
+                    "output_last_message_file": self.config.codex.output_development_verification_request_file,
+                })
+                result, event_offset = await self._run_codex_pass(
+                    prompt=prompt, workspace_path=workspace_path, config=config,
+                    run_id=run_id, event_offset=event_offset, event_prefix="test_selection",
+                )
+                if result.status != "completed":
+                    return None, event_offset, result.error or "Test selection did not complete"
+                request = DevelopmentVerificationRequest.model_validate_json(result.final_message or "")
+                if any(target.suite not in self.config.codex.development_test_suites for target in request.targets):
+                    raise ValueError("Test selection requested a suite disabled by this workflow")
+                request.validate_repositories(changed)
+                after = capture_workspace_diff(workspace_path, plan,
+                    managed_repositories=managed_workspace_repositories(self.config))
+                if after.content_hash != before.content_hash:
+                    raise ValueError("Code changed during read-only test selection; test results would be stale")
+            request = DevelopmentVerificationRequest.model_validate({
+                **request.model_dump(),
+                "workspace_diff_hash": before.content_hash,
+                "snapshot_repositories": sorted(
+                    set(managed_workspace_repositories(self.config))
+                    | {item.repository for item in plan.baseline_repository_shas}
+                ),
+            })
+            write_frozen_text_artifact(workspace_path,
+                self.config.codex.output_development_verification_request_file,
+                request.model_dump_json(indent=2), label="selected development tests")
+            return request, event_offset, None
+        except (HumanReviewContextError, ValueError) as exc:
+            return None, event_offset, str(exc)
+
     async def _run_verification_hook(
         self,
         name: str,
@@ -1681,6 +1829,7 @@ Apply explicit human decisions using the shared human decision policy."""
             issue=issue,
             requirements_snapshot_hash=requirements_snapshot_hash,
             legacy_frozen_plan=False,
+            allow_descendant_head=True,
         )
         if plan_change:
             if active_plan_approval_id:
@@ -2882,6 +3031,7 @@ def build_review_prompt(
     plan_message: str | None = None,
     requirements_snapshot_hash: str | None = None,
     plan_artifact_path: str | None = None,
+    verification_feedback: str | None = None,
 ) -> str:
     return f"""You are reviewing a completed implementation for Jira issue {issue.identifier}.
 
@@ -2915,6 +3065,13 @@ Decision contract:
 - If you cannot emit JSON, start with `APPROVE`, `CHANGES_REQUIRED`,
   or `PLAN_CHANGES_REQUIRED`, then explain concisely.
 - Empty, ambiguous, or unrecognized decisions fail closed and block the review.
+
+Host test execution evidence (advisory):
+{verification_feedback or "No host test result was supplied."}
+Distinguish failed assertions from unavailable runtime/dependencies. Use concrete
+code/test failures when reviewing corrections; do not ask Codex to repair infrastructure.
+Missing, skipped, or stale verification must be reported honestly and does not alone
+block handoff. Do not repeat a human-waived criterion as a test requirement.
 
 Implementation final message:
 {implementation_message or "No implementation final message was produced."}
@@ -3025,7 +3182,9 @@ def retained_planning_context(
             break
     if source_plan is None:
         raise PlanSpecError("Retained implementation's exact approved PlanSpec is unavailable")
-    baseline_error = validate_plan_repository_baselines(source_plan, workspace_path)
+    baseline_error = validate_plan_repository_baselines(
+        source_plan, workspace_path, allow_descendant_head=True,
+    )
     if baseline_error:
         raise PlanSpecError(baseline_error)
     repositories = sorted(
@@ -3034,6 +3193,7 @@ def retained_planning_context(
     )
     diff = capture_workspace_diff(
         workspace_path, source_plan, managed_repositories=tuple(repositories),
+        include_plan_repositories=False,
     )
     baseline = PlanningBaseline(
         source_run_id=source.id,
@@ -3404,6 +3564,7 @@ def validate_plan_repository_baselines(
     *,
     timeout_seconds: float = GIT_BASELINE_TIMEOUT_SECONDS,
     require_clean: bool = False,
+    allow_descendant_head: bool = False,
 ) -> str | None:
     workspace_root = workspace_path.resolve()
     repository_paths: dict[str, Path] = {}
@@ -3476,7 +3637,17 @@ def validate_plan_repository_baselines(
             suffix = f": {detail[-1][:300]}" if detail else ""
             return f"Git HEAD is unavailable for baseline repository {repository_name!r}{suffix}."
         actual_sha = head_result.stdout.strip()
-        if actual_sha.lower() != baseline.sha.lower():
+        matches = actual_sha.lower() == baseline.sha.lower()
+        if not matches and allow_descendant_head and not require_clean:
+            try:
+                ancestor = subprocess.run(
+                    ["git", "-C", str(repository_path), "merge-base", "--is-ancestor", baseline.sha, actual_sha],
+                    capture_output=True, check=False, timeout=timeout_seconds,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                return f"Git ancestry verification failed for repository {repository_name!r}: {exc}"
+            matches = ancestor.returncode == 0
+        if not matches:
             return (
                 f"Repository baseline drift for {repository_name!r}: PlanSpec declares "
                 f"{baseline.sha}, but git rev-parse HEAD is {actual_sha}. Replan and obtain approval "
@@ -3573,6 +3744,7 @@ def validate_plan_artifact(
     issue: Issue,
     requirements_snapshot_hash: str,
     legacy_frozen_plan: bool = False,
+    allow_descendant_head: bool = False,
 ) -> str | None:
     if not expected_hash:
         return None
@@ -3613,7 +3785,9 @@ def validate_plan_artifact(
         return f"Validated PlanSpec artifact is no longer valid: {exc}"
     if plan_spec.content_hash() != expected_hash:
         return "Validated PlanSpec artifact changed after planning; prior plan approval is invalid."
-    baseline_error = validate_plan_repository_baselines(plan_spec, workspace_path)
+    baseline_error = validate_plan_repository_baselines(
+        plan_spec, workspace_path, allow_descendant_head=allow_descendant_head,
+    )
     if baseline_error:
         return f"Validated PlanSpec repository baseline is invalid: {baseline_error}"
     return None
@@ -3850,8 +4024,6 @@ def classify_review_decision(review_message: str | None) -> str:
     structured = parse_review_json(review_message)
     if structured:
         decision = str(structured.get("decision") or structured.get("status") or "").strip().lower()
-        if decision in {*()}:
-            return "invalid"
         if decision in {
             "plan_changes_required",
             "plan changes required",
@@ -3866,8 +4038,6 @@ def classify_review_decision(review_message: str | None) -> str:
     normalized = review_message.strip().lower()
     first_line = normalized.splitlines()[0] if normalized else ""
     legacy_token = first_line.split(":", 1)[0].strip()
-    if legacy_token in {*()}:
-        return "invalid"
     if legacy_token in {"plan_changes_required", "plan changes required"}:
         return "plan_changes_required"
     if legacy_token in {"changes_required", "changes required"}:

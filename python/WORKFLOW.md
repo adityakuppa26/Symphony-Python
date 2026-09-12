@@ -87,10 +87,23 @@ hooks:
     git -C foyr2 status --short
     git -C cpm status --short
     git -C pi status --short
-  # Optional trusted checks can be configured here; failures remain advisory.
-  verify: null
+  # Codex selects tests from the implemented diff; Symphony owns service setup/execution.
+  verify: |
+    /home/adkuppa/Symphony-Python/python/.venv/bin/python -m symphony_jira.development_verification \
+      --workspace "{{ workspace_path }}" \
+      --request "{{ verification_request_path }}" \
+      --sha256 "{{ verification_request_hash }}" \
+      --entrypoint /home/adkuppa/Symphony-Python/python/scripts/test.sh \
+      --runtime-entrypoint /home/adkuppa/Symphony-Python/python/scripts/runtime.sh \
+      --prepare-with-test \
+      --result "{{ config.codex.output_development_verification_result_file }}" \
+      --plan "{{ config.codex.output_plan_file }}" \
+      --timeout-seconds 1800
   verify_required: false
-  use_development_verification_request: false
+  # Release only runtime services and temporary runners owned by this workspace.
+  after_run: |
+    /home/adkuppa/Symphony-Python/python/scripts/runtime.sh down "{{ workspace_path }}"
+  use_development_verification_request: true
   timeout_seconds: 10800
 
 agent:
@@ -100,9 +113,9 @@ agent:
   timeout_seconds: 7200
 
 codex:
-  # Use the installed 0.153.4 CLI; PATH currently selects an older npm CLI
+  # Use the installed extension CLI; PATH currently selects an older npm CLI
   # that cannot read the model cache written by the VS Code extension.
-  command: "/home/adkuppa/.vscode-server/extensions/openai.chatgpt-26.5903.71938-linux-x64/bin/linux-x86_64/codex"
+  command: "/home/adkuppa/.vscode-server/extensions/openai.chatgpt-26.5908.31748-linux-x64/bin/linux-x86_64/codex"
   args:
     - "exec"
     - "--json"
@@ -120,6 +133,9 @@ codex:
     - "mcp_servers.pi.enabled=false"
   output_last_message_file: ".symphony/codex-final.md"
   output_development_verification_request_file: ".symphony/development-verification-request.json"
+  select_tests_after_implementation: true
+  development_test_suites: [python]
+  output_development_verification_result_file: ".symphony/development-verification-result.json"
   output_plan_file: ".symphony/codex-plan.md"
   output_review_file: ".symphony/codex-review.md"
   output_review_history_file: ".symphony/codex-review-history.md"
@@ -221,7 +237,8 @@ Repository rules:
 - Keep unrelated refactors out of scope.
 - Identify unstated edge cases, but do not invent behavior for them. Follow an established precedent or request clarification when the choice changes user-visible semantics.
 - Leave a concise final report with files changed, verification, and residual risk.
-- Add or update tests appropriate to the approved PlanSpec, following existing test patterns. Running them is optional; use focused existing selectors when available.
+- Add or update tests appropriate to the approved PlanSpec, following existing test patterns. After each implementation pass, Symphony runs a read-only test-selection phase against the actual changes and executes the requested focused tests on the host.
+- Symphony owns service startup, dependency setup, container networking, and test execution. Do not run Podman or service-backed tests from the Codex sandbox. Finish the code changes; the host test results will be supplied to review and correction passes.
 - Report verification as passed, failed, or not run, with evidence and residual risk. Test failures or unavailable environments alone do not block handoff and need no human bypass approval.
 - Do not run shared environment setup. If optional host verification is configured, Symphony runs the trusted hook.
 - Handoff follows completion of implementation and the code review loop. Later human review resumes the saved PlanSpec, approval, Jira snapshot, prior reports, reviews, and workspace diff.

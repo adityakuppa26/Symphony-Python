@@ -31,6 +31,36 @@ from symphony_jira.plan_spec import PlanSpec
 
 
 class HumanReviewTests(unittest.TestCase):
+    def test_committed_implementation_retains_diff_and_rejects_diverged_history(self):
+        from symphony_jira.orchestrator import validate_plan_repository_baselines
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            repo = workspace / "repo"
+            original = _create_repository(repo, "original\n")
+            (repo / "tracked.txt").write_text("approved baseline\n")
+            def commit():
+                subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test",
+                                "-c", "user.email=test@example.test", "commit", "-am", "change", "-q"], check=True)
+                return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            baseline = commit()
+            plan = _plan_spec([("repo", baseline)])
+            (repo / "tracked.txt").write_text("implemented\n")
+            commit()
+            self.assertIsNotNone(validate_plan_repository_baselines(plan, workspace))
+            self.assertIsNone(validate_plan_repository_baselines(plan, workspace, allow_descendant_head=True))
+            captured = capture_workspace_diff(workspace, plan)
+            self.assertIn("+implemented", captured.content)
+            self.assertEqual(captured.changed_repositories, ("repo",))
+            (repo / "tracked.txt").write_text("later feedback edit\n")
+            self.assertNotEqual(captured.content_hash, capture_workspace_diff(workspace, plan).content_hash)
+            subprocess.run(["git", "-C", str(repo), "reset", "--hard", original], check=True, capture_output=True)
+            (repo / "tracked.txt").write_text("unrelated branch\n")
+            commit()
+            self.assertIsNotNone(validate_plan_repository_baselines(plan, workspace, allow_descendant_head=True))
+            with self.assertRaisesRegex(HumanReviewContextError, "no longer descends"):
+                capture_workspace_diff(workspace, plan)
+
     def test_classify_human_review_triage_accepts_plain_json(self) -> None:
         self.assertEqual(
             classify_human_review_triage(

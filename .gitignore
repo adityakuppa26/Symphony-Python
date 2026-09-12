@@ -1,2 +1,4 @@
 __pycache__/
-python/.symphony/attachment-analysis-cache/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/

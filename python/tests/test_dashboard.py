@@ -136,7 +136,7 @@ class DashboardTests(unittest.TestCase):
             self.assertNotIn("codex_event_count", state["recent_runs"][0])
             self.assertNotIn("<th>Events</th>", html)
             self.assertNotIn('<meta http-equiv="refresh"', html)
-            self.assertIn("Refresh paused while you read or edit", html)
+            self.assertIn("Page refresh paused · alerts still checked", html)
             self.assertIn("<th>Details</th>", html)
             self.assertNotIn("<th>Requirements Spec</th>", html)
             self.assertNotIn("<th>Blocked Phase</th>", html)
@@ -1330,7 +1330,7 @@ class DashboardTests(unittest.TestCase):
 
             self.assertEqual(state["blocked_issues"], [])
             self.assertIn("panel panel-blocked", html)
-            self.assertIn('<div class="panel-label">Blocked</div>', html)
+            self.assertIn('<div class="panel-label">Needs your input</div>', html)
             self.assertIn('<span class="metric">0</span>', html)
 
 

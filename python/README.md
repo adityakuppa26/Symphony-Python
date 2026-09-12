@@ -1,4 +1,4 @@
-# Symphony Jira Python MVP
+# Symphony Jira — Python workflow guide
 
 It uses Jira REST credentials from `WORKFLOW.md`, prepares a per-issue local
 workspace, runs the locally installed `codex` CLI with `codex exec --json`, stores
@@ -52,14 +52,21 @@ because the original Jira wording differs. New post-approval scope changes still
 require replanning and approval. The dashboard exposes the exact accumulated context
 used by each run for inspection.
 
-Running tests is optional. `hooks.verify` defaults to null; configured trusted
-checks record their result in the dashboard as advisory. Failed, unavailable, or
+The checked-in workflow requests and executes focused tests after each implementation
+pass. Results remain advisory; set `hooks.verify: null` to disable execution. Failed, unavailable, or
 unconfigured checks do not block handoff or require a bypass approval. Concrete
 code defects still require review corrections. Reports distinguish passed, failed,
 and unrun tests. Old `verify_required` settings are normalized to false.
 
-The dashboard shows all five workflow stages, highlights the next human action,
+The dashboard shows the development stages and the host-test phase, highlights the next human action,
 keeps plan/review summaries readable, and pauses refresh while reading or editing.
+Use **Enable sound** in each dashboard tab to hear a two-tone alert when a new
+human-input request arrives; the volume control is remembered in this browser.
+Desktop notifications are optional and require browser permission. Alerts check
+every 15 seconds even while page refresh is paused, with duplicates suppressed
+for requests already notified. Keep the dashboard open; browser background-tab
+throttling can delay checks. Use **Load latest cases** to refresh the rows when ready.
+Case search and status filters help find approvals, active work, and handoffs.
 Existing stored data and workspaces are not deleted by startup; retired feature
 columns are no longer used, and new databases create only the development schema.
 
@@ -229,11 +236,11 @@ metadata is retained for inspection, but normal issue ingestion does not downloa
 analyze attachment content. Attachment names, contents, analysis status, failures,
 and markers cannot create requirements, acceptance criteria, contradictions,
 PlanSpec coverage, incomplete reasons, or approval-hash changes. Put any required
-behavior from a mockup into Description, Acceptance Criteria, or a root Jira comment
-before running Symphony.
+behavior from a mockup into Description or Acceptance Criteria before running
+Symphony. The active workflow excludes Jira comments from planning.
 
-Low-level attachment download/analyzer helpers remain isolated for tests and future
-use, but they are not part of the v4 Jira planning-evidence pipeline.
+The Jira client retains basic attachment helpers for compatibility. The unused
+standalone Codex vision/PDF analyzer has been removed.
 
 ## PlanSpec, artifacts, and approval
 
@@ -385,11 +392,9 @@ HEADs, and oversized diffs fail closed.
 The dashboard is unauthenticated and intended for loopback use. Keep the default
 `127.0.0.1` binding unless an authenticated reverse proxy protects it.
 
-The configured `hooks.verify` command is advisory by default. Symphony records
-`passed` or `failed`, retains the hook log path, and surfaces the result in the
-dashboard and finish comment. Set `hooks.verify_required: true` to make a failed
-hook block the run in the verification phase; with the default `false`, Symphony
-records a warning and continues to review and handoff.
+The configured host verification is advisory. Results distinguish passed tests,
+failed tests, runtime/environment errors, skipped or partial coverage, and stale
+results when the code changed. There is no human bypass gate.
 
 Epics must choose one of two strategies in PlanSpec:
 
@@ -398,27 +403,104 @@ Epics must choose one of two strategies in PlanSpec:
 - `single_change` explains why the Epic is bounded and always requires explicit
   approval of that exact PlanSpec, even if the global approval gate is disabled.
 
-## Optional host-side development verification
+## Change-aware host verification
 
-The trusted targeted verifier remains available when operators choose to run it.
-Set `hooks.use_development_verification_request: true` and configure a hook:
+The workflow is planning → human approval → implementation → test selection →
+host runtime/tests → code review. A correction pass repeats selection and testing
+against its new diff. All Codex phases receive the accumulated human decisions.
 
-```yaml
-hooks:
-  verify: |
-    /home/adkuppa/Symphony-Python/python/.venv/bin/python -m symphony_jira.development_verification \
-      --workspace "{{ workspace_path }}" \
-      --request "{{ verification_request_path }}" \
-      --sha256 "{{ verification_request_hash }}" \
-      --entrypoint /home/adkuppa/Symphony-Python/python/scripts/test.sh
-  use_development_verification_request: true
+`codex.select_tests_after_implementation: true` enables a read-only selection pass.
+It receives the approved PlanSpec, implementation report, and actual workspace diff
+(including staged and untracked changes). Codex returns focused test selectors and
+reasons, or explicit coverage gaps. Symphony adds the workspace code hash and freezes
+`.symphony/development-verification-request.json`. The host checks this hash before
+and after execution; it cannot report stale results as passing.
+
+`hooks.verify` invokes `symphony_jira.development_verification` with
+`--prepare-with-test`. Each selected target goes through one `scripts/test.sh` call,
+so checkout selection, Compose startup, mount checks, and test execution remain
+under the same runtime lock. Test processes run on the host's Podman runtime,
+outside Codex's sandbox.
+
+The current workflow enables `codex.development_test_suites: [python]`:
+
+| Repository | Supported focused selectors | Container |
+| --- | --- | --- |
+| CPM | `Test/unit/<file>.py`, optionally `::Class::test` | `cpm` |
+| Foyr | `tests/<file>.py`, optionally `::Class::test` | `foyr` |
+
+Requests need explicit relative test paths. Filters such as `-k` and `-m` and basic
+pytest output flags are allowed. CPM `api/` and `Test/functional/` requests are
+rejected instead of being run in the wrong environment; API routing to iBIS and
+functional testdb creation are not configured in this first milestone. Frontend
+coverage gaps are recorded rather than claiming Python tests cover browser behavior.
+
+The runner overrides `CPM_SRC` and `FOYR_SRC` only in its own process environment.
+Compose reads `/home/adkuppa/compost/.env` for other settings; the file is never
+written, temporarily edited, or backed up by the runtime. Checkout overrides expire
+when the command exits. Compost YAML and startup scripts are also left untouched.
+Running containers keep their selected mounts until Compose recreates them; future
+manual Compose commands use your original `.env` values.
+
+Using existing images (`--pull never`, no builds), the runner starts the required
+Compose services and waits for health. Existing application services restart to
+load current code. It verifies their source mounts before `compose exec -T` runs
+pytest in the target container. Foyr uses `tests/testing.yml` and one pytest worker.
+CPM unit-test processes (including the helper's `--shell` mode) override
+`CREATE_NEW_DATABASE_WHEN_TESTING=False`. This prevents the shared functional-test
+setting from creating database objects during unit collection; the `.env` setting
+itself is preserved.
+The currently validated CPM image runs Python 3.12.6, while this checkout declares
+Python >=3.14.5. The image is intentionally retained at the user's request; the
+focused runtime checks validate this environment, not compatibility with every
+future Python feature. Revalidate after the CPM image is updated.
+Timeouts run inside the container as well as on the host; setup failures and timeouts
+return environment-error status rather than successful verification.
+
+`hooks.after_run` releases the workspace's test runtime before handoff is recorded,
+and also runs when an attempt fails, is cancelled, or waits for human input.
+Symphony records which Compose services were already running before setup. It stops
+only services it started and removes containers it created, without deleting images
+or volumes. Dependencies still used by another running service or Symphony workspace
+are retained. Container IDs prevent old cleanup records from targeting replacements.
+Test processes carry a unique execution token, so cleanup can terminate leftover
+pytest workers inside a preserved development container without stopping its server.
+Temporary standalone runners are labelled by workspace and removed as well.
+Ownership is persisted under `.symphony/runtime-services/`; interrupted setup can be
+recovered from its labels. Failed cleanup retains ownership for a later retry.
+For manual sessions, release the runtime explicitly:
+
+```sh
+./scripts/runtime.sh down /home/adkuppa/codex-workspaces/development/ICPM-74929
 ```
 
-Ask implementation to write `.symphony/development-verification-request.json` with
-`schema_version: "1.0"` and `targets` containing each PlanSpec repository plus its
-focused `test_args`. The request cannot choose an executable or shell command.
-Symphony validates the selectors and uses the fixed repository runner. Missing or
-failed requests remain advisory; the dashboard retains the result and evidence.
+
+Symphony's compatibility adapters and wheel caches remain under `scripts/` and
+`.symphony/runtime-cache/`. Missing compatibility wheels are prepared over host
+networking before service startup and installed offline inside the service.
+Temporary preparation containers have a 2 GiB memory limit, no extra swap allowance,
+two CPUs, and a PID limit. Running Compose services retain their configured limits.
+
+The earlier browser/Karma adapter remains available for manual diagnostics, but is
+not selected by this Python-only workflow. Pi retains its existing test path.
+
+The host saves a structured result and Symphony archives evidence for each run and
+correction pass under `.symphony/verification/`. Review receives the result and
+bounded command output. Skipped coverage is never labeled passed. All selected
+repositories are attempted even if an earlier test fails; the overall execution has
+a time budget and terminates child command groups on timeout.
+
+Manual host commands:
+
+```sh
+./scripts/runtime.sh up /home/adkuppa/codex-workspaces/development/ICPM-74929 foyr2
+./scripts/test.sh cpm /home/adkuppa/codex-workspaces/development/ICPM-74929 -- pytest Test/unit/util/test_datetime.py
+./scripts/test.sh foyr2 /home/adkuppa/codex-workspaces/development/ICPM-74929 -- pytest tests/views/api/test_home.py -n 1
+```
+
+Changing application/test source to resolve real test failures remains part of the
+implementation/review loop. Codex is not asked to debug container startup, package
+installation, sandbox networking, or shared environment configuration.
 
 ## Commands
 

@@ -65,11 +65,6 @@ class JiraRequirementsConfig(BaseModel):
     max_attachment_bytes: int = 10 * 1024 * 1024
     attachment_download_max_concurrency: int = 4
     require_attachment_analysis: bool = False
-    attachment_analyzer: Literal["basic", "codex"] = "basic"
-    attachment_analysis_timeout_seconds: int = 120
-    attachment_pdf_max_pages: int = 4
-    attachment_analysis_max_concurrency: int = 1
-    attachment_analysis_max_output_characters: int = 12_000
     hydrate_search_results: bool = True
     discover_epic_children: bool = True
     child_issue_jql: str | None = None
@@ -89,10 +84,6 @@ class JiraRequirementsConfig(BaseModel):
         "related_issue_hydration_max_concurrency",
         "max_attachment_bytes",
         "attachment_download_max_concurrency",
-        "attachment_analysis_timeout_seconds",
-        "attachment_pdf_max_pages",
-        "attachment_analysis_max_concurrency",
-        "attachment_analysis_max_output_characters",
         "child_issue_max_pages",
     )
     @classmethod
@@ -102,10 +93,6 @@ class JiraRequirementsConfig(BaseModel):
         upper_bounds = {
             "related_issue_hydration_max_concurrency": 32,
             "attachment_download_max_concurrency": 32,
-            "attachment_analysis_timeout_seconds": 900,
-            "attachment_pdf_max_pages": 20,
-            "attachment_analysis_max_concurrency": 4,
-            "attachment_analysis_max_output_characters": 50_000,
             "child_issue_max_pages": 1_000,
         }
         maximum = upper_bounds.get(info.field_name)
@@ -341,6 +328,11 @@ class CodexConfig(BaseModel):
     output_development_verification_request_file: str = (
         ".symphony/development-verification-request.json"
     )
+    select_tests_after_implementation: bool = False
+    development_test_suites: list[Literal["python", "karma"]] = Field(
+        default_factory=lambda: ["python", "karma"], min_length=1,
+    )
+    output_development_verification_result_file: str = ".symphony/development-verification-result.json"
     plan_before_implementation: bool = False
     require_plan_approval: bool = False
     planning_prompt: str = (
