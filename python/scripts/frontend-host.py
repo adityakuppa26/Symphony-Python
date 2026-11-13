@@ -44,6 +44,7 @@ def main():
     # Refuse to capture somebody else's already-running Karma server.
     try:
         with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(('127.0.0.1', 9876))
     except OSError:
         print('Frontend runtime: host port 9876 is already in use', flush=True)
@@ -70,9 +71,11 @@ def main():
                             '--unit', browser_unit, '-p', 'MemoryMax=768M',
                             '-p', 'MemorySwapMax=0', '-p', 'CPUQuota=100%',
                             browser_path, '--headless', '--no-sandbox', '--disable-gpu',
+                            '--lang=en-US', '--accept-lang=en-US',
                             '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check',
                             f'--user-data-dir={profile}', 'http://127.0.0.1:9876/',
-                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                            env={**os.environ, 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8', 'LANGUAGE': 'en_US:en'})
                         print('Host Chrome connected to Karma', flush=True)
                 elif browser.poll() is not None:
                     print('Frontend runtime: host browser exited before tests finished', flush=True)

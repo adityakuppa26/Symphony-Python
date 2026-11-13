@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -175,7 +176,18 @@ async def command_run(args: argparse.Namespace) -> int:
             print(json.dumps(orchestrator.snapshot(), indent=2, sort_keys=True))
             return 0
         print(f"Polling Jira every {workflow.config.polling.interval_seconds}s. Press Ctrl-C to stop.")
-        await orchestrator.run_forever()
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGTERM, orchestrator.stop)
+        except (NotImplementedError, RuntimeError):
+            signal_installed = False
+        else:
+            signal_installed = True
+        try:
+            await orchestrator.run_forever()
+        finally:
+            if signal_installed:
+                loop.remove_signal_handler(signal.SIGTERM)
     return 0
 
 

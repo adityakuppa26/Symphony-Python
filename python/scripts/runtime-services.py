@@ -26,10 +26,10 @@ def read(path):
     return json.loads(path.read_text()) if path.exists() else {'containers': {}, 'dependencies': {}}
 
 
-def podman(args, command):
-    result = subprocess.run([args.podman, *command], capture_output=True, text=True, timeout=60)
+def podman(args, command, *, timeout=60, input=None):
+    result = subprocess.run([args.podman, *command], capture_output=True, text=True, timeout=timeout, input=input)
     if result.returncode:
-        raise RuntimeError(f'Podman {command[0]} failed: {result.stderr.strip()[:300]}')
+        raise RuntimeError(f'Podman {command[0]} failed: {(result.stderr or result.stdout).strip()[:300]}')
     return result.stdout
 
 
@@ -44,6 +44,59 @@ def containers(args, filters, *, by_service=True):
         result[name] = {'id': item['Id'], 'running': bool(item.get('State', {}).get('Running')),
                         'setup': labels.get('symphony.runtime.setup')}
     return result
+
+
+def networks(args):
+    names = podman(args, ['network', 'ls', '--format', '{{.Name}}']).split()
+    if not names:
+        return {}
+    return {item['name']: {'id': item['id'], 'labels': item.get('labels') or {}}
+            for item in json.loads(podman(args, ['network', 'inspect', *names]))}
+
+
+def register_networks(state, snapshot, current):
+    records = state.setdefault('networks', {})
+    for name in snapshot.get('network_names', []):
+        item = current.get(name)
+        if item is None:
+            continue
+        record = records.get(name)
+        if record and record['id'] == item['id']:
+            record['owners'] = sorted(set(record['owners']) | {snapshot['workspace']})
+        elif (name not in snapshot.get('before_networks', {})
+              and item['labels'].get('symphony.runtime.setup') == snapshot['token']):
+            records[name] = {'id': item['id'], 'owners': [snapshot['workspace']]}
+
+
+def cleanup_networks(args, state, workspace):
+    records = state.get('networks', {})
+    if not records:
+        return []
+    current = networks(args)
+    failures = []
+    for name, record in list(records.items()):
+        record['owners'] = [owner for owner in record['owners'] if owner != workspace]
+        item = current.get(name)
+        if item and item['id'] != record['id']:
+            records.pop(name)  # Someone replaced it; never remove that network.
+            continue
+        if record['owners']:
+            continue
+        try:
+            if item:
+                # Include stopped containers: they may belong to the developer.
+                attached = podman(args, ['ps', '-a', '--filter', f'network={name}', '--format', '{{.ID}}'])
+                if attached.strip():
+                    continue
+                podman(args, ['network', 'rm', record['id']])  # Never --force.
+            dns_cleanup = Path('/home/adkuppa/compost/scripts/cleanupPodmanDns.sh')
+            if dns_cleanup.is_file():
+                subprocess.run([str(dns_cleanup), name], check=True, timeout=15)
+            records.pop(name)
+            print(f'Released test network: {name}')
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            failures.append(str(exc))
+    return failures
 
 
 def scope_for(config, services):
@@ -77,7 +130,7 @@ def register(state, snapshot, current):
                 record['remove'] = True
             record['id'] = after['id']
             record['owners'] = sorted(set(record['owners']) | {snapshot['workspace']})
-        elif (before is None or not before['running']) and (
+        elif (before is None or not before['running'] or before['id'] != after['id']) and (
             after['running'] or before is None or before['id'] != after['id']
         ):
             records[name] = {'id': after['id'], 'owners': [snapshot['workspace']],
@@ -145,6 +198,7 @@ def main():
     parser.add_argument('--snapshot', type=Path)
     parser.add_argument('--podman', default='/usr/bin/podman')
     parser.add_argument('--services', nargs='*', default=[])
+    parser.add_argument('--recreate-services', nargs='*', default=[])
     args = parser.parse_args()
     workspace = str(Path(args.workspace).resolve())
     args.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -152,24 +206,37 @@ def main():
     state.setdefault('execs', [])
     current = containers(args, ['label=com.docker.compose.project=compost'])
     if args.action == 'begin':
-        scope, dependencies = scope_for(json.load(sys.stdin), args.services)
+        config = json.load(sys.stdin)
+        scope, dependencies = scope_for(config, args.services)
+        network_names = {key: value.get('name', f'compost_{key}')
+                         for key, value in (config.get('networks') or {}).items()
+                         if not value.get('external')}
+        before_networks = networks(args) if network_names else {}
         fd, name = tempfile.mkstemp(prefix='setup-', suffix='.json', dir=args.state.parent)
         os.close(fd)
         snapshot = Path(name)
         token = hashlib.sha256(workspace.encode()).hexdigest()
         save(snapshot, {'workspace': workspace, 'scope': scope, 'dependencies': dependencies,
-                        'before': current, 'token': token})
+                        'before': current, 'token': token,
+                        'network_names': list(network_names.values()), 'before_networks': before_networks})
         # Stable labels avoid metadata-only recreation on repeated tests. Do not
         # add ownership labels to services that were already running for the user.
         labelled = [name for name in scope if name not in current or not current[name]['running']
-                    or state['containers'].get(name, {}).get('id') == current[name]['id']]
-        save(Path(str(snapshot) + '.override'), {'services': {name: {'labels': {'symphony.runtime.setup': token}} for name in labelled}})
+                    or state['containers'].get(name, {}).get('id') == current[name]['id']
+                    or name in args.recreate_services]
+        override = {'services': {name: {'labels': {'symphony.runtime.setup': token}} for name in labelled}}
+        override['networks'] = {key: {'labels': {'symphony.runtime.setup': token,
+                                               'com.docker.compose.network': key}}
+                                for key, name in network_names.items() if name not in before_networks}
+        save(Path(str(snapshot) + '.override'), override)
         print(snapshot)
     elif args.action == 'finish':
         snapshot = json.loads(args.snapshot.read_text())
         if snapshot['workspace'] != workspace:
             raise ValueError('Runtime setup snapshot belongs to another workspace')
         register(state, snapshot, current)
+        if snapshot.get('network_names'):
+            register_networks(state, snapshot, networks(args))
         save(args.state, state)
         args.snapshot.unlink()
         Path(str(args.snapshot) + '.override').unlink(missing_ok=True)
@@ -188,6 +255,8 @@ def main():
             if snapshot['workspace'] == workspace:
                 recovered = {name: item for name, item in current.items() if item.get('setup') == snapshot['token']}
                 register(state, snapshot, recovered)
+                if snapshot.get('network_names'):
+                    register_networks(state, snapshot, networks(args))
                 save(args.state, state)
                 snapshot_path.unlink()
                 Path(str(snapshot_path) + '.override').unlink(missing_ok=True)
@@ -206,9 +275,18 @@ def main():
         state['execs'] = remaining_execs
         for name in releasable(state, current, workspace):
             record = state['containers'][name]
-            command = ['rm', '-f', '--time', '30', record['id']] if record['remove'] else ['stop', '--time', '30', record['id']]
             try:
-                podman(args, command)
+                # Never force-remove a running database. A host timeout retains
+                # ownership for retry; Oracle is allowed to finish shutdown.
+                if current[name]['running']:
+                    oracle = name in {'oracledb19', 'oracledb23ai'}
+                    if oracle:
+                        podman(args, ['exec', '-i', '--user', 'oracle', record['id'], '/bin/bash', '-c',
+                                      'exec "${ORACLE_HOME:?}/bin/sqlplus" -L -s "/ as sysdba"'],
+                               input='WHENEVER SQLERROR EXIT FAILURE\nSHUTDOWN IMMEDIATE;\nEXIT;\n', timeout=300)
+                    podman(args, ['stop', '--time', '30', record['id']])
+                if record['remove']:
+                    podman(args, ['rm', record['id']])
                 print(f'Released test service: {name}')
                 state['containers'].pop(name)
             except (RuntimeError, subprocess.TimeoutExpired) as exc:
@@ -224,6 +302,8 @@ def main():
                 print(f'Removed test runner: {name}')
             except (RuntimeError, subprocess.TimeoutExpired) as exc:
                 failures.append(str(exc))
+        failures.extend(cleanup_networks(args, state, workspace))
+        save(args.state, state)
         if failures:
             raise RuntimeError('; '.join(failures))
 

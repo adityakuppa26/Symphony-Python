@@ -1,4 +1,5 @@
 import html
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,6 +7,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .dashboard_client import DASHBOARD_SCRIPT
+from .review_page import render_review_page, review_progress
+from .conversation import answer_question, decision_ledger, plan_changes
 from .human_review import (
     HumanReviewContextError,
     capture_workspace_diff,
@@ -59,6 +62,58 @@ def create_app(
     @app.get("/api/v1/runs")
     async def runs(limit: int = 50) -> list[dict[str, Any]]:
         return [enrich_run(run, store, workflow) for run in store.list_runs(limit=limit)]
+
+    @app.get("/reviews/{action_id}", response_class=HTMLResponse)
+    async def review_detail(action_id: str) -> str:
+        action = store.get_human_review_action(action_id)
+        if action is None:
+            raise HTTPException(status_code=404, detail="review not found")
+        result = store.get_run(action["result_run_id"])
+        if result is None:
+            raise HTTPException(status_code=409, detail="review result run is missing")
+        data = run_to_dict(result)
+        data["human_input_actionable"] = store.is_latest_actionable_blocked_run(result.id)
+        return render_review_page(action, data)
+
+    @app.get("/api/v1/reviews/{action_id}")
+    async def review_state(action_id: str) -> dict[str, Any]:
+        action = store.get_human_review_action(action_id)
+        if action is None:
+            raise HTTPException(status_code=404, detail="review not found")
+        result = store.get_run(action["result_run_id"])
+        if result is None:
+            raise HTTPException(status_code=409, detail="review result run is missing")
+        data = run_to_dict(result)
+        data["human_input_actionable"] = store.is_latest_actionable_blocked_run(result.id)
+        return review_progress(action, data)
+
+    @app.post("/api/v1/reviews/{action_id}/clarifications")
+    async def clarify_review(action_id: str, request: Request):
+        if store.get_human_review_action(action_id) is None:
+            raise HTTPException(status_code=404, detail="review not found")
+        body = await request.body()
+        if len(body) > MAX_HUMAN_REVIEW_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="answer is too large")
+        is_json = "application/json" in request.headers.get("content-type", "")
+        try:
+            payload = json.loads(body) if is_json else {key: values[0] for key, values in parse_qs(body.decode()).items()}
+            response = payload.get("response") if isinstance(payload, dict) else None
+            if not isinstance(response, str) or not response.strip() or len(response.strip()) > 16000:
+                raise ValueError("answer must contain 1–16000 characters")
+            revision = payload.get("expected_revision")
+            if not is_json and isinstance(revision, str) and revision.isdecimal():
+                revision = int(revision)
+            if type(revision) is not int or revision < 0:
+                raise ValueError("a valid question revision is required")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="a nonempty answer (up to 16000 characters) and valid question revision are required") from exc
+        try:
+            action = store.clarify_human_review(action_id, response, expected_revision=revision)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not is_json and "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(f"/reviews/{action['id']}", status_code=303)
+        return {"status": action["status"], "review_id": action["id"]}
 
     @app.get("/api/v1/runs/{run_id}")
     async def run_detail(run_id: str) -> dict[str, Any]:
@@ -142,6 +197,40 @@ def create_app(
             ) from exc
         return PlainTextResponse(content, media_type="application/json")
 
+    question_lock = asyncio.Lock()
+
+    @app.post("/api/v1/runs/{run_id}/question")
+    async def ask_question(run_id: str, request: Request):
+        run = store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        body = await request.body()
+        if len(body) > 16000:
+            raise HTTPException(status_code=413, detail="question is too long")
+        try:
+            if "application/json" in request.headers.get("content-type", ""):
+                payload = json.loads(body)
+            else:
+                payload = {key: values[0] for key, values in parse_qs(body.decode()).items()}
+            question = str(payload.get("question") or "").strip()
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail="invalid question")
+        if not question or len(question) > 4000:
+            raise HTTPException(status_code=400, detail="question must contain 1–4000 characters")
+        if question_lock.locked():
+            raise HTTPException(status_code=409, detail="A question is already being answered; please wait.")
+        try:
+            async with question_lock:
+                answer = await answer_question(run=run, question=question,
+                    plan=read_text_if_exists(Path(run.workspace_path) / workflow.config.codex.output_plan_file) or "",
+                    config=workflow.config.codex)
+        except (ValueError, TimeoutError, OSError) as exc:
+            raise HTTPException(status_code=503, detail="Question service unavailable; case state is unchanged.") from exc
+        store.add_log(run.id, "conversation", json.dumps({"question": question, "answer": answer}))
+        if "application/json" in request.headers.get("content-type", ""):
+            return {"answer": answer, "resumed": False}
+        return RedirectResponse(url="/", status_code=303)
+
     @app.post("/api/v1/runs/{run_id}/human-input")
     async def add_human_input(run_id: str, request: Request):
         run = store.get_run(run_id)
@@ -204,7 +293,7 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-        elif action not in {"", "feedback"}:
+        elif action not in {"", "feedback", "decision"}:
             raise HTTPException(status_code=400, detail="unsupported human input action")
         elif not response:
             raise HTTPException(status_code=400, detail="response is required")
@@ -215,6 +304,7 @@ def create_app(
                     run_id=run.id,
                     question=run.error,
                     response=response,
+                    action="decision" if action == "decision" else "response",
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -247,12 +337,6 @@ def create_app(
                 status_code=409,
                 detail="human review can only be addressed from completed runs",
             )
-        if not store.is_latest_actionable_completed_run(run.id):
-            raise HTTPException(
-                status_code=409,
-                detail="this completed run is no longer the latest actionable run",
-            )
-
         body = await request.body()
         if len(body) > MAX_HUMAN_REVIEW_REQUEST_BYTES:
             raise HTTPException(
@@ -282,7 +366,7 @@ def create_app(
             }
 
         reviewer_value = payload.get("reviewer_identity")
-        source_value = payload.get("source_url") or payload.get("source_link")
+        source_value = payload.get("source_url", payload.get("source_link"))
         comments_value = payload.get("comments")
         for field_name, field_value in (
             ("reviewer_identity", reviewer_value),
@@ -302,13 +386,11 @@ def create_app(
                 status_code=400,
                 detail="reviewer identity is required",
             )
-        if not source_url:
-            raise HTTPException(
-                status_code=400,
-                detail="review source/PR link is required",
-            )
-        parsed_source = urlparse(source_url)
-        if parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc:
+        try:
+            parsed_source = urlparse(source_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="review source/PR link must be an absolute HTTP(S) URL") from exc
+        if source_url and (parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc):
             raise HTTPException(
                 status_code=400,
                 detail="review source/PR link must be an absolute HTTP(S) URL",
@@ -318,6 +400,21 @@ def create_app(
                 status_code=400,
                 detail="review comments are required",
             )
+
+        existing = store.list_human_review_actions_for_source_run(run.id)
+        if existing:
+            action = existing[0]
+            if (action["reviewer_identity"], action["source_url"], action["comments"]) != (reviewer_identity, source_url, comments):
+                raise HTTPException(status_code=409, detail="A different review is already queued for this handoff. Open its result run to continue.")
+            result_run = store.get_run(action["result_run_id"])
+            if result_run is None:
+                raise HTTPException(status_code=409, detail="human review result run is missing")
+            if "text/html" in request.headers.get("accept", "") and "application/json" not in content_type:
+                return RedirectResponse(f"/reviews/{action['id']}", status_code=303)
+            return {"status": action["status"], "human_review": summarize_human_review_action(action),
+                    "run": run_to_dict(result_run), "replayed": True}
+        if not store.is_latest_actionable_completed_run(run.id):
+            raise HTTPException(status_code=409, detail="this completed run is no longer the latest actionable run")
 
         try:
             context = prepare_human_review_context(run, workflow, store)
@@ -344,7 +441,7 @@ def create_app(
             "text/html" in request.headers.get("accept", "")
             and "application/json" not in content_type
         ):
-            return RedirectResponse("/", status_code=303)
+            return RedirectResponse(f"/reviews/{action['id']}", status_code=303)
         return {
             "status": action["status"],
             "human_review": summarize_human_review_action(action),
@@ -663,6 +760,20 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
     data = run_to_dict(run)
     data["workflow_kind"] = workflow.config.kind
     data["verification_advisory"] = True
+    data["decision_ledger"] = decision_ledger(run.human_input_context)
+    previous_runs = store.list_runs_for_issue(run.issue_identifier, limit=10)
+    data["conversation"] = [json.loads(item["message"]) for previous in previous_runs
+                            for item in store.list_logs(previous.id)
+                            if item["level"] == "conversation"]
+    data["repeated_blocker"] = sum(item.status == "blocked" and item.error == run.error
+                                   for item in previous_runs) if run.error else 0
+    data["blocker_category"] = (
+        "Requirements ingestion" if (run.error or '').startswith(('Requirements snapshot', 'Canonical Jira', 'Unresolved Jira')) else
+        "Plan validation" if (run.error or '').startswith(('PlanSpec', 'invalid PlanSpec')) else
+        "Plan approval" if run.blocked_phase == 'planning_approval' else
+        "Human clarification" if run.status == 'blocked' else None
+    )
+    data["business_summary"] = store.get_business_summary(run.issue_identifier, str(run.issue_fingerprint or ""))
     events = store.list_codex_events(run.id)
     latest_event_type = events[-1].event_type if events else None
     current_phase = infer_phase(run, latest_event_type)
@@ -678,6 +789,22 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
     result_review_action = store.human_review_action_for_result_run(run.id)
     plan_path = Path(run.workspace_path) / workflow.config.codex.output_plan_file
     plan_content = read_text_if_exists(plan_path)
+    data["plan_changes"] = []
+    if run.plan_spec_hash and plan_content:
+        for prior in previous_runs:
+            if prior.started_at >= run.started_at or not prior.plan_spec_hash or prior.plan_spec_hash == run.plan_spec_hash:
+                continue
+            try:
+                old_text = read_frozen_text_artifact(Path(run.workspace_path),
+                    f".symphony/plan-history/{prior.plan_spec_hash}.json", label="previous plan")
+                if old_text:
+                    old = PlanSpec.model_validate_json(old_text)
+                    current = PlanSpec.model_validate_json(plan_content)
+                    if old.content_hash() == prior.plan_spec_hash and current.content_hash() == run.plan_spec_hash:
+                        data["plan_changes"] = plan_changes(old.model_dump(), current.model_dump())
+            except (ValueError, HumanReviewContextError):
+                pass
+            break
     requirements_snapshot: RequirementsSnapshot | None = None
     requirements_summary_error: str | None = None
     snapshot_hash = str(run.issue_fingerprint or "").strip()
@@ -920,6 +1047,7 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     tbody tr:last-child td {{ border-bottom: 0; }}
     tbody tr:hover {{ background: #fbfdff; }}
     .issue-key {{ font-size: 0.95rem; font-weight: 780; white-space: nowrap; }}
+    .business-summary {{ margin: 0.6rem 0 0; min-width: 12rem; max-width: 22rem; white-space: normal; color: #475569; font-size: 0.82rem; line-height: 1.65; overflow-wrap: anywhere; }}
     .issue-meta {{ margin-top: 0.25rem; color: #94a3b8; font-size: 0.72rem; }}
     .badge {{ display: inline-flex; align-items: center; gap: 0.3rem; border-radius: 999px; padding: 0.22rem 0.52rem; font-size: 0.74rem; font-weight: 760; white-space: nowrap; background: #eef2f7; color: #475569; }}
     .badge::before {{ content: ""; width: 0.42rem; height: 0.42rem; border-radius: 50%; background: currentColor; }}
@@ -1121,10 +1249,13 @@ def render_run_row(
         "queued" if run.get("human_input_submitted") else str(run.get("status") or "")
     )
     case_search = str(run.get("issue_identifier") or "").lower()
+    summary = str(run.get("business_summary") or "")
+    summary_hidden = "" if summary else " hidden"
     return (
-        f'<tr class="run-{status_class(status)}" data-case="{escape(case_search)}" data-filter="{escape(filter_status)}">'
+        f'<tr class="run-{status_class(status)}" id="run-{escape(run.get("id"))}" data-case="{escape(case_search)}" data-filter="{escape(filter_status)}">'
         f'<td data-label="Issue"><div class="issue-key">{escape(run.get("issue_identifier"))}</div>'
-        f'<div class="issue-meta">attempt {escape(run.get("attempt"))}{attempts_note}</div></td>'
+        f'<div class="issue-meta">attempt {escape(run.get("attempt"))}{attempts_note}</div>'
+        f'<p class="business-summary" data-business-summary-run="{escape(run.get("id"))}" aria-label="Business overview from Jira requirements"{summary_hidden}>{escape(summary)}</p></td>'
         f'<td data-label="Status">{render_badge(status)}</td>'
         f'<td data-label="Phase">{phase_cell}</td>'
         f'<td data-label="Verification">{render_badge(verification)}{verification_note}</td>'
@@ -1256,6 +1387,22 @@ def render_run_details(
             f'{render_plan_cell(run, show_summary=True)}</div>'
         )
     details: list[str] = []
+    if run.get("repeated_blocker", 0) > 1:
+        details.append('<div class="handoff-note">This blocker has repeated. Ask for an explanation before resuming; previous decisions are preserved.</div>')
+    if run.get("decision_ledger"):
+        entries = ''.join(f'<li><strong>{escape(item["kind"].replace("_", " "))}</strong>: {escape(item["text"])}'
+                          f'{" (invalidated approval)" if item.get("approval_state") == "invalidated" else ""}</li>'
+                          for item in run["decision_ledger"])
+        details.append(f'<details><summary>Decision ledger · newest first</summary><ul>{entries}</ul></details>')
+    answers = ''.join(f'<p><strong>You:</strong> {escape(item["question"])}</p><p><strong>Codex:</strong> {escape(item["answer"])}</p>'
+                      for item in reversed(run.get("conversation", [])))
+    details.append('<details><summary>Ask Codex · does not resume or approve</summary>' + answers +
+                   f'<form method="post" action="/api/v1/runs/{escape(run.get("id"))}/question">'
+                   '<label>Your question<textarea name="question" required maxlength="4000" rows="3"></textarea></label>'
+                   '<button type="submit">Ask question</button><p data-question-answer role="status" style="white-space:pre-wrap"></p></form></details>')
+    if run.get("plan_changes"):
+        changed = ', '.join(run["plan_changes"])
+        details.append(f'<div class="handoff-note"><strong>Changed since the previous plan:</strong> {escape(changed)}. Review the full plan before approval.</div>')
     if run.get("plan_exists"):
         details.append(render_plan_link(run))
     open_attribute = " open" if planning_complete else ""
@@ -1277,7 +1424,7 @@ def render_run_details(
     error = display_error(run)
     if error:
         details.append(
-            '<details open><summary>Error</summary>'
+            f'<details open><summary>{escape(run.get("blocker_category") or "Error")}</summary>'
             f'<pre>{escape(error)}</pre></details>'
         )
     human_input = render_human_input_cell(run)
@@ -1289,7 +1436,7 @@ def render_run_details(
             f'<div class="detail-grid">{human_input}</div></details>'
         )
     if run.get("status") == "completed" and run.get("human_review_actionable"):
-        details.insert(0, '<div class="handoff-note">Handoff complete. Add later review feedback below to resume with the saved plan and code context.</div>')
+        details.insert(0, '<div class="handoff-note">Handoff complete. Later feedback continues from this implementation, saved plan and code context, and accepted decisions. Verification is advisory; inspect its result and residual risks before using the changes.</div>')
     if final_message:
         details.append(
             '<details><summary>Final output</summary>'
@@ -1755,14 +1902,19 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
     review_lineage = render_human_review_lineage(
         run.get("human_review_action")
     )
+    review_action = run.get("human_review_action") or {}
+    if run.get("status") == "blocked" and review_action.get("triage_decision") == "needs_human":
+        return review_lineage + '<p>Open review progress above to answer the scope question and resume this review batch.</p>'
     if run.get("status") == "completed":
         if review_actions:
             latest_review = review_actions[0]
+            source = latest_review.get("source_url")
+            source_html = f'<a href="{escape(source)}">Review source / PR</a>' if source else "Manual feedback"
             return review_lineage + (
                 f"<strong>{escape(latest_review.get('status'))}</strong>"
+                f'<div><a href="/reviews/{escape(latest_review.get("id"))}">Open review progress &amp; response</a></div>'
                 f"<div>Reviewer: {escape(latest_review.get('reviewer_identity'))}</div>"
-                f"<div><a href=\"{escape(latest_review.get('source_url'))}\">"
-                "Review source / PR</a></div>"
+                f"<div>{source_html}</div>"
                 f"<pre>{escape((latest_review.get('comments') or '')[:500])}</pre>"
                 f"<div class=\"muted\">Result run: "
                 f"<code>{escape(latest_review.get('result_run_id'))}</code></div>"
@@ -1774,14 +1926,21 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
         )
         return review_lineage + (
             "<details><summary>Address Human Review</summary>"
-            f"<form method=\"post\" action=\"{action_url}\">"
+            f"<form method=\"post\" action=\"{action_url}\" data-review-form>"
+            '<p>Paste a review batch, including file names, line references, and code examples. '
+            'Symphony checks it against the approved plan, applies in-scope corrections, and reviews the result.</p>'
             "<label>Reviewer identity<input name=\"reviewer_identity\" required "
-            "placeholder=\"Reviewer identity\"></label>"
-            "<label>PR or review URL<input name=\"source_url\" type=\"url\" required "
-            "placeholder=\"PR or review URL\"></label>"
+            "value=\"Operator\" placeholder=\"Your name or reviewer\"></label>"
+            "<label>PR or review URL (optional)<input name=\"source_url\" type=\"url\" "
+            "placeholder=\"Optional link for reference\"></label>"
             "<label>Review feedback<textarea name=\"comments\" required rows=\"6\" cols=\"42\" "
-            "placeholder=\"Paste human review comments\"></textarea></label>"
-            "<button type=\"submit\">Address Human Review</button>"
+            "placeholder=\"1. path/to/file.py:42 — What should change and why?&#10;2. Include expected behavior or a reproduction if helpful.\"></textarea></label>"
+            '<p data-review-draft class="muted">Drafts stay in this browser tab until submitted or cleared.</p>'
+            '<details><summary>Preview feedback</summary><pre data-review-preview>No feedback entered yet.</pre></details>'
+            '<button type="submit">Address Human Review</button> '
+            '<button type="button" data-review-clear>Clear draft</button>'
+            '<p data-review-status role="status" aria-live="polite"></p>'
+            '<p><a data-review-result hidden>Open review progress &amp; response</a></p>'
             "</form></details>"
         )
     if run.get("status") != "blocked":
@@ -1827,7 +1986,7 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
         f"<form method=\"post\" action=\"{action_url}\">"
         "<label>Feedback for Codex<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
         "placeholder=\"Add clarification for Codex\"></textarea></label>"
-        "<button type=\"submit\">Resume</button>"
+        "<button type=\"submit\" name=\"action\" value=\"decision\">Record decision &amp; resume</button>"
         "</form>"
     )
 
@@ -1842,7 +2001,7 @@ def render_human_review_lineage(action: dict[str, Any] | None) -> str:
             f'<a href="{escape(source_url)}">Review source / PR</a>'
         )
     else:
-        source = "Review source unavailable"
+        source = "Manual feedback"
     decision = str(action.get("triage_decision") or "")
     planning_notice = ""
     if decision == "plan_changes_required":
@@ -1854,6 +2013,7 @@ def render_human_review_lineage(action: dict[str, Any] | None) -> str:
         )
     return (
         '<div class="review-lineage"><strong>Human-review continuation</strong>'
+        f'<div><a href="/reviews/{escape(action.get("id"))}">Open review progress &amp; response</a></div>'
         f"<div>Reviewer: {escape(action.get('reviewer_identity'))}</div>"
         f"<div>{source}</div>"
         f"<div class=\"muted\">Action: <code>{escape(action.get('id'))}</code><br>"

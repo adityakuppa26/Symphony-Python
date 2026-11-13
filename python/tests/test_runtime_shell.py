@@ -80,8 +80,11 @@ class RuntimeShellTests(unittest.TestCase):
 import json,os,sys
 args=sys.argv[1:]
 with open(os.environ['CALL_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')
+if args[0]=='compose':
+ assert os.environ.get('PODMAN_COMPOSE_PROVIDER','').endswith('/podman-compose')
+ assert '--project-directory' not in args and '--format' not in args
 if 'config' in args:
- print(json.dumps({'services': {name: {'image':name,'volumes':[{'target':mount,'source':os.environ[var]}]} for name,mount,var in [('foyr','/src','FOYR_SRC'),('ibis','/ibis','CPM_SRC')]}}))
+ print(json.dumps({'services': {name: {'image':name,'volumes':[os.environ[var]+':'+mount+':rw'] if name=='foyr' else [{'target':mount,'source':os.environ[var]}]} for name,mount,var in [('foyr','/src','FOYR_SRC'),('ibis','/ibis','CPM_SRC')]}}))
 elif args[0]=='ps':
  print('fake-cpm fake-foyr fake-ibis')
 elif args[0]=='inspect' and '--format' not in args:
@@ -92,6 +95,9 @@ elif args[0]=='inspect':
  else: print(json.dumps([{'Destination':'/src','Source':os.environ['FOYR_SRC']},{'Destination':'/ibis','Source':os.environ['CPM_SRC']},{'Destination':'/TexturaWD/textura','Source':os.environ['CPM_SRC']}]))
 ''')
             podman.chmod(0o755)
+            provider = root / 'podman-compose'
+            provider.write_text('#!/bin/sh\nexit 0\n')
+            provider.chmod(0o755)
             script = root / 'scripts/test.sh'
             script.write_text((SCRIPTS / 'test.sh').read_text()
                               .replace('/home/adkuppa/compost', str(compost))
@@ -99,7 +105,7 @@ elif args[0]=='inspect':
                               .replace('/home/adkuppa/.local/state/symphony', str(root / 'locks')))
             logfile = root / 'calls'
             result = subprocess.run(['bash', str(script), repository, str(workspace), '--', 'pytest', 'Test/unit/test_home.py' if repository=='cpm' else 'tests/test_home.py'],
-                                    env={**os.environ, 'CALL_LOG': str(logfile)}, capture_output=True, text=True)
+                                    env={**os.environ, 'CALL_LOG': str(logfile), 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'PODMAN_COMPOSE_PROVIDER': '/invalid/docker-compose'}, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             calls = [json.loads(line) for line in logfile.read_text().splitlines()]
             up=next(i for i,call in enumerate(calls) if 'up' in call)
@@ -113,8 +119,42 @@ elif args[0]=='inspect':
             self.assertEqual((compost/'.env').stat().st_mtime_ns, original_mtime)
             self.assertFalse((root/'.symphony/env-backups').exists())
 
-    def test_foyr_compose_prepares_selected_checkout_before_executing(self):
-        self._check_compose_runtime('foyr2')
+    def test_legacy_foyr_route_is_rejected_before_runtime_setup(self):
+        result = subprocess.run(['bash', str(SCRIPTS / 'test.sh'), 'foyr2', '/missing-checkout'],
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Foyr verification moved to', result.stderr)
 
-    def test_cpm_unit_process_disables_database_creation_without_editing_shared_setting(self):
-        self._check_compose_runtime('cpm')
+    def test_legacy_cpm_route_is_rejected_before_runtime_setup(self):
+        result = subprocess.run(['bash', str(SCRIPTS / 'test.sh'), 'cpm', '/missing-checkout'],
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('CPM verification moved to', result.stderr)
+
+
+def test_podman_children_cannot_inherit_runtime_lock(tmp_path):
+    source = (SCRIPTS / 'test.sh').read_text()
+    function = source[source.index('run_logged() {'):source.index('# Always remove')]
+    child = tmp_path / 'child.py'
+    child.write_text('import os\nassert not os.path.exists("/proc/self/fd/9"), "lock leaked to child"\n')
+    script = 'exec 9>"$LOCK_FILE"\nflock 9\n' + function + '\nrun_logged python3 "$CHILD"\n! flock -n "$LOCK_FILE" true\n'
+    result = subprocess.run(['bash', '-e', '-c', script],
+        env={**os.environ, 'LOCK_FILE': str(tmp_path/'lock'), 'CHILD': str(child), 'log_file': str(tmp_path/'log')},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cleanup_trap_runs_on_test_exit_and_failed_setup(tmp_path):
+    source = (SCRIPTS / 'test.sh').read_text()
+    function = source[source.index('cleanup_runtime() {'):source.index('trap cleanup_runtime EXIT')]
+    python = tmp_path / 'python3'
+    python.write_text('#!/bin/sh\necho "$*" >> "$CALLS"\n')
+    python.chmod(0o700)
+    for mode, code, cleanup_expected in [('test', 0, True), ('test', 3, True), ('prepare', 0, False), ('prepare', 1, True)]:
+        calls = tmp_path / f'{mode}-{code}'
+        result = subprocess.run(['bash', '-c', 'record_runtime() { :; }\n' + function + '\ntrap cleanup_runtime EXIT\nexit "$TEST_CODE"'],
+            env={**os.environ, 'PATH': str(tmp_path)+':'+os.environ['PATH'], 'mode': mode,
+                 'TEST_CODE': str(code), 'CALLS': str(calls), 'runtime_owner': '/work/A',
+                 'runtime_state': '/state.json', 'PODMAN': '/podman', 'SCRIPT_ROOT': '/scripts'}, timeout=10)
+        assert result.returncode == code
+        assert calls.exists() == cleanup_expected

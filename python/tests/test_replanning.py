@@ -246,3 +246,47 @@ class ReplanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(revised.planning_baseline.source_run_id, blocked.id)
         self.assertIn('saved-filter compatibility requirement', self.runner.planning_prompts[-1])
         self.assertEqual((self.repository / 'module.py').read_text(), 'retained implementation\n')
+
+
+    async def test_independent_review_automatically_queues_replanning_with_its_reason(self):
+        self.workflow.config.codex.auto_replan = True
+        source = await self.implementation_sent_to_replanning()
+        queued = self.store.list_human_inputs(run_id=source.id)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]['action'], 'automatic_replan')
+        self.assertIn('Revise the affected surfaces', queued[0]['question'])
+        self.assertIsNone(queued[0]['approval_id'])
+        await dispatch_pending_human_resume(self.polling())
+        planned = self.store.latest_run_for_issue('T-1')
+        self.assertEqual(planned.blocked_phase, 'planning_approval', planned.error)
+        self.assertIn('Revise the affected surfaces', self.runner.planning_prompts[-1])
+        self.assertEqual(self.runner.implementation_count, 1)
+
+    async def test_human_review_triage_automatically_queues_replanning_with_its_reason(self):
+        source = await self.implementation_sent_to_replanning()
+        self.assertEqual(self.store.list_human_inputs(run_id=source.id), [])
+        planned = await self.replan(source)
+        approve_development_run(self.store, planned)
+        await dispatch_pending_human_resume(self.polling())
+        completed = self.store.latest_run_for_issue('T-1')
+        self.assertEqual(completed.status, 'completed', completed.error)
+        self.workflow.config.codex.auto_replan = True
+        response = TestClient(create_app(self.workflow, self.store)).post(
+            f'/api/v1/runs/{completed.id}/human-review', json={
+                'reviewer_identity': 'reviewer@example.test',
+                'comments': 'The plan must cover saved-filter compatibility.',
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        await dispatch_pending_human_resume(self.polling())
+        blocked = self.store.latest_run_for_issue('T-1')
+        self.assertEqual(blocked.blocked_phase, 'planning', blocked.error)
+        queued = self.store.list_human_inputs(run_id=blocked.id)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]['action'], 'automatic_replan')
+        self.assertIn('Human feedback changes the approved scope.', queued[0]['question'])
+        self.assertIsNone(queued[0]['approval_id'])
+        await dispatch_pending_human_resume(self.polling())
+        revised = self.store.latest_run_for_issue('T-1')
+        self.assertEqual(revised.blocked_phase, 'planning_approval', revised.error)
+        self.assertIn('Human feedback changes the approved scope.', self.runner.planning_prompts[-1])
+        self.assertEqual(self.runner.implementation_count, 2)

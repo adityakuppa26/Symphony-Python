@@ -30,6 +30,10 @@ class CodexRunResult:
     raw_stdout_lines: list[str] = field(default_factory=list)
 
 
+class RunnerStalledError(RuntimeError):
+    """The child has stopped emitting output before its overall deadline."""
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -75,9 +79,11 @@ class CodexRunner:
         events: list[dict[str, Any]] = []
         raw_lines: list[str] = []
         final_message: str | None = None
+        loop = asyncio.get_running_loop()
+        last_activity = loop.time()
 
         async def read_stdout() -> None:
-            nonlocal final_message
+            nonlocal last_activity
             sequence = 0
             assert process.stdout is not None
             buffer = b""
@@ -85,6 +91,7 @@ class CodexRunner:
                 chunk = await process.stdout.read(65536)
                 if not chunk:
                     break
+                last_activity = loop.time()
                 buffer += chunk
                 while b"\n" in buffer:
                     line_bytes, buffer = buffer.split(b"\n", 1)
@@ -100,6 +107,8 @@ class CodexRunner:
             try:
                 raw = json.loads(line)
             except json.JSONDecodeError:
+                raw = None
+            if not isinstance(raw, dict):
                 raw_lines.append(line)
                 if log_callback:
                     await maybe_await(log_callback("codex_stdout", line))
@@ -115,15 +124,21 @@ class CodexRunner:
             return sequence
 
         async def read_stderr() -> str:
+            nonlocal last_activity
             assert process.stderr is not None
-            data = await process.stderr.read()
-            text = data.decode(errors="replace")
-            write_frozen_text_artifact(
-                workspace_path,
-                ".symphony/codex-stderr.log",
-                text,
-                label="Codex stderr artifact",
-            )
+            chunks = []
+            try:
+                while chunk := await process.stderr.read(65536):
+                    last_activity = loop.time()
+                    chunks.append(chunk)
+            finally:
+                text = b"".join(chunks).decode(errors="replace")
+                write_frozen_text_artifact(
+                    workspace_path,
+                    ".symphony/codex-stderr.log",
+                    text,
+                    label="Codex stderr artifact",
+                )
             return text
 
         async def write_stdin() -> bool:
@@ -185,15 +200,47 @@ class CodexRunner:
             stderr_text = await stderr_task
             return returncode, prompt_delivered, stderr_text
 
+        async def wait_for_activity() -> None:
+            while True:
+                remaining = config.stall_timeout_seconds - (loop.time() - last_activity)
+                if remaining <= 0:
+                    raise RunnerStalledError(
+                        f"Codex stalled: no output for {config.stall_timeout_seconds:g} seconds"
+                    )
+                await asyncio.sleep(remaining)
+
+        async def wait_with_watchdog() -> tuple[int, bool, str]:
+            completion = asyncio.create_task(wait_for_completion())
+            watchdog = asyncio.create_task(wait_for_activity()) if config.stall_timeout_seconds else None
+            tasks = {completion, watchdog} if watchdog else {completion}
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if completion in done:
+                    return completion.result()
+                assert watchdog is not None
+                watchdog.result()
+                raise AssertionError("activity watchdog exited without a result")
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
         timed_out = False
+        stall_error: str | None = None
         try:
             try:
                 returncode, prompt_delivered, stderr_text = await asyncio.wait_for(
-                    wait_for_completion(),
+                    wait_with_watchdog(),
                     timeout=timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 timed_out = True
+                returncode = await terminate_and_settle()
+                prompt_delivered = False
+                stderr_text = ""
+            except RunnerStalledError as exc:
+                stall_error = str(exc)
                 returncode = await terminate_and_settle()
                 prompt_delivered = False
                 stderr_text = ""
@@ -217,12 +264,12 @@ class CodexRunner:
             label="Codex final-message artifact",
         )
 
-        if timed_out:
+        if timed_out or stall_error:
             return CodexRunResult(
                 status="failed",
                 returncode=returncode,
                 final_message=final_message,
-                error=f"Codex timed out after {timeout_seconds} seconds",
+                error=stall_error or f"Codex timed out after {timeout_seconds} seconds",
                 stderr_path=stderr_path,
                 final_message_path=final_message_path,
                 events=events,
@@ -241,7 +288,10 @@ class CodexRunner:
                 raw_stdout_lines=raw_lines,
             )
 
-        if returncode == 0:
+        terminal_failure = next((
+            raw for raw in reversed(events) if event_type_from(raw) == "turn.failed"
+        ), None)
+        if returncode == 0 and terminal_failure is None:
             return CodexRunResult(
                 status="completed",
                 returncode=returncode,
@@ -253,13 +303,21 @@ class CodexRunner:
                 raw_stdout_lines=raw_lines,
             )
 
-        combined = "\n".join(raw_lines + [stderr_text]).strip()
+        failure_messages = []
+        for raw in events:
+            if event_type_from(raw) in {"turn.failed", "error"}:
+                payload = raw.get("msg") or raw.get("event") or raw
+                if isinstance(payload, dict):
+                    message = content_to_text(payload.get("error") or payload.get("message"))
+                    if message:
+                        failure_messages.append(message)
+        combined = "\n".join(failure_messages + raw_lines + [stderr_text]).strip()
         blocked = looks_blocked(combined)
         return CodexRunResult(
             status="blocked" if blocked else "failed",
             returncode=returncode,
             final_message=final_message,
-            error=combined or f"Codex exited with status {returncode}",
+            error=combined or ("Codex turn failed" if terminal_failure is not None else f"Codex exited with status {returncode}"),
             stderr_path=stderr_path,
             final_message_path=final_message_path,
             events=events,

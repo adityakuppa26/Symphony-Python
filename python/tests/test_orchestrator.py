@@ -1066,6 +1066,37 @@ class OrchestratorTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_ordinary_implementation_plan_change_routes_to_planning(self) -> None:
+        class ReplanRunner(PlanThenImplementCodexRunner):
+            async def run(self, prompt, workspace_path, config, **kwargs):
+                result = await super().run(prompt, workspace_path, config, **kwargs)
+                if self.prompts_seen[-1] == 'implementation':
+                    return codex_result(workspace_path, 'completed', final_message=json.dumps({
+                        'decision': 'plan_changes_required',
+                        'reason': 'Persist the approved aggregation exception; keep verification deferred.',
+                    }))
+                return result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(write_workflow(root, write_fake_codex(root),
+                codex_extra='\n  plan_before_implementation: true\n  auto_replan: true\n'),
+                environ={'TEST_JIRA_TOKEN': 'token'})
+            runner = ReplanRunner()
+            store = Store(root / 'db.sqlite3')
+            result = asyncio.run(SingleIssueOrchestrator(workflow, FakeJira(hydrated_issue()),
+                store, codex_runner=runner).run_once('T-1'))
+            self.assertEqual(result.run.status, 'blocked')
+            self.assertEqual(result.run.blocked_phase, 'planning')
+            self.assertIn('aggregation exception', result.run.error)
+            self.assertIn('verification deferred', result.run.error)
+            self.assertEqual(runner.prompts_seen, ['plan', 'implementation'])
+
+            queued = store.list_human_inputs(run_id=result.run.id)
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0]['action'], 'automatic_replan')
+            self.assertIsNone(queued[0]['approval_id'])
+
     def test_plan_pass_runs_before_implementation_and_is_saved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1110,12 +1141,17 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("Codex planning/spec pass:", runner.implementation_prompt)
             self.assertIn('"schema_version": "1.0"', runner.implementation_prompt)
             self.assertIn("Reserve needs_human for a genuine conflict", runner.plan_prompt)
+            self.assertIn("gbuconfluence.oraclecorp.com", runner.plan_prompt)
+            self.assertIn("text extraction alone is not visual inspection", runner.plan_prompt)
+            self.assertIn("Record the page URL/title/version", runner.plan_prompt)
+            self.assertIn("Do not fetch Jira comments or unrelated documents", runner.plan_prompt)
+
             self.assertIn(
                 "Do not manufacture requirements or acceptance criteria",
                 runner.plan_prompt,
             )
             self.assertIn(
-                "Attachments, attachment metadata/analysis, generic custom fields",
+                "Unreferenced attachments, generic custom fields",
                 runner.plan_prompt,
             )
 
@@ -1167,7 +1203,7 @@ class OrchestratorTests(unittest.TestCase):
                 runner.repair_prompt,
             )
             self.assertIn(
-                "Attachments, attachment metadata/analysis, generic custom",
+                "Unreferenced attachments, generic custom fields",
                 runner.repair_prompt,
             )
             self.assertIn(
@@ -1969,7 +2005,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("Plan: change the report message.", comment)
             self.assertIn("Confirm the plan", comment)
 
-    def test_review_loop_reruns_generation_when_review_requires_changes(self) -> None:
+    def test_review_loop_stops_before_correction_when_review_budget_is_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fake_codex = write_fake_codex(root)
@@ -2004,9 +2040,9 @@ class OrchestratorTests(unittest.TestCase):
             assert result.run is not None
             self.assertEqual(result.run.status, "blocked")
             self.assertEqual(result.run.blocked_phase, "review")
-            self.assertIn("remain unreviewed", result.run.error or "")
-            self.assertEqual(result.run.final_message, "fixed implementation")
-            self.assertEqual(runner.prompts_seen, ["implementation", "review", "regeneration"])
+            self.assertIn("maximum review iterations", result.run.error or "")
+            self.assertEqual(result.run.final_message, "first implementation")
+            self.assertEqual(runner.prompts_seen, ["implementation", "review"])
             assert result.workspace is not None
             self.assertEqual(
                 (result.workspace.path / ".symphony" / "codex-review.md").read_text(encoding="utf-8"),

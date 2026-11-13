@@ -16,6 +16,92 @@ DASHBOARD_SCRIPT = r"""
     $('refresh-status').textContent = 'Page refresh paused · alerts still checked';
   };
   document.addEventListener('input', pauseRefresh);
+  document.querySelectorAll('[data-review-form]').forEach(form => {
+    const key = 'symphony.review-draft:' + form.getAttribute('action');
+    const fields = ['reviewer_identity', 'source_url', 'comments'];
+    const status = form.querySelector('[data-review-status]');
+    const draftStatus = form.querySelector('[data-review-draft]');
+    const preview = form.querySelector('[data-review-preview]');
+    const button = form.querySelector('button[type="submit"]');
+    const clear = form.querySelector('[data-review-clear]');
+    let submitting = false, submitted = false;
+    const values = () => Object.fromEntries(fields.map(name => [name, form.elements[name].value]));
+    const updatePreview = () => { preview.textContent = form.elements.comments.value || 'No feedback entered yet.'; };
+    const removeDraft = () => { try { sessionStorage.removeItem(key); } catch {} };
+    try {
+      const draft = JSON.parse(sessionStorage.getItem(key) || 'null');
+      if (draft && typeof draft === 'object') {
+        fields.forEach(name => { if (typeof draft[name] === 'string') form.elements[name].value = draft[name]; });
+        form.closest('details').open = true;
+        pauseRefresh();
+        draftStatus.textContent = 'Draft restored in this tab.';
+      }
+    } catch { draftStatus.textContent = 'Draft storage unavailable. Keep this tab open until submission succeeds.'; }
+    updatePreview();
+    form.addEventListener('input', () => {
+      pauseRefresh(); updatePreview();
+      try { sessionStorage.setItem(key, JSON.stringify(values())); draftStatus.textContent = 'Draft saved in this tab.'; }
+      catch { draftStatus.textContent = 'Draft could not be saved. Keep this tab open until submission succeeds.'; }
+    });
+    clear.addEventListener('click', () => {
+      if (submitting || submitted) return;
+      form.elements.comments.value = ''; form.elements.source_url.value = '';
+      removeDraft(); updatePreview(); status.textContent = '';
+      draftStatus.textContent = 'Draft cleared.';
+    });
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (submitting || submitted) return;
+      pauseRefresh(); submitting = true; button.disabled = true; clear.disabled = true;
+      const payload = values();
+      fields.forEach(name => { form.elements[name].readOnly = true; });
+      status.textContent = 'Submitting review…';
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST', headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+          body: JSON.stringify(payload), signal: AbortSignal.timeout(30000)
+        });
+        let data;
+        try { data = await response.json(); } catch { throw new Error('The server returned an unreadable response.'); }
+        if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Review could not be submitted.');
+        if (!data.human_review?.id) throw new Error('The response did not identify the queued review.');
+        submitted = true; removeDraft();
+        draftStatus.textContent = 'Review saved to Symphony.';
+        status.textContent = data.replayed ? 'This review was already received. Open its progress below.' :
+          'Review received. Symphony will check its scope, apply corrections, and review the result.';
+        const link = form.querySelector('[data-review-result]');
+        link.href = '/reviews/' + encodeURIComponent(data.human_review.id); link.hidden = false;
+        button.textContent = 'Review submitted';
+      } catch (error) {
+        status.textContent = `${error.message} Your feedback is still here. Retrying the same submission will not create duplicate work.`;
+      } finally {
+        submitting = false; button.disabled = submitted; clear.disabled = submitted;
+        fields.forEach(name => { form.elements[name].readOnly = submitted; });
+      }
+    });
+  });
+  document.addEventListener('submit', async event => {
+    const form = event.target;
+    if (!form.matches('form[action$="/question"]')) return;
+    event.preventDefault();
+    pauseRefresh();
+    const button = form.querySelector('button[type="submit"]');
+    const answer = form.querySelector('[data-question-answer]');
+    button.disabled = true;
+    answer.textContent = 'Codex is answering… Your case remains unchanged.';
+    try {
+      const response = await fetch(form.action, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({question: form.elements.question.value}),
+        signal: AbortSignal.timeout(70000)
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || 'Question could not be answered.');
+      answer.textContent = payload.answer;
+    } catch (error) {
+      answer.textContent = `${error.message} Your case has not resumed. You can retry the question.`;
+    } finally { button.disabled = false; }
+  });
   document.addEventListener('click', event => { if (event.target.closest('summary')) pauseRefresh(); });
   document.addEventListener('keydown', event => {
     if (event.target.closest('summary') && ['Enter', ' '].includes(event.key)) pauseRefresh();
@@ -76,6 +162,16 @@ DASHBOARD_SCRIPT = r"""
   let seen;
   try { seen = new Set(JSON.parse(read('symphony.alerted', '[]'))); } catch { seen = new Set(); }
   function processState(state) {
+    const runs = new Map((state.all_runs || []).map(run => [run.id, run]));
+    document.querySelectorAll('[data-business-summary-run]').forEach(element => {
+      const run = runs.get(element.dataset.businessSummaryRun);
+      if (run) {
+        if (element.textContent !== (run.business_summary || '')) {
+          element.textContent = run.business_summary || '';
+        }
+        element.hidden = !run.business_summary;
+      }
+    });
     try { JSON.parse(read('symphony.alerted', '[]')).forEach(id => seen.add(id)); } catch {}
     // Use server actionability, not every historical blocked attempt.
     const waiting = (state.blocked_issues || []).filter(run => run.human_input_actionable);

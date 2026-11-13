@@ -320,6 +320,7 @@ class CodexConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     command: str = "codex"
+    stall_timeout_seconds: int = Field(default=900, ge=0)
     args: list[str] = Field(default_factory=lambda: ["exec", "--json", "--sandbox", "workspace-write"])
     environment_exclude: list[str] = Field(
         default_factory=lambda: list(DEFAULT_JIRA_ENVIRONMENT_EXCLUDE_PATTERNS)
@@ -328,9 +329,15 @@ class CodexConfig(BaseModel):
     output_development_verification_request_file: str = (
         ".symphony/development-verification-request.json"
     )
+    auto_replan: bool = False
+    summarize_requirements_before_planning: bool = False
+    business_summary_timeout_seconds: int = Field(default=30, ge=1, le=60)
     select_tests_after_implementation: bool = False
-    development_test_suites: list[Literal["python", "karma"]] = Field(
-        default_factory=lambda: ["python", "karma"], min_length=1,
+    max_implementation_continuations: int = Field(default=6, ge=0, le=20)
+    max_review_no_progress_passes: int = Field(default=2, ge=1, le=10)
+    require_review_comment_coverage: bool = False
+    development_test_suites: list[Literal["python", "functional", "frontend", "karma", "smoke"]] = Field(
+        default_factory=lambda: ["python", "functional", "frontend"], min_length=1,
     )
     output_development_verification_result_file: str = ".symphony/development-verification-result.json"
     plan_before_implementation: bool = False

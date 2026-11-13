@@ -1458,8 +1458,9 @@ def build_requirements_snapshot(
     return snapshot.with_content_hash()
 
 
-_MAX_DECISION_UNITS_PER_ARTIFACT = 64
-_BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)(.+?)\s*$")
+# Bound expansion while accommodating full PRDs, not just short tickets.
+_MAX_DECISION_UNITS_PER_ARTIFACT = 256
+_BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]\s+|#+\s+|\d+[.)]\s+)(.+?)\s*$")
 _CLAUSE_BOUNDARY = re.compile(
     r"(?<=[.!?;])\s+(?=(?:\[[^\]]+\]\s*)?[A-Z0-9])"
 )
@@ -1501,29 +1502,81 @@ def _normalized_decision_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
 
 
+_SECTION_HEADING = re.compile(r"^\s*(?:h([1-6])\.\s+|(#{1,6})\s+)(.+?)\s*#*\s*$")
+_CONTEXT_SECTIONS = (
+    'summary', 'who we', 'personas', 'problems', 'business value', 'goals',
+    'current state', 'repository findings', 'as-is', 'discovery', 'support assistant',
+    'additional v1 candidate', 'candidate', 'background', 'user goals',
+)
+
+
+def _section_decision_units(artifact: RequirementArtifact) -> list[tuple[str, str]]:
+    """Keep headings out of citations and retain explicit background as context."""
+    sections: list[tuple[int, str]] = []
+    pending: list[str] = []
+    result: list[tuple[str, str]] = []
+    kind = artifact.kind
+    wiki_headings = bool(re.search(r"(?m)^\s*h[1-6]\.\s+", artifact.text))
+    structured_requirements = bool(re.search(r"(?im)^\s*(?:h[1-6]\.|#{1,6})\s+.*(?:requirements|acceptance criteria)", artifact.text))
+
+    def flush() -> None:
+        result.extend((text, kind) for text in _decision_text_units('\n'.join(pending)))
+        pending.clear()
+
+    for line in artifact.text.splitlines():
+        match = _SECTION_HEADING.match(line)
+        if not match or (wiki_headings and match[2]):
+            pending.append(line)
+            continue
+        flush()
+        level = int(match[1]) if match[1] else len(match[2])
+        heading = match[3].strip().casefold()
+        while sections and sections[-1][0] >= level:
+            sections.pop()
+        sections.append((level, heading))
+        if any(title.startswith(_CONTEXT_SECTIONS) and (structured_requirements or title != 'summary') for _, title in sections):
+            kind = 'supporting_evidence'
+        elif any('acceptance criteria' in title for _, title in sections):
+            kind = 'acceptance_criterion'
+        else:
+            kind = artifact.kind
+    flush()
+    return result
+
+
 def _expand_decision_artifact(
     artifact: RequirementArtifact,
 ) -> tuple[list[RequirementArtifact], str | None]:
-    units = _decision_text_units(artifact.text)
-    if len(units) <= 1:
+    units = _section_decision_units(artifact)
+    if not units:
+        return [], None
+    if len(units) == 1 and units[0] == (artifact.text.strip(), artifact.kind):
         return [artifact], None
     if len(units) > _MAX_DECISION_UNITS_PER_ARTIFACT:
-        return [artifact], (
+        return [], (
             f"Requirement artifact {artifact.source.issue_identifier}:{artifact.artifact_id} "
             f"contains {len(units)} decision units; the maximum is "
             f"{_MAX_DECISION_UNITS_PER_ARTIFACT}."
         )
 
     expanded: list[RequirementArtifact] = []
-    for unit in units:
-        digest = hashlib.sha256(
-            _normalized_decision_text(unit).encode("utf-8")
-        ).hexdigest()[:16]
+    seen_units: set[tuple[str, str]] = set()
+    seen_text: set[str] = set()
+    for unit, kind in units:
+        normalized = _normalized_decision_text(unit)
+        if (normalized, kind) in seen_units:
+            continue
+        seen_units.add((normalized, kind))
+        # Repeated text in different layers needs distinct citation identities.
+        identity = normalized if normalized not in seen_text else f"{normalized}\0{kind}"
+        seen_text.add(normalized)
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         suffix = f"#unit:{digest}"
         expanded.append(
             artifact.model_copy(
                 update={
                     "artifact_id": f"{artifact.artifact_id}{suffix}",
+                    "kind": kind,
                     "text": unit,
                     "value": unit,
                     "source": artifact.source.model_copy(
@@ -1606,25 +1659,21 @@ def _classify_decisions(
     by_alias: dict[str, list[RequirementDecision]] = {}
     pending_references: dict[str, list[str]] = {}
     incomplete: list[str] = []
-    expanded_artifacts: list[tuple[RequirementArtifact, bool]] = []
+    expanded_artifacts: list[RequirementArtifact] = []
     for original in artifacts:
         units, expansion_error = _expand_decision_artifact(original)
         if expansion_error:
             incomplete.append(expansion_error)
-        expanded_artifacts.extend((unit, bool(expansion_error)) for unit in units)
+        expanded_artifacts.extend(units)
 
-    for artifact, force_unresolved in expanded_artifacts:
+    for artifact in expanded_artifacts:
         source_issue_identifier = artifact.source.issue_identifier or issue_identifier
         decision_id = f"jira:{source_issue_identifier}:{artifact.artifact_id}"
         decision = RequirementDecision(
             id=decision_id,
             text=artifact.text,
             kind=artifact.kind,
-            classification=(
-                "unresolved_contradiction"
-                if force_unresolved
-                else classifier.classify(artifact)
-            ),
+            classification=("current" if artifact.kind == "supporting_evidence" else classifier.classify(artifact)),
             sources=[artifact.source],
         )
         decisions.append(decision)
@@ -1643,7 +1692,7 @@ def _classify_decisions(
         }
         for alias in aliases:
             by_alias.setdefault(alias, []).append(decision)
-        pending_references[decision_id] = classifier.supersedes(artifact)
+        pending_references[decision_id] = [] if artifact.kind == "supporting_evidence" else classifier.supersedes(artifact)
 
     ranked_authorities = {
         authority.strip().casefold(): rank

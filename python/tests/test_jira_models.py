@@ -120,6 +120,92 @@ def complete_test_attachment(
 
 
 class JiraModelTests(unittest.TestCase):
+    def test_real_contradiction_gate_is_concise_and_explains_retry_behavior(self):
+        from symphony_jira.orchestrator import requirements_planning_safety_error
+        payload = sample_issue_payload()
+        payload['fields']['description'] = '[contradiction] ' + 'Conflicting behavior ' * 500
+        issue = normalize_issue(payload, 'https://jira.example.com')
+        issue.requirements_snapshot = build_requirements_snapshot(issue, payload, JiraRequirementsConfig())
+        error = requirements_planning_safety_error(issue)
+        self.assertIn('Unresolved Jira requirement contradictions', error)
+        self.assertIn('Codex has not started', error)
+        self.assertIn('Dashboard replies are saved', error)
+        self.assertLess(len(error), 1000)
+
+
+    def test_repeated_text_has_unique_citations_across_requirement_layers(self):
+        payload = sample_issue_payload()
+        payload['fields']['description'] = "h2. Requirements\nShow columns.\nh2. Acceptance criteria\nShow columns.\nh2. Requirements\nShow columns."
+        issue = normalize_issue(payload, 'https://jira.example.com')
+        snapshot = build_requirements_snapshot(issue, payload, JiraRequirementsConfig())
+        decisions = [d for d in snapshot.current_requirements if d.sources[0].source_type == 'description']
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(len({d.id for d in decisions}), 2)
+        self.assertEqual({d.kind for d in decisions}, {'requirement', 'acceptance_criterion'})
+
+    def test_prd_sections_separate_background_requirements_and_acceptance_criteria(self):
+        payload = sample_issue_payload()
+        payload['fields']['description'] = """h2. Summary
+A page for project administrators.
+h2. Who we're building for
+* Project managers.
+h2. Requirements
+h3. Functional requirements
+ # Display the approved columns.
+ # Preserve project permissions.
+h3. Acceptance criteria
+ # Given a saved layout, restore it.
+h3. Additional V1 candidate columns for product review
+Candidates are not approved scope.
+h2. Out of scope
+ * Bulk edits.
+"""
+        issue = normalize_issue(payload, 'https://jira.example.com')
+        snapshot = build_requirements_snapshot(issue, payload, JiraRequirementsConfig())
+        decisions = [d for d in snapshot.current_requirements if d.sources[0].source_type == 'description']
+        kinds = {d.text: d.kind for d in decisions}
+        self.assertEqual(kinds['A page for project administrators.'], 'supporting_evidence')
+        self.assertEqual(kinds['Display the approved columns.'], 'requirement')
+        self.assertEqual(kinds['Preserve project permissions.'], 'requirement')
+        self.assertEqual(kinds['Given a saved layout, restore it.'], 'acceptance_criterion')
+        self.assertEqual(kinds['Candidates are not approved scope.'], 'supporting_evidence')
+        self.assertEqual(kinds['Bulk edits.'], 'requirement')
+        self.assertNotIn('h2.', kinds)
+        self.assertNotIn('Summary', kinds)
+
+    def test_long_prd_expands_without_false_contradiction(self):
+        from symphony_jira.orchestrator import requirements_planning_safety_error
+        payload = sample_issue_payload()
+        payload['fields']['description'] = '\n'.join(
+            f'- Display approved project field {i}.' for i in range(111)
+        )
+        issue = normalize_issue(payload, 'https://jira.example.com')
+        snapshot = build_requirements_snapshot(issue, payload, JiraRequirementsConfig())
+        issue.requirements_snapshot = snapshot
+        self.assertFalse(snapshot.unresolved_contradictions)
+        self.assertEqual(len([d for d in snapshot.current_requirements
+                              if d.sources[0].source_type == 'description']), 111)
+        self.assertIsNone(requirements_planning_safety_error(issue))
+
+    def test_expansion_limit_is_incomplete_ingestion_not_a_contradiction(self):
+        from symphony_jira.jira import _MAX_DECISION_UNITS_PER_ARTIFACT
+        from symphony_jira.orchestrator import requirements_planning_safety_error
+        payload = sample_issue_payload()
+        payload['fields']['description'] = '\n'.join(
+            f'- Display approved project field {i}.'
+            for i in range(_MAX_DECISION_UNITS_PER_ARTIFACT + 1)
+        )
+        issue = normalize_issue(payload, 'https://jira.example.com')
+        snapshot = build_requirements_snapshot(issue, payload, JiraRequirementsConfig())
+        issue.requirements_snapshot = snapshot
+        self.assertFalse(snapshot.unresolved_contradictions)
+        self.assertTrue(any('decision units' in r for r in snapshot.incomplete_reasons))
+        error = requirements_planning_safety_error(issue)
+        self.assertIn('Requirements snapshot is incomplete', error)
+        self.assertIn('Codex has not started', error)
+        self.assertLess(len(error), 900)
+
+
     def test_normalize_issue_payload(self) -> None:
         issue = normalize_issue(sample_issue_payload(), "https://jira.example.test")
 

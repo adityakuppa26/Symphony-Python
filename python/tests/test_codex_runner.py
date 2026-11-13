@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import signal
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,50 @@ from symphony_jira.config import CodexConfig
 
 
 class CodexRunnerTests(unittest.TestCase):
+    def run_event_stream(self, lines, returncode=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            return asyncio.run(CodexRunner().run(
+                "prompt", Path(tmp), CodexConfig(command=sys.executable, args=[
+                    "-c", "import sys; sys.stdin.read(); "
+                    f"print({chr(10).join(lines)!r}); sys.exit({returncode})",
+                ]), timeout_seconds=10,
+            ))
+
+    def test_non_object_json_is_logged_without_interrupting_events(self):
+        noise = ['null', '[]', '42', '"diagnostic"']
+        result = self.run_event_stream(noise + [json.dumps({
+            'type': 'item.completed',
+            'item': {'type': 'agent_message', 'text': 'Done'},
+        })])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(result.final_message, 'Done')
+        self.assertEqual(result.raw_stdout_lines, noise)
+        self.assertEqual(len(result.events), 1)
+
+    def test_failed_turn_cannot_be_reported_as_completed_on_zero_exit(self):
+        result = self.run_event_stream([
+            json.dumps({'type': 'item.completed', 'item': {
+                'type': 'agent_message', 'text': 'Working on it',
+            }}),
+            json.dumps({'type': 'turn.failed', 'error': {'message': 'Quota exceeded'}}),
+        ])
+        self.assertEqual(result.status, 'failed')
+        self.assertEqual(result.error, 'Quota exceeded')
+
+    def test_structured_error_preserves_actionable_block_reason(self):
+        result = self.run_event_stream([json.dumps({
+            'type': 'turn.failed', 'error': {'message': 'Tool requires approval'},
+        })], returncode=1)
+        self.assertEqual(result.status, 'blocked')
+        self.assertEqual(result.error, 'Tool requires approval')
+
+    def test_recoverable_error_does_not_fail_a_successful_turn(self):
+        result = self.run_event_stream([
+            json.dumps({'type': 'error', 'message': 'Retrying connection'}),
+            json.dumps({'type': 'turn.completed', 'final_message': 'Done'}),
+        ])
+        self.assertEqual(result.status, 'completed')
+
     def test_parses_jsonl_events_and_extracts_final_agent_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -154,14 +199,14 @@ class CodexRunnerTests(unittest.TestCase):
                             "x" * 4_000_000,
                             workspace,
                             CodexConfig(command=str(fake_codex), args=["exec", "--json"]),
-                            timeout_seconds=0.05,
+                            timeout_seconds=0.5,
                         ),
-                        timeout=2,
+                        timeout=3,
                     )
                     elapsed = asyncio.get_running_loop().time() - started
                     self.assertEqual(result.status, "failed")
-                    self.assertEqual(result.error, "Codex timed out after 0.05 seconds")
-                    self.assertLess(elapsed, 1)
+                    self.assertEqual(result.error, "Codex timed out after 0.5 seconds")
+                    self.assertLess(elapsed, 2)
                     grandchild_pid = int(
                         (workspace / "grandchild.pid").read_text(encoding="utf-8")
                     )
@@ -216,12 +261,12 @@ class CodexRunnerTests(unittest.TestCase):
                         "x" * 4_000_000,
                         workspace,
                         CodexConfig(command=str(fake_codex), args=["exec", "--json"]),
-                        timeout_seconds=0.05,
+                        timeout_seconds=0.5,
                     ),
                     timeout=10,
                 )
                 self.assertEqual(result.status, "failed")
-                self.assertEqual(result.error, "Codex timed out after 0.05 seconds")
+                self.assertEqual(result.error, "Codex timed out after 0.5 seconds")
                 assert_child_process_gone(workspace / "child.pid")
 
             asyncio.run(run())

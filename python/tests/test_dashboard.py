@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -38,6 +38,27 @@ from symphony_jira.workflow import load_workflow
 
 
 class DashboardTests(unittest.TestCase):
+    def test_question_answers_without_resuming_or_creating_an_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = load_workflow(write_workflow(root), environ={"TEST_JIRA_TOKEN": "token"})
+            store = Store(root / "db.sqlite3")
+            issue = Issue(id="1", identifier="T-1", title="Title", status="To Do", url="u")
+            run = store.create_run(issue, root / "T-1", branch_name=None)
+            store.update_run(run.id, status="blocked", blocked_phase="implementation", error="Which option?")
+            client = TestClient(create_app(workflow, store))
+            with patch('symphony_jira.dashboard.answer_question', new_callable=AsyncMock,
+                       return_value='The choice changes schema scope.'):
+                response = client.post(f'/api/v1/runs/{run.id}/question', json={'question': 'Why are you asking?'})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertFalse(response.json()['resumed'])
+            self.assertEqual(store.get_run(run.id).blocked_phase, 'implementation')
+            self.assertEqual(store.list_human_inputs(run_id=run.id), [])
+            self.assertEqual(store.list_plan_approvals(run_id=run.id), [])
+            page = render_dashboard_html(build_state(workflow, store))
+            self.assertIn('The choice changes schema scope.', page)
+            self.assertIn('Ask Codex', page)
+
     def test_case_rows_consolidate_attempts_without_changing_stored_runs_or_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -606,11 +627,12 @@ class DashboardTests(unittest.TestCase):
             self.assertNotIn("bypass_verification", html)
             self.assertIn("Address Human Review", html)
             self.assertIn(
-                f'<form method="post" action="/api/v1/runs/{run.id}/human-review">',
+                f'<form method="post" action="/api/v1/runs/{run.id}/human-review" data-review-form>',
                 html,
             )
             self.assertIn('name="reviewer_identity" required', html)
-            self.assertIn('name="source_url" type="url" required', html)
+            self.assertIn('PR or review URL (optional)', html)
+            self.assertNotIn('name="source_url" type="url" required', html)
             self.assertIn('name="comments" required', html)
 
     def test_human_review_route_rejects_historical_and_non_completed_runs(self) -> None:
@@ -714,7 +736,6 @@ class DashboardTests(unittest.TestCase):
 
             for field_name, expected_detail in (
                 ("reviewer_identity", "reviewer identity is required"),
-                ("source_url", "review source/PR link is required"),
                 ("comments", "review comments are required"),
             ):
                 with self.subTest(missing_field=field_name):

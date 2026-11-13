@@ -1,4 +1,8 @@
 # Layered over Compost by Symphony only. The original images and files are unchanged.
+networks:
+  TPM:
+    labels:
+      com.docker.compose.network: TPM
 services:
   ibis:
     volumes:

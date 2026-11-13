@@ -977,6 +977,44 @@ def test_each_active_scope_item_requires_a_current_decision_source(
     assert unanchored_id in str(error.value)
 
 
+def test_derived_acceptance_criterion_can_cite_its_parent_requirement() -> None:
+    snapshot = requirements_snapshot()
+    snapshot.current_requirements = [snapshot.current_requirements[0]]
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot.content_hash)
+    plan = parse_plan_spec(json.dumps(payload), requirements_snapshot=snapshot)
+    assert plan.requirements[0].acceptance_criteria[0].id == "AC-gc"
+
+
+def test_derived_criterion_does_not_replace_explicit_jira_acceptance_coverage() -> None:
+    snapshot = requirements_snapshot()
+    explicit = snapshot.current_requirements[1]
+    explicit.sources = [explicit.sources[0].model_copy(update={"source_id": "description#unit:explicit-ac"})]
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload(snapshot_hash=snapshot.content_hash)
+    with pytest.raises(PlanSpecError, match="does not cover every current"):
+        parse_plan_spec(json.dumps(payload), requirements_snapshot=snapshot)
+
+
+def test_derived_criterion_cannot_borrow_an_unrelated_parent_requirement() -> None:
+    snapshot = requirements_snapshot()
+    first = snapshot.current_requirements[0]
+    other = first.model_copy(deep=True, update={"id": "decision:other", "sources": [
+        first.sources[0].model_copy(update={"source_id": "description#unit:other"})]})
+    snapshot.current_requirements = [first, other]
+    snapshot = snapshot.with_content_hash()
+    payload = plan_payload_with_two_requirements()
+    payload['requirements_snapshot_hash'] = snapshot.content_hash
+    other_source = {"issue_key": snapshot.issue_identifier, "source_type": "description", "source_id": "description#unit:other"}
+    payload['requirements'][1]['jira_sources'] = [other_source]
+    payload['requirements'][1]['acceptance_criteria'][0]['jira_sources'] = [other_source]
+    payload['requirements'][0]['acceptance_criteria'][0]['jira_sources'] = [other_source]
+    with pytest.raises(PlanSpecError) as error:
+        parse_plan_spec(json.dumps(payload), requirements_snapshot=snapshot)
+    assert 'AC-gc (parent R-role-visibility)' in str(error.value)
+    assert "parent's requirement source" in str(error.value)
+
+
 def test_each_active_scope_item_requires_a_matching_decision_kind() -> None:
     snapshot = requirements_snapshot_with_current_decisions()
     payload = plan_payload_with_two_requirements()
@@ -1019,7 +1057,7 @@ def test_each_active_scope_item_requires_a_matching_decision_kind() -> None:
         requirement_sources[0]
     ]
 
-    with pytest.raises(PlanSpecError, match="matching-layer current") as error:
+    with pytest.raises(PlanSpecError, match="current authoritative Jira decision source") as error:
         parse_plan_spec(
             json.dumps(payload),
             expected_issue_key="ICPM-67703",

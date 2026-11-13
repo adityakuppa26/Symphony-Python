@@ -12,7 +12,7 @@ if [[ ${1:-} == "down" && $# -eq 2 ]]; then
 fi
 
 if [[ ${1:-} == "--help" || $# -lt 3 || ${1:-} != "up" ]]; then
-    printf 'Usage: %s up <issue-workspace> <cpm|foyr2|pi> [repositories...]\n       %s down <issue-workspace>\n' "$0" "$0"
+    printf 'Usage: %s up <issue-workspace> <pi> [repositories...]\n       %s down <issue-workspace>\n' "$0" "$0"
     [[ ${1:-} == "--help" ]] && exit 0
     exit 2
 fi

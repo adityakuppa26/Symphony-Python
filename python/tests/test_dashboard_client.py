@@ -22,6 +22,7 @@ function element(id) {
     addEventListener(name, callback) {this.handlers[name] = callback;}, setAttribute(){}});
   return elements.get(id);
 }
+const summary = {dataset:{businessSummaryRun:'one'}, textContent:'', hidden:true};
 const rows = [
   {dataset:{case:'t-1', filter:'attention'}},
   {dataset:{case:'t-2', filter:'completed'}}
@@ -37,7 +38,7 @@ class Notification {
   static async requestPermission() {this.permission = 'granted'; return 'granted';}
   constructor() {notifications++;}
 }
-const document = {getElementById:element, querySelectorAll:()=>rows, hidden:false,
+const document = {getElementById:element, querySelectorAll:selector=>selector === '[data-review-form]' ? [] : selector === '[data-business-summary-run]' ? [summary] : rows, hidden:false,
   addEventListener(name, callback){listeners[name] = callback;}};
 vm.runInNewContext(script, {document, window:{AudioContext, Notification, location:{reload(){reloads++;}}, focus(){}},
   Notification, AbortSignal, localStorage:{getItem:key=>storage.get(key) ?? null, setItem:(key,value)=>storage.set(key,value)},
@@ -52,6 +53,9 @@ const settle = () => new Promise(resolve=>setImmediate(resolve));
   assert.equal(tones, 4); // Preview plus first actionable request, two tones each.
   const poll = intervals.find(item=>item.delay===15000).callback;
   await poll(); assert.equal(tones, 4); // No repeat on every poll.
+  state.all_runs=[{id:'one',business_summary:'Managers can find recently created projects. Filters narrow the list.'}];
+  await poll(); assert.equal(summary.hidden,false); assert.match(summary.textContent,/Managers/);
+  assert.equal(reloads,0);
   state.blocked_issues.push({id:'old', issue_identifier:'T-0', human_input_actionable:false});
   await poll(); assert.equal(tones, 4);
   state.blocked_issues.push({id:'two', issue_identifier:'T-2', human_input_actionable:true});

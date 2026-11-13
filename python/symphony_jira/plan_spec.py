@@ -906,15 +906,26 @@ def _validate_current_decision_coverage(
             current_requirement_sources,
         )
     ]
-    unanchored_acceptance_criteria = [
-        criterion.id
-        for requirement in plan.requirements
-        for criterion in requirement.acceptance_criteria
-        if not cites_current_decision(
-            criterion.jira_sources,
-            current_acceptance_sources,
-        )
-    ]
+    unanchored_acceptance_criteria: list[str] = []
+    for requirement in plan.requirements:
+        parent_requirement_sources = {
+            (source.issue_key, source.source_type, source.source_id)
+            for source in requirement.jira_sources
+            if cites_current_decision([source], current_requirement_sources)
+        }
+        for criterion in requirement.acceptance_criteria:
+            if cites_current_decision(criterion.jira_sources, current_acceptance_sources):
+                continue
+            if cites_current_decision(criterion.jira_sources, parent_requirement_sources):
+                continue
+            options = ", ".join(
+                f"{issue}:{source_type}:{source_id}"
+                for issue, source_type, source_id in sorted(parent_requirement_sources)
+            ) or "none; first anchor the parent requirement to a current Jira requirement"
+            unanchored_acceptance_criteria.append(
+                f"{criterion.id} (parent {requirement.id}): cite an explicit current Jira "
+                f"acceptance criterion or the parent's requirement source: {options}"
+            )
     if unanchored_requirements or unanchored_acceptance_criteria:
         details: list[str] = []
         if unanchored_requirements:
@@ -925,8 +936,9 @@ def _validate_current_decision_coverage(
                 + ", ".join(unanchored_acceptance_criteria)
             )
         raise PlanSpecError(
-            "Every PlanRequirement and AcceptanceCriterion must cite a matching-layer "
-            f"current authoritative Jira decision source: {'; '.join(details)}"
+            "Every PlanRequirement and AcceptanceCriterion must cite a current authoritative Jira decision source. "
+            "Requirements need requirement sources; derived acceptance criteria may cite their parent requirement. "
+            f"Repair these citations: {'; '.join(details)}"
         )
 
 

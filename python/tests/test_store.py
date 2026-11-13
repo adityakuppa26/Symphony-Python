@@ -621,10 +621,9 @@ class StoreHumanReviewTests(unittest.TestCase):
             self.assertEqual(
                 store.list_human_review_actions_for_issue("T-1"), [action]
             )
-            with self.assertRaisesRegex(
-                ValueError, "latest actionable completed run"
-            ):
-                submit(latest.id)
+            replayed_action, replayed_child = submit(latest.id)
+            self.assertEqual(replayed_action["id"], action["id"])
+            self.assertEqual(replayed_child.id, child.id)
             self.assertEqual(
                 [run.id for run in store.list_runs_for_issue("T-1")],
                 [child.id, latest.id, non_completed.id],

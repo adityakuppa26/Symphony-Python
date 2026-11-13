@@ -280,6 +280,8 @@ class RunRecord(BaseModel):
     plan_approval_id: str | None = None
     planning_baseline: PlanningBaseline | None = None
     human_input_context: str | None = None
+    # Non-null means this run must validate resolutions for the retained checklist.
+    review_comment_checklist: str | None = None
     finished_at: datetime | None = None
     final_message: str | None = None
     error: str | None = None

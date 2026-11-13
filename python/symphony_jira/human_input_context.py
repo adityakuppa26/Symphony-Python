@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from typing import Any
 
@@ -81,7 +81,7 @@ def build_human_input_context(
             entry["id"] == entry_id
             or (
                 not current_input.get("id")
-                and entry["kind"] in {"operator_feedback", "plan_approval"}
+                and entry["kind"] in {"operator_feedback", "operator_decision", "plan_approval"}
                 and entry.get("source_run_id") == source_run_id
                 and entry.get("text") == current_input["response"]
             )
@@ -90,7 +90,7 @@ def build_human_input_context(
         if not represented:
             history.append({
                 "id": entry_id,
-                "kind": "plan_approval" if current_input.get("action") == "plan_approval" else "operator_feedback",
+                "kind": {"plan_approval": "plan_approval", "automatic_replan": "system_routing", "decision": "operator_decision"}.get(current_input.get("action"), "operator_feedback"),
                 "source_run_id": source_run_id,
                 "phase": previous_run.blocked_phase if previous_run else None,
                 "created_at": str(current_input.get("created_at") or through.isoformat()),
@@ -100,6 +100,8 @@ def build_human_input_context(
                 "approval_id": current_input.get("approval_id"),
             })
     if current_review:
+        known_ids = {entry["id"] for entry in history}
+        history.extend(entry for entry in current_review.get("clarifications", []) if entry["id"] not in known_ids)
         entry_id = "human-review:" + str(current_review["id"])
         if not any(entry["id"] == entry_id for entry in history):
             history.append({
@@ -112,7 +114,14 @@ def build_human_input_context(
                 "source_url": current_review.get("source_url"),
                 "text": current_review.get("comments"),
             })
-    history.sort(key=lambda entry: (entry["created_at"], entry["id"]))
+    # ISO strings with different offsets do not sort chronologically. Keep the
+    # source order for equal instants rather than letting random UUIDs decide
+    # which operator decision is presented as the latest one.
+    def input_time(entry: dict[str, Any]) -> datetime:
+        timestamp = datetime.fromisoformat(entry["created_at"].replace("Z", "+00:00"))
+        return timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp
+
+    history.sort(key=input_time)
     return (
         "## Accumulated human input for all phases\n\n"
         f"Issue: {issue_identifier}\n"
@@ -120,6 +129,14 @@ def build_human_input_context(
         f"Captured through: {through.isoformat()}\n"
         f"Plan approval reference at run start: {approval_id or 'none'}\n\n"
         + HUMAN_DECISION_POLICY
-        + "\n\n" + HISTORY_MARKER
+        + "\n\nRecent decision ledger (newest first; full history follows):\n"
+        + json.dumps([{
+            "id": entry["id"], "kind": entry["kind"], "text": str(entry.get("text") or "")[:800],
+            "answers_question": str(entry.get("question") or "")[:500],
+            "approval_invalidated_at": entry.get("approval_invalidated_at"),
+        } for entry in reversed(history) if entry["kind"] != "system_routing"][:12], ensure_ascii=False)
+        + "\nQuestions are not decisions. Interpret short assent only against its recorded question. "
+        "Do not treat system routing as operator authorization. Resolve supersession only for the specific point explicitly addressed.\n\n"
+        + HISTORY_MARKER
         + json.dumps(history, ensure_ascii=False, indent=2, sort_keys=True)
     )

@@ -201,3 +201,39 @@ class HumanInputContextTests(unittest.IsolatedAsyncioTestCase):
         resumed = build_human_input_context(self.store, 'T-1', through=utc_now(),
             run_id='resumed', previous_run=source, current_input={'response': FORMATTER})
         self.assertEqual([entry['text'] for entry in context_entries(resumed)], [OVERRIDE, FORMATTER])
+
+    async def test_direct_decisions_are_ordered_by_instant_across_timezones(self):
+        source = self.store.create_run(self.issue, self.root / 'workspace', branch_name=None)
+        context = build_human_input_context(self.store, 'T-1', through=source.started_at,
+            run_id=source.id, current_input={
+                'response': 'Earlier decision', 'created_at': '2026-01-01T10:00:00+00:00',
+            })
+        source = self.store.update_run(source.id, human_input_context=context)
+        resumed = build_human_input_context(self.store, 'T-1', through=utc_now(),
+            run_id='resumed', previous_run=source, current_input={
+                'response': 'Latest decision', 'created_at': '2026-01-01T05:00:00-06:00',
+            })
+        self.assertEqual([entry['text'] for entry in context_entries(resumed)],
+                         ['Earlier decision', 'Latest decision'])
+
+    async def test_same_timestamp_preserves_operator_submission_order(self):
+        source = self.store.create_run(self.issue, self.root / 'workspace', branch_name=None)
+        created_at = (utc_now() - timedelta(days=1)).isoformat()
+        with sqlite3.connect(self.store.db_path) as conn:
+            for entry_id, response in [('z-first', 'Earlier decision'), ('a-second', 'Latest decision')]:
+                conn.execute('''INSERT INTO human_inputs
+                    (id,issue_identifier,run_id,response,created_at) VALUES (?,?,?,?,?)''',
+                    (entry_id, 'T-1', source.id, response, created_at))
+        context = build_human_input_context(self.store, 'T-1', through=utc_now(), run_id='next')
+        self.assertEqual([entry['text'] for entry in context_entries(context)],
+                         ['Earlier decision', 'Latest decision'])
+
+    async def test_direct_input_does_not_duplicate_a_saved_explicit_decision(self):
+        source = self.store.create_run(self.issue, self.root / 'workspace', branch_name=None)
+        with sqlite3.connect(self.store.db_path) as conn:
+            conn.execute('''INSERT INTO human_inputs
+                (id,issue_identifier,run_id,response,created_at,action) VALUES (?,?,?,?,?,?)''',
+                ('decision', 'T-1', source.id, OVERRIDE, source.started_at.isoformat(), 'decision'))
+        context = build_human_input_context(self.store, 'T-1', through=utc_now(),
+            run_id='next', previous_run=source, current_input={'response': OVERRIDE, 'action': 'decision'})
+        self.assertEqual(len(context_entries(context)), 1)

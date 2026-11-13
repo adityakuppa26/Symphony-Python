@@ -9,11 +9,29 @@ whatever the local `codex` CLI already uses.
 
 ## Development workflow
 
+The dashboard displays a 2–4 sentence business overview below each issue key.
+With `codex.summarize_requirements_before_planning: true`, a short read-only Codex
+call generates it from the allowed Jira requirements before planning starts.
+Summaries are cached by issue and requirements snapshot, remain separate from the
+approved plan, and do not add a workflow phase. Generation has a 30-second default
+limit (`business_summary_timeout_seconds`); failures do not block planning.
+The existing dashboard polling updates summaries without disturbing feedback forms.
+
 `WORKFLOW.md` is the single supported workflow. Symphony inspects Jira requirements
 and the relevant application code, plans the smallest correct change using existing
 patterns, waits for human plan approval, implements, runs an independent code review
 and correction loop, and hands off. Changes to approved scope require a new plan
 and approval.
+
+Every development agent pass receives the shared existing-pattern and minimal-change
+policy, including repairs, review corrections, test selection, and post-handoff
+human-review triage. Plans must identify the existing code path to extend. Changes
+follow the closest applicable component/module convention and preserve behavior
+outside the requirement. New abstractions, dependencies, configuration, flags,
+fallbacks, retries, caching, and unrelated cleanup require a concrete necessity
+within approved scope. Review findings must cite the changed location and relevant
+precedent or requirement, then request the smallest correction. Routine coding
+choices follow existing patterns without another approval request.
 
 The development handler owns changes in `foyr2`, `cpm`, and `pi`. Workspaces remain
 under `~/codex-workspaces/development`; run history, approvals, and review context
@@ -57,6 +75,40 @@ pass. Results remain advisory; set `hooks.verify: null` to disable execution. Fa
 unconfigured checks do not block handoff or require a bypass approval. Concrete
 code defects still require review corrections. Reports distinguish passed, failed,
 and unrun tests. Old `verify_required` settings are normalized to false.
+Runtime startup failures are reported as environment errors, with the original
+setup exit code retained, because tests have not run. A failed Codex turn cannot
+count as a completed implementation even if the CLI exits with status zero;
+structured error messages are retained for diagnosis and approval routing.
+
+Host verification reports bind the exact selected commands and code snapshot.
+Symphony checks every target, exit code, skip reason, and aggregate status before
+accepting a result. Missing or contradictory evidence becomes an environment error,
+never a passing check. Each review correction receives the prior implementation
+report and host output, followed by fresh focused test selection and execution.
+
+Unattended execution has two separate limits: `agent.timeout_seconds` caps the
+whole agent pass, while `codex.stall_timeout_seconds` stops a child that emits no
+stdout or stderr for 900 seconds by default. Set the latter to `0` to disable it
+for tools that legitimately remain silent longer. Host verification has its own
+timeout and is not subject to this inactivity watchdog.
+
+After `codex.max_review_no_progress_passes` consecutive reviewed implementations
+without code changes (default 2), Symphony stops with the retained changes and
+review findings available for inspection. It also stops before starting a correction
+when the review budget cannot cover another review. Neither limit invalidates an
+otherwise valid approval or discards the workspace.
+
+Retry attempts and backoff survive polling-process restarts, including dispatch
+failures before a run record exists. Exhausted or non-retryable failures do not
+restart indefinitely for unchanged requirements. Revised requirements start a new
+budget; an intentional `once --issue <KEY>` execution remains available after
+fixing the cause. Existing queued/running records prevent duplicate dispatch; this
+does not automatically reclaim orphaned runs after a hard process kill. Durable
+human resumes continue to use their existing lease recovery.
+
+Jira search outages no longer skip reconciliation of active issues. On normal stop,
+Ctrl-C, or SIGTERM, the polling process cancels and waits for its workers so their
+process cleanup, workspace hooks, and final run records settle before shutdown.
 
 The dashboard shows the development stages and the host-test phase, highlights the next human action,
 keeps plan/review summaries readable, and pauses refresh while reading or editing.
@@ -231,16 +283,19 @@ nonblank, and ranked because authority affects supersession precedence.
 
 ### Attachments
 
-Attachments are intentionally excluded from planning for now. Jira attachment
-metadata is retained for inspection, but normal issue ingestion does not download or
-analyze attachment content. Attachment names, contents, analysis status, failures,
-and markers cannot create requirements, acceptance criteria, contradictions,
-PlanSpec coverage, incomplete reasons, or approval-hash changes. Put any required
-behavior from a mockup into Description or Acceptance Criteria before running
-Symphony. The active workflow excludes Jira comments from planning.
+Before finalizing a plan, Codex is instructed to read relevant links in Jira
+Description and Acceptance Criteria through its available MCP tools, including
+Confluence, and visually inspect embedded/linked UI mockups and relevant issue
+mockup attachments. It records source URLs, versions when available, image
+identifiers, and relevant observations in the existing PlanSpec fields. The
+approved plan carries that interpretation into implementation and review.
+Unavailable required evidence prompts a specific human question; incidental gaps
+are recorded as risks. Jira comments remain excluded.
 
-The Jira client retains basic attachment helpers for compatibility. The unused
-standalone Codex vision/PDF analyzer has been removed.
+This uses Codex's existing MCP access; host ingestion does not download external
+pages/images or include their contents in the Jira snapshot hash. External changes
+are not automatically detected. Plan citations still use the referring root Jira
+source IDs. Unreferenced attachments do not independently create scope.
 
 ## PlanSpec, artifacts, and approval
 
@@ -342,15 +397,65 @@ never defaults to approval.
 ## Addressing human review after completion
 
 The dashboard exposes **Address Human Review** only on the latest completed run for
-an issue. The action accepts the reviewer identity, an absolute HTTP(S) review or PR
-link, and pasted comments. The equivalent API request is:
+an issue. Paste a batch of comments, including file names, line references, and code
+examples. The reviewer field starts as `Operator` and can be changed to the actual
+reviewer's name. A review/PR URL is optional; when provided it must be an absolute
+HTTP(S) URL. No MCP connector is needed for manual feedback.
+
+The form previews the exact text and saves drafts in session storage for this
+browser tab. Reloading restores the draft; closing the tab ends that storage.
+**Clear draft** removes it. Submission errors appear inline and retain the input.
+Repeated identical submissions for the same handoff return the existing review and
+result run, including after a lost response or process restart. A different batch
+cannot overwrite one already submitted. Submit the next round from its completed
+result run.
+
+After submission, **Open review progress & response** opens `/reviews/<review-id>`.
+It shows the scope check's comment list, current status, verification result, and
+the implementation's response without refreshing away your reading position.
+The read-only triage assigns comment IDs; implementation is instructed to respond
+to each with its resolution and file/check evidence, and independent review checks
+those claims against the diff. An item in the scope checklist is proposed work,
+not proof of completion.
+
+The checked-in workflow enables `codex.require_review_comment_coverage`. Before
+implementation, Symphony validates the triage checklist's IDs, text, scope, and
+proposed actions. Mixed-scope items cannot be routed as an in-scope batch. An
+independent reviewer may approve only with a `comment_resolutions` entry for every
+checklist ID, exactly once, giving `addressed`, `already_satisfied`, or `unresolved`
+and nonempty code/check evidence. Unresolved items return to correction. Missing
+or malformed checklist/resolution output receives one read-only repair attempt;
+continued invalid output blocks handoff. Successful resolution evidence is stored
+with the reviewed workspace hash and shown on the progress page after completion.
+Older custom workflows keep their previous behavior unless this option is enabled;
+historical results without evidence are labeled `not recorded`.
+
+These checks establish complete, structured review records. They do not prove the
+reviewer's semantic judgment is correct: independent review must still inspect the
+original comments, actual code, tests, and accepted human decisions. Test execution
+remains advisory, and unrun checks cannot be cited as passing evidence.
+
+Each implementation pass also compares snapshots of every managed repository.
+Changing a repository outside the approved PlanSpec stops handoff and preserves
+the edits for inspection. Unchanged pre-existing work in other repositories is
+allowed. This boundary supplements the existing code-pattern and minimal-change
+instructions; it does not infer whether every edit within an approved repository
+is justified.
+
+Run the focused handoff acceptance scenarios with
+`.venv/bin/python -m pytest -q tests/test_review_completion.py` from `python/`.
+They exercise repair bounds, omitted/duplicate comment dispositions, unresolved
+feedback, scope conflicts, read-only review mutations, and repository boundaries.
+These are deterministic orchestration tests using controlled runner responses,
+not a benchmark of live model quality.
+
+The equivalent API request is:
 
 ```bash
 curl -X POST http://localhost:3333/api/v1/runs/<run-id>/human-review \
   -H 'Content-Type: application/json' \
   -d '{
     "reviewer_identity": "reviewer@example.com",
-    "source_url": "https://github.example.com/org/repo/pull/123",
     "comments": "Please reuse the existing helper and add the missing regression test."
   }'
 ```
@@ -381,7 +486,24 @@ Before any edits, Symphony runs a read-only triage pass:
   issue into an active status. If product requirements changed, update authoritative
   Jira evidence before replanning; pasted review text is never silently promoted to
   a product requirement; and
-- `needs_human` or invalid triage output blocks in review without editing code.
+- `needs_human` blocks in review without editing code. Answer the scope question
+  directly on the review progress page using **Save answer & resume review**.
+  Symphony reruns the read-only scope check on the same saved review batch, even
+  while Jira remains Done. Answers are durable, stay separate from the original
+  pasted comments, and reach subsequent implementation/review phases and later
+  review rounds. Workspace and approval integrity checks still apply. Answer
+  submissions carry the displayed question revision so a stale tab cannot replace
+  a newer answer; retries of the same answer are idempotent; and
+- invalid triage output blocks in review without editing code and is not eligible
+  for the scope-answer shortcut.
+
+`GET /api/v1/reviews/<review-id>` supplies lightweight progress, comment items,
+answers, and the latest response. `POST /api/v1/reviews/<review-id>/clarifications`
+accepts `response` plus the `expected_revision` from the progress response's
+`clarification_revision`. Future MCP ingestion can submit normalized reviewer,
+optional source URL, and comments through the existing submission endpoint; the
+frozen-context, triage, and review pipeline is shared. No external comments are
+fetched, posted, or marked resolved by this manual flow.
 
 The triage pass uses a normalized read-only Codex sandbox, skips `before_run` hooks
 that could mutate the frozen diff, and rejects workspace drift before and after
@@ -417,85 +539,76 @@ reasons, or explicit coverage gaps. Symphony adds the workspace code hash and fr
 and after execution; it cannot report stale results as passing.
 
 `hooks.verify` invokes `symphony_jira.development_verification` with
-`--prepare-with-test`. Each selected target goes through one `scripts/test.sh` call,
-so checkout selection, Compose startup, mount checks, and test execution remain
-under the same runtime lock. Test processes run on the host's Podman runtime,
+`--prepare-with-test`. CPM unit/functional targets use the dedicated schema controller.
+Foyr Python/frontend targets use the standalone Foyr controller. Pi retains
+`scripts/test.sh`. Test processes run on the host's Podman runtime,
 outside Codex's sandbox.
 
-The current workflow enables `codex.development_test_suites: [python]`:
+The checked-in workflow enables `codex.development_test_suites: [python, functional, frontend]`.
 
-| Repository | Supported focused selectors | Container |
+| Repository | Suite and supported selection | Runner |
 | --- | --- | --- |
-| CPM | `Test/unit/<file>.py`, optionally `::Class::test` | `cpm` |
-| Foyr | `tests/<file>.py`, optionally `::Class::test` | `foyr` |
+| CPM | `python`: `Test/unit/<file>.py`, optionally `::Class::test` | Dedicated schema stack |
+| CPM | `functional`: `Test/functional/<file>.py`, optionally `::Class::test` | Dedicated schema stack |
+| Foyr | `python`: `tests/<file>.py`, optionally `::Class::test` | Disposable Foyr runner |
+| Foyr | `frontend`: source files under `foyr/client_src/karma_test/` or `foyr/src/` (`.spec.ts` / `.spec.tsx`) | Karma or Jest, one worker |
 
-Requests need explicit relative test paths. Filters such as `-k` and `-m` and basic
-pytest output flags are allowed. CPM `api/` and `Test/functional/` requests are
-rejected instead of being run in the wrong environment; API routing to iBIS and
-functional testdb creation are not configured in this first milestone. Frontend
-coverage gaps are recorded rather than claiming Python tests cover browser behavior.
+Symphony runs tests relevant to the actual feature-branch diff, with no automatic
+sanity profile. Before freezing the request, the host discovers added and modified
+Python and supported Foyr frontend test files against the approved baseline, including staged and untracked files.
+Supported test files are included in full so every newly introduced case runs; filters
+and early-stop flags are removed from those targets. Existing unchanged tests are
+selected only for relevant behavior. Missing or unsupported coverage remains explicit
+in skipped entries; unrelated checks are never substituted. Functional directory and
+full-suite requests are rejected.
+API suites remain out of scope until separate iBIS verification is configured.
 
-The runner overrides `CPM_SRC` and `FOYR_SRC` only in its own process environment.
-Compose reads `/home/adkuppa/compost/.env` for other settings; the file is never
-written, temporarily edited, or backed up by the runtime. Checkout overrides expire
-when the command exits. Compost YAML and startup scripts are also left untouched.
-Running containers keep their selected mounts until Compose recreates them; future
-manual Compose commands use your original `.env` values.
+`--cpm-entrypoint /home/adkuppa/playground/cpm-verification/verify.py` routes CPM
+unit and functional targets directly to the standalone controller, bypassing
+Compost startup and application containers. It receives this issue's `cpm/` checkout,
+literal test selectors and validated pytest filters, and the remaining host time budget.
+The controller snapshots source, resets only its owned schema in the existing Oracle
+service and its private cache, and runs a disposable test container. A missing controller
+is an environment error; there is no fallback to the shared CPM application runner.
 
-Using existing images (`--pull never`, no builds), the runner starts the required
-Compose services and waits for health. Existing application services restart to
-load current code. It verifies their source mounts before `compose exec -T` runs
-pytest in the target container. Foyr uses `tests/testing.yml` and one pytest worker.
-CPM unit-test processes (including the helper's `--shell` mode) override
-`CREATE_NEW_DATABASE_WHEN_TESTING=False`. This prevents the shared functional-test
-setting from creating database objects during unit collection; the `.env` setting
-itself is preserved.
-The currently validated CPM image runs Python 3.12.6, while this checkout declares
-Python >=3.14.5. The image is intentionally retained at the user's request; the
-focused runtime checks validate this environment, not compatibility with every
-future Python feature. Revalidate after the CPM image is updated.
-Timeouts run inside the container as well as on the host; setup failures and timeouts
-return environment-error status rather than successful verification.
+Each target's result enters the normal code-bound verification report and review input.
+The hook log includes paths to the controller's logs, JUnit XML, source fingerprints,
+and summaries under `/home/adkuppa/playground/cpm-verification/results/`. Correction
+and human-review implementation passes repeat selection and execution. Verification
+remains advisory. There are no automatic smoke or sanity profiles.
 
-`hooks.after_run` releases the workspace's test runtime before handoff is recorded,
-and also runs when an attempt fails, is cancelled, or waits for human input.
-Symphony records which Compose services were already running before setup. It stops
-only services it started and removes containers it created, without deleting images
-or volumes. Dependencies still used by another running service or Symphony workspace
-are retained. Container IDs prevent old cleanup records from targeting replacements.
-Test processes carry a unique execution token, so cleanup can terminate leftover
-pytest workers inside a preserved development container without stopping its server.
-Temporary standalone runners are labelled by workspace and removed as well.
-Ownership is persisted under `.symphony/runtime-services/`; interrupted setup can be
-recovered from its labels. Failed cleanup retains ownership for a later retry.
-For manual sessions, release the runtime explicitly:
+For example, manual use against an issue checkout:
 
 ```sh
-./scripts/runtime.sh down /home/adkuppa/codex-workspaces/development/ICPM-74929
+python3 /home/adkuppa/playground/cpm-verification/verify.py unit --source /path/to/issue/cpm Test/unit/path/test_changed_feature.py
 ```
 
+Foyr uses `/home/adkuppa/playground/cpm-verification/foyr.py`. Python tests run
+with `tests/testing.yml`, in-process clients, mock cache, one worker, and container
+networking disabled. Neither Python nor frontend verification starts Oracle,
+memcached, CPM, iBIS, or the Foyr service. No Compose command is used.
 
-Symphony's compatibility adapters and wheel caches remain under `scripts/` and
-`.symphony/runtime-cache/`. Missing compatibility wheels are prepared over host
-networking before service startup and installed offline inside the service.
-Temporary preparation containers have a 2 GiB memory limit, no extra swap allowance,
-two CPUs, and a PID limit. Running Compose services retain their configured limits.
+Frontend verification caches `npm ci --ignore-scripts` dependencies by both lockfiles
+and the image ID. It builds the branch's assets in a private source copy, runs only
+selected legacy JavaScript / TypeScript Karma files or JSX Jest files, and collects
+JUnit or Jest JSON evidence. Karma uses a temporary headless browser and a loopback
+server; builds and CDN assets may require network access. The runner is capped at
+1.5 GiB and two CPUs, and the temporary browser at 768 MiB and one CPU. Verification
+jobs share a lock with CPM to keep resource use bounded. No application services persist.
 
-The earlier browser/Karma adapter remains available for manual diagnostics, but is
-not selected by this Python-only workflow. Pi retains its existing test path.
+The original application image is unchanged; a small `foyr-verification` image adds
+the repository's pinned Python test extras. Changes to those extras require an image
+rebuild. Missing dependencies, zero tests, all-skipped results, absent evidence, and
+timeouts cannot produce a passing report. Logs, source/image fingerprints, and frozen
+harness files are retained alongside results.
 
-The host saves a structured result and Symphony archives evidence for each run and
-correction pass under `.symphony/verification/`. Review receives the result and
-bounded command output. Skipped coverage is never labeled passed. All selected
-repositories are attempted even if an earlier test fails; the overall execution has
-a time budget and terminates child command groups on timeout.
-
-Manual host commands:
+Both `scripts/test.sh cpm` and `scripts/test.sh foyr2` reject the old Compose route
+before touching services. There is no fallback from either standalone runner. Pi's
+existing runtime preparation and ownership-based cleanup remain available.
 
 ```sh
-./scripts/runtime.sh up /home/adkuppa/codex-workspaces/development/ICPM-74929 foyr2
-./scripts/test.sh cpm /home/adkuppa/codex-workspaces/development/ICPM-74929 -- pytest Test/unit/util/test_datetime.py
-./scripts/test.sh foyr2 /home/adkuppa/codex-workspaces/development/ICPM-74929 -- pytest tests/views/api/test_home.py -n 1
+python3 /home/adkuppa/playground/cpm-verification/foyr.py python --source /path/to/issue/foyr2 tests/views/api/test_home.py
+python3 /home/adkuppa/playground/cpm-verification/foyr.py frontend --source /path/to/issue/foyr2 foyr/client_src/karma_test/cpm/home/homeTest.js
 ```
 
 Changing application/test source to resolve real test failures remains part of the
@@ -511,3 +624,88 @@ python3 -m symphony_jira once ./WORKFLOW.md --issue ICPM-73100
 python3 -m symphony_jira run ./WORKFLOW.md
 python3 -m symphony_jira dashboard ./WORKFLOW.md --port 3333
 ```
+
+
+### Human conversation and automatic replanning
+
+The dashboard separates **Ask Codex** (a read-only answer, with no resume or
+approval) from **Record decision & resume**. Questions and answers remain visible
+across recent case attempts. Decisions retain the exact question they answer;
+short assent is not blanket approval. The decision ledger shows newest inputs
+first, while every phase still receives the full chronological history.
+
+With `codex.auto_replan: true` (enabled in WORKFLOW.md), a structured
+`plan_changes_required` response queues a durable planning continuation. It does
+not authorize implementation: the revised plan still requires exact approval.
+Repeated routing, or two automatic revisions without another approval, pauses
+for inspection. System routing entries are never treated as operator decisions.
+
+Validated plans are retained under `.symphony/plan-history/`. The dashboard shows
+changed plan sections and brief details when a previous version is available.
+PRD section headings are excluded from decision citations; explicit background,
+persona, and candidate sections remain supporting evidence, while acceptance
+criteria inside Description are classified at the acceptance-criterion layer.
+Unrecognized sections remain requirements conservatively. Changes to this
+classification affect the requirements hash and may require a fresh plan/approval.
+
+Restart the orchestrator and dashboard to load Python changes. Existing code,
+operator decisions, and verification deferrals are preserved. Test verification
+remains advisory and never becomes a new approval requirement.
+
+
+Derived plan acceptance criteria may cite a current authoritative Jira requirement
+source also cited by their parent PlanRequirement, or an explicit current Jira
+acceptance-criterion source. Every explicit Jira requirement and acceptance
+criterion still requires coverage in its own layer. Supporting evidence alone or
+an unrelated requirement cannot anchor a derived criterion. Citation validation
+establishes traceability; planning and review must separately check that limits,
+defaults, and other behavior are supported and preserve recorded human overrides
+and verification deferrals.
+
+## Implementation continuation and grouped planning questions
+
+Implementation can return `{"implementation_status":"continue","summary":"...",
+"remaining_work":["..."]}`. Symphony continues under the approved plan before
+running verification or independent review. A complete report uses
+`implementation_status: complete` with an empty `remaining_work` list. Older prose
+reports remain compatible; explicit partial-implementation reports also continue.
+Two consecutive implementation passes without code progress stop the run, as does
+`codex.max_implementation_continuations` (default 6 per review iteration). Existing
+approval and requirements checks still run on continuation. Test unavailability
+alone does not make source implementation incomplete.
+
+Planning investigates authorization, field sources, null/default behavior,
+persistence, and UI precedents before asking for clarification. A `needs_human`
+response can contain a `questions` array of strings; every question is displayed
+in one numbered request instead of dropping all but the first. This reduces
+avoidable clarification rounds without inventing answers to product decisions.
+
+## Local Projects smoke checks
+
+The old local Projects smoke scripts are diagnostic utilities, not part of the
+checked-in verification workflow. They require an already-running application stack;
+the new Foyr test runner does not invoke them. Real browser end-to-end tests against
+running services are outside this lightweight unit/component-test stack.
+
+### Runtime cleanup after verification
+
+The retained Pi Compose runner releases containers it created or replaced on exit, including
+failed setup and failed tests, while still holding the Compost lock. Successful
+`--prepare-only` calls deliberately retain their services until `runtime.sh down`;
+the workflow's `after_run` cleanup remains a fallback. Running developer-owned
+services that were merely reused are preserved. A pre-existing stopped container
+started for a test is stopped again; newly created containers are removed without
+removing volumes.
+
+Podman subprocesses do not inherit the lock descriptor: long-lived conmon and
+network helpers must not keep verification locked after the runner exits.
+Symphony records networks it creates, gives them Docker Compose-compatible labels,
+and removes them only when no containers (including stopped developer containers)
+use them. Cleanup also clears the stale CNI DNS helper for a removed network.
+Networks that predate Symphony or have since been replaced are preserved.
+
+Oracle cleanup first executes `SHUTDOWN IMMEDIATE` through OS-authenticated SQLPlus,
+then stops and removes the container. It does not use force removal or Podman's
+negative stop timeout. If database shutdown fails, cleanup reports the failure and
+retains ownership for retry instead of force-killing the database. Data volumes
+are never removed by this cleanup.

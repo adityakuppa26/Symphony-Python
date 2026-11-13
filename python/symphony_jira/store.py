@@ -37,6 +37,20 @@ class Store:
         with self._connect() as conn:
             conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS dispatch_failures (
+                  issue_identifier TEXT PRIMARY KEY,
+                  issue_fingerprint TEXT NOT NULL,
+                  attempt INTEGER NOT NULL,
+                  failed_at TEXT NOT NULL,
+                  error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS business_summaries (
+                  issue_identifier TEXT NOT NULL,
+                  requirements_hash TEXT NOT NULL,
+                  summary TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY (issue_identifier, requirements_hash)
+                );
                 CREATE TABLE IF NOT EXISTS runs (
                   id TEXT PRIMARY KEY,
                   issue_id TEXT NOT NULL,
@@ -196,8 +210,11 @@ class Store:
             self._ensure_column(conn, "runs", "plan_approval_id", "TEXT")
             self._ensure_column(conn, "runs", "planning_baseline", "TEXT")
             self._ensure_column(conn, "runs", "human_input_context", "TEXT")
+            self._ensure_column(conn, "runs", "review_comment_checklist", "TEXT")
             self._ensure_column(conn, "plan_approvals", "workspace_diff_hash", "TEXT")
             self._ensure_column(conn, "human_review_actions", "plan_spec", "TEXT")
+            self._ensure_column(conn, "human_review_actions", "clarifications_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "human_review_actions", "resolution_json", "TEXT")
 
     def save_requirements_snapshot(self, snapshot: RequirementsSnapshot) -> dict[str, Any]:
         issue_identifier = snapshot.issue_identifier.strip()
@@ -302,6 +319,39 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_business_summary(self, issue_identifier: str, requirements_hash: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT summary FROM business_summaries WHERE issue_identifier = ? AND requirements_hash = ?",
+                (issue_identifier, requirements_hash),
+            ).fetchone()
+        return str(row["summary"]) if row is not None else None
+
+    def save_business_summary(self, issue_identifier: str, requirements_hash: str, summary: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO business_summaries (issue_identifier, requirements_hash, summary, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (issue_identifier, requirements_hash) DO NOTHING",
+                (issue_identifier, requirements_hash, summary, utc_now().isoformat()),
+            )
+
+    def record_dispatch_failure(self, identifier: str, fingerprint: str, attempt: int, error: str | None) -> None:
+        with self._connect() as conn:
+            conn.execute("""INSERT INTO dispatch_failures VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(issue_identifier) DO UPDATE SET
+                issue_fingerprint=excluded.issue_fingerprint, attempt=excluded.attempt,
+                failed_at=excluded.failed_at, error=excluded.error""",
+                (identifier, fingerprint, attempt, utc_now().isoformat(), error))
+
+    def get_dispatch_failure(self, identifier: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM dispatch_failures WHERE issue_identifier = ?", (identifier,)).fetchone()
+        return dict(row) if row else None
+
+    def clear_dispatch_failure(self, identifier: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM dispatch_failures WHERE issue_identifier = ?", (identifier,))
+
     def create_run(
         self,
         issue: Issue,
@@ -374,8 +424,6 @@ class Store:
         diff_hash = workspace_diff_hash.strip()
         if not reviewer:
             raise ValueError("reviewer identity is required")
-        if not review_source:
-            raise ValueError("review source/PR link is required")
         if not review_comments:
             raise ValueError("review comments are required")
         if not diff_hash:
@@ -385,6 +433,16 @@ class Store:
         action_id = str(uuid.uuid4())
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM human_review_actions WHERE source_run_id = ?", (source_run_id,),
+            ).fetchone()
+            if existing is not None:
+                if (existing["reviewer_identity"], existing["source_url"], existing["comments"]) != (reviewer, review_source, review_comments):
+                    raise ValueError("A different review is already queued for this handoff. Open its result run to continue.")
+                result = conn.execute("SELECT * FROM runs WHERE id = ?", (existing["result_run_id"],)).fetchone()
+                if result is None:
+                    raise StoreIntegrityError("human review result run is missing")
+                return human_review_action_from_row(existing), run_from_row(result)
             source_row = conn.execute(
                 "SELECT * FROM runs WHERE id = ?",
                 (source_run_id,),
@@ -464,6 +522,41 @@ class Store:
         if action is None:
             raise StoreIntegrityError("human review action disappeared after creation")
         return action, result_run
+
+    def clarify_human_review(self, action_id: str, response: str, *, expected_revision: int) -> dict[str, Any]:
+        response = response.strip()
+        if not response or len(response) > 16000:
+            raise ValueError("answer must contain 1–16000 characters")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM human_review_actions WHERE id = ?", (action_id,)).fetchone()
+            if row is None:
+                raise ValueError("review not found")
+            action = human_review_action_from_row(row)
+            answers = action["clarifications"]
+            if expected_revision < len(answers):
+                if expected_revision >= 0 and answers[expected_revision]["text"] == response:
+                    return action
+                raise ValueError("This question already has a different answer. Clear the answer draft before replying to the current question.")
+            if expected_revision != len(answers):
+                raise ValueError("The review question changed. Reload review progress before replying.")
+            result = conn.execute("SELECT * FROM runs WHERE id = ?", (action["result_run_id"],)).fetchone()
+            if (action["status"] != "blocked" or action["triage_decision"] != "needs_human"
+                    or result is None or result["status"] != "blocked" or result["blocked_phase"] != "review"
+                    or not self._is_latest_actionable_blocked_run(conn, result["id"])):
+                raise ValueError("this review is not waiting for a scope clarification")
+            pending = conn.execute("SELECT 1 FROM human_inputs WHERE run_id = ? AND consumed_at IS NULL", (result["id"],)).fetchone()
+            if pending:
+                raise ValueError("this case already has a pending response")
+            answers.append({"id": "review-clarification:" + str(uuid.uuid4()), "kind": "operator_feedback",
+                "source_run_id": result["id"], "phase": "human_review", "created_at": utc_now().isoformat(),
+                "question": result["error"], "text": response, "author": "operator (identity not recorded)"})
+            conn.execute("""UPDATE human_review_actions SET status='queued', claimed_at=NULL,
+                claim_token=NULL, finished_at=NULL, triage_decision=NULL, triage_output=NULL,
+                clarifications_json=? WHERE id=?""", (json.dumps(answers, ensure_ascii=False), action_id))
+            conn.execute("""UPDATE runs SET status='queued', finished_at=NULL, error=NULL,
+                blocked_phase=NULL, human_input_context=NULL WHERE id=?""", (result["id"],))
+        return self.get_human_review_action(action_id)
 
     def get_human_review_action(self, action_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -658,6 +751,7 @@ class Store:
                 branch_name=branch_name,
                 plan_spec_hash=predecessor.plan_spec_hash,
                 plan_approval_id=predecessor.plan_approval_id,
+                review_comment_checklist=predecessor.review_comment_checklist,
             )
             self._insert_run(conn, record)
             conn.execute(
@@ -883,7 +977,7 @@ class Store:
         if lease <= timedelta(0):
             raise ValueError("human resume handoff claim lease must be positive")
         claim_time = now or utc_now()
-        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context'}
+        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context', 'review_comment_checklist'}
         updates = {key: value for key, value in fields.items() if key in allowed}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1122,6 +1216,18 @@ class Store:
             )
         return cursor.rowcount == 1
 
+    def record_owned_human_review_resolutions(
+        self, action_id: str, claim_token: str, *, resolutions: list[dict], workspace_diff_hash: str | None,
+    ) -> bool:
+        now = utc_now()
+        evidence = json.dumps({"items": resolutions, "workspace_diff_hash": workspace_diff_hash,
+                               "reviewed_at": now.isoformat()}, ensure_ascii=False)
+        with self._connect() as conn:
+            cursor = conn.execute("""UPDATE human_review_actions SET resolution_json=?
+                WHERE id=? AND claim_token=? AND status='running' AND claimed_at>?""",
+                (evidence, action_id, claim_token, (now - HUMAN_RESUME_HANDOFF_LEASE).isoformat()))
+        return cursor.rowcount == 1
+
     def record_owned_human_review_triage(
         self,
         action_id: str,
@@ -1166,7 +1272,7 @@ class Store:
         if lease <= timedelta(0):
             raise ValueError("human review action claim lease must be positive")
         claim_time = now or utc_now()
-        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context'}
+        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context', 'review_comment_checklist'}
         updates = {key: value for key, value in fields.items() if key in allowed}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1229,7 +1335,7 @@ class Store:
         return run_from_row(row) if row else None
 
     def update_run(self, run_id: str, **fields: Any) -> RunRecord:
-        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context'}
+        allowed = {'status', 'finished_at', 'final_message', 'error', 'blocked_phase', 'verification_status', 'verification_output_path', 'plan_spec_hash', 'plan_approval_id', 'planning_baseline', 'human_input_context', 'review_comment_checklist'}
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
             record = self.get_run(run_id)
@@ -1401,8 +1507,11 @@ class Store:
         response: str,
         question: str | None = None,
         approval_id: str | None = None,
+        action: str = "response",
     ) -> dict[str, Any]:
-        record = {'id': str(uuid.uuid4()), 'issue_identifier': issue_identifier, 'run_id': run_id, 'question': question, 'response': response, 'approval_id': approval_id, 'action': 'response', 'approver_identity': None, 'workspace_diff_hash': None, 'claimed_at': None, 'claim_token': None, 'consumed_at': None, 'created_at': utc_now().isoformat()}
+        if action not in {'response', 'decision', 'automatic_replan'}:
+            raise ValueError('unsupported input action')
+        record = {'id': str(uuid.uuid4()), 'issue_identifier': issue_identifier, 'run_id': run_id, 'question': question, 'response': response, 'approval_id': approval_id, 'action': action, 'approver_identity': None, 'workspace_diff_hash': None, 'claimed_at': None, 'claim_token': None, 'consumed_at': None, 'created_at': utc_now().isoformat()}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._assert_human_input_submission_allowed(
@@ -1767,7 +1876,7 @@ class Store:
                 """
                 SELECT id, source_run_id, result_run_id, created_at, comments,
                        reviewer_identity, source_url, requirements_snapshot_hash,
-                       plan_spec_hash, triage_decision
+                       plan_spec_hash, triage_decision, clarifications_json
                 FROM human_review_actions
                 WHERE issue_identifier = ? AND created_at <= ?
                 ORDER BY created_at, rowid
@@ -1786,7 +1895,7 @@ class Store:
         history = [
             {
                 "id": f"human-input:{row['id']}",
-                "kind": "plan_approval" if row["action"] == "plan_approval" else "operator_feedback",
+                "kind": {"plan_approval": "plan_approval", "automatic_replan": "system_routing", "decision": "operator_decision"}.get(row["action"], "operator_feedback"),
                 "source_run_id": row["run_id"],
                 "phase": row["phase"],
                 "created_at": row["created_at"],
@@ -1829,7 +1938,10 @@ class Store:
             "approved_at": row["approved_at"],
             "approval_invalidated_at": row["invalidated_at"],
         } for row in approvals)
-        return sorted(history, key=lambda entry: (entry["created_at"], entry["id"]))
+        for row in reviews:
+            history.extend(entry for entry in json.loads(row["clarifications_json"])
+                           if entry["created_at"] <= cutoff)
+        return sorted(history, key=lambda entry: entry["created_at"])
 
     def list_human_inputs(self, run_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -2162,8 +2274,8 @@ class Store:
     def _insert_run(conn: sqlite3.Connection, record: RunRecord) -> None:
         conn.execute(
             """
-            INSERT INTO runs (id, issue_id, issue_identifier, issue_fingerprint, workspace_path, status, attempt, started_at, plan_spec_hash, plan_approval_id, finished_at, final_message, error, blocked_phase, branch_name, verification_status, verification_output_path, planning_baseline, human_input_context)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runs (id, issue_id, issue_identifier, issue_fingerprint, workspace_path, status, attempt, started_at, plan_spec_hash, plan_approval_id, finished_at, final_message, error, blocked_phase, branch_name, verification_status, verification_output_path, planning_baseline, human_input_context, review_comment_checklist)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             run_values(record),
         )
@@ -2181,6 +2293,19 @@ class Store:
 
 def human_review_action_from_row(row: sqlite3.Row) -> dict[str, Any]:
     action = dict(row)
+    try:
+        action["resolution"] = json.loads(action.pop("resolution_json", None) or "null")
+    except (TypeError, ValueError) as exc:
+        raise StoreIntegrityError("human review resolution evidence is invalid") from exc
+    try:
+        action["clarifications"] = json.loads(action.pop("clarifications_json", "[]"))
+    except (TypeError, ValueError) as exc:
+        raise StoreIntegrityError("human review clarification history is invalid") from exc
+    if not isinstance(action["clarifications"], list) or any(
+        not isinstance(entry, dict) or not {"id", "kind", "created_at", "text", "question"} <= entry.keys()
+        for entry in action["clarifications"]
+    ):
+        raise StoreIntegrityError("human review clarification history is invalid")
     approval_json = action.pop("approval_json", None)
     if approval_json:
         try:
@@ -2239,6 +2364,7 @@ def run_values(record: RunRecord) -> tuple[Any, ...]:
         record.verification_output_path,
         serialize_value(record.planning_baseline),
         record.human_input_context,
+        record.review_comment_checklist,
     )
 
 
@@ -2270,6 +2396,7 @@ def run_from_row(row: sqlite3.Row) -> RunRecord:
         verification_status=row['verification_status'],
         verification_output_path=row['verification_output_path'],
         human_input_context=row['human_input_context'],
+        review_comment_checklist=row['review_comment_checklist'],
         planning_baseline=(PlanningBaseline.model_validate_json(row['planning_baseline'])
                            if row['planning_baseline'] else None),
     )

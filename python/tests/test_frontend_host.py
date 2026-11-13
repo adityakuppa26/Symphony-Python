@@ -38,6 +38,8 @@ class FrontendHostTests(unittest.TestCase):
             self.assertIn('http://127.0.0.1:9876/', start.call_args.args[0])
             self.assertTrue(any(arg.startswith('--user-data-dir=') for arg in start.call_args.args[0]))
             self.assertEqual(start.call_args.args[0][0], "systemd-run")
+            self.assertIn("--accept-lang=en-US", start.call_args.args[0])
+            self.assertEqual(start.call_args.kwargs["env"]["LC_ALL"], "en_US.UTF-8")
             self.assertIn("MemoryMax=768M", start.call_args.args[0])
             self.assertIn("CPUQuota=100%", start.call_args.args[0])
             self.assertTrue(start.call_args.kwargs.get("start_new_session"))

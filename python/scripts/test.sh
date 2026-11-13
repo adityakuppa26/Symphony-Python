@@ -15,15 +15,14 @@ readonly LOCK_FILE="${LOCK_DIR}/compost-runtime.lock"
 usage() {
     cat <<'EOF'
 Usage:
-  ./scripts/test.sh <cpm|foyr2|pi> <workspace-or-repository-path>
-  ./scripts/test.sh <cpm|foyr2|pi> <workspace-or-repository-path> -- <command> [args...]
-  ./scripts/test.sh <cpm|foyr2|pi> <workspace-or-repository-path> --shell
-  ./scripts/test.sh <cpm|foyr2|pi> <workspace-or-repository-path> --prepare-only
-  ./scripts/test.sh <cpm|foyr2|pi> <workspace-or-repository-path> --test-only -- <command> [args...]
+  ./scripts/test.sh <pi> <workspace-or-repository-path>
+  ./scripts/test.sh foyr2 <workspace-or-repository-path> -- symphony-local-smoke projects-page
+  ./scripts/test.sh <pi> <workspace-or-repository-path> -- <command> [args...]
+  ./scripts/test.sh <pi> <workspace-or-repository-path> --shell
+  ./scripts/test.sh <pi> <workspace-or-repository-path> --prepare-only
+  ./scripts/test.sh <pi> <workspace-or-repository-path> --test-only -- <command> [args...]
 
 Examples:
-  ./scripts/test.sh cpm /home/adkuppa/codex-workspaces/ICPM-12345
-  ./scripts/test.sh foyr2 /home/adkuppa/codex-workspaces/ICPM-12345 -- pytest /src/tests/test_example.py
   ./scripts/test.sh pi /home/adkuppa/codex-workspaces/ICPM-12345 --shell
 
 The path may be either a Symphony workspace containing cpm/, foyr2/, and pi/
@@ -32,8 +31,6 @@ its process environment, starts existing images, waits for
 Compose health checks, verifies the mounted checkout, and then runs tests.
 
 Default test commands:
-  cpm    pytest Test/unit
-  foyr2  pytest /src/tests -n 1 --tb=native
   pi     hatch run dev:test
 EOF
 }
@@ -60,33 +57,35 @@ repository="$1"
 source_input="$2"
 shift 2
 
+# Smoke checks reuse an existing matching stack; they must remain reachable
+# without reopening the migrated Foyr unit/frontend service-setup route.
+if [[ "$repository" == "foyr" || "$repository" == "foyr2" ]]; then
+    if [[ ${1:-} == "--test-only" && ${2:-} == "--" && ${3:-} == "symphony-local-smoke" ]]; then
+        shift
+    fi
+    if [[ ${1:-} == "--" && ${2:-} == "symphony-local-smoke" ]]; then
+        shift 2
+        [[ $# -eq 1 && "$1" == "projects-page" ]] || fail "unsupported Foyr smoke profile"
+        mkdir -p "$LOG_DIR" "$LOCK_DIR"
+        exec 9>"$LOCK_FILE"
+        flock -w 600 9 || exit 125
+        log_file="${LOG_DIR}/foyr2-smoke-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+        printf 'Smoke verification log: %s\n' "$log_file"
+        set +e
+        timeout --kill-after=5s 180s python3 "$SCRIPT_ROOT/scripts/local-smoke.py" \
+            --workspace "$source_input" --repository foyr2 projects-page 9>&- 2>&1 | tee "$log_file"
+        smoke_status=${PIPESTATUS[0]}
+        [[ "$smoke_status" == 124 || "$smoke_status" == 137 ]] && smoke_status=125
+        exit "$smoke_status"
+    fi
+fi
+
 case "$repository" in
     cpm)
-        service="cpm"
-        repository_dir="cpm"
-        source_variable="CPM_SRC"
-        mount_target="/TexturaWD/textura"
-        workdir="/TexturaWD/textura"
-        dependencies=(oracledb19 memcached)
-        recreate_services=(cpm)
-        default_command=(pytest Test/unit)
-        # Test/__init__.py otherwise inherits the functional-test database creation flag.
-        exec_environment=(-e CREATE_NEW_DATABASE_WHEN_TESTING=False)
+        fail "CPM verification moved to /home/adkuppa/playground/cpm-verification/verify.py; use unit, functional, or sanity with --source <cpm-checkout>"
         ;;
     foyr|foyr2)
-        repository="foyr2"
-        service="foyr"
-        repository_dir="foyr2"
-        source_variable="FOYR_SRC"
-        mount_target="/src"
-        workdir="/src"
-        dependencies=(oracledb19 memcached)
-        recreate_services=(ibis foyr)
-        default_command=(
-            pytest /src/tests -n 1 --tb=native
-            --junitxml=/tmp/symphony-foyr-pytest-results.xml
-        )
-        exec_environment=(-e FOYR_CONFIG_FILE=/src/tests/testing.yml)
+        fail "Foyr verification moved to /home/adkuppa/playground/cpm-verification/foyr.py; use python or frontend with --source <foyr-checkout>"
         ;;
     pi)
         service="pi"
@@ -100,7 +99,7 @@ case "$repository" in
         exec_environment=()
         ;;
     *)
-        fail "unsupported repository '$repository'; expected cpm, foyr2, or pi"
+        fail "unsupported repository '$repository'; expected pi"
         ;;
 esac
 
@@ -183,10 +182,15 @@ if [[ -n "$workspace_root" ]]; then
     fi
 fi
 
+# Pin the provider: Podman's default discovery may prefer docker-compose.
+export PODMAN_COMPOSE_PROVIDER="$(command -v podman-compose)" || fail "podman-compose is required"
+[[ -x "$PODMAN_COMPOSE_PROVIDER" ]] || fail "podman-compose is required"
+compose_config() {
+    "${compose[@]}" config | python3 -c 'import json,sys,yaml; json.dump(yaml.safe_load(sys.stdin),sys.stdout)'
+}
 compose=(
     "$PODMAN" compose
     --project-name "$PROJECT_NAME"
-    --project-directory "$COMPOST_DIR"
     --env-file "$ENV_FILE"
     -f "$COMPOSE_FILE"
 )
@@ -215,7 +219,9 @@ run_logged() {
     printf '\n' | tee -a "$log_file"
 
     set +e
-    "$@" 2>&1 | tee -a "$log_file"
+    # Podman can launch long-lived conmon/network helpers. They must not inherit
+    # the runtime lock or cleanup will deadlock after the test shell exits.
+    "$@" 9>&- 2>&1 | tee -a "$log_file"
     status=${PIPESTATUS[0]}
     set -e
     return "$status"
@@ -258,11 +264,35 @@ record_runtime() {
             compose=("${compose[@]:0:${#compose[@]}-2}")
         else
             printf 'Runtime ownership recording failed; after-run cleanup will recover the labelled setup.\n' >&2
+            return 125
         fi
     fi
 }
-trap record_runtime EXIT
+cleanup_runtime() {
+    local result=$?
+    trap - EXIT
+    record_runtime || result=125
+    # A prepare-only success intentionally keeps the runtime for the caller.
+    # Every completed/failed test (and failed setup) releases its own resources
+    # while the same lock is still held, not only at eventual issue handoff.
+    if [[ "$mode" != "prepare" || "$result" != 0 ]]; then
+        python3 "$SCRIPT_ROOT/scripts/runtime-services.py" down --workspace "$runtime_owner" \
+            --state "$runtime_state" --podman "$PODMAN" || result=125
+    fi
+    exit "$result"
+}
+trap cleanup_runtime EXIT
 trap 'exit 125' TERM INT
+
+if [[ ${command[0]:-} == "symphony-local-smoke" ]]; then
+    # Reuse only an already-running, matching local stack. Never prepare/restart
+    # services or create a test database for a smoke request.
+    run_logged timeout --kill-after=5s 180s python3 "$SCRIPT_ROOT/scripts/local-smoke.py" \
+        --workspace "${workspace_root:-$source_path}" --repository "$repository" "${command[@]:1}" && exit 0
+    smoke_status=$?
+    [[ "$smoke_status" == 124 || "$smoke_status" == 137 ]] && smoke_status=125
+    exit "$smoke_status"
+fi
 
 if [[ "$repository" == "foyr2" && ${command[1]:-} == "/symphony-runtime/foyr-frontend-tests.sh" ]]; then
     # Fetch large external artifacts on the host; container networking may differ
@@ -279,7 +309,7 @@ if [[ "$repository" == "foyr2" && ${command[1]:-} == "/symphony-runtime/foyr-fro
         fi
         mv "$browser_download" "$browser_package"
     fi
-    frontend_image="$("${compose[@]}" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["foyr"]["image"])')"
+    frontend_image="$(compose_config | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["foyr"]["image"])')"
     host_browser="$browser_cache/chrome-host/opt/google/chrome/chrome"
     if [[ ! -x "$host_browser" ]]; then
         mkdir -p "$browser_cache/chrome-host"
@@ -306,15 +336,16 @@ if [[ "$repository" == "foyr2" && ${command[1]:-} == "/symphony-runtime/foyr-fro
 fi
 
 if [[ "$prepare_runtime" == true ]]; then
-runtime_snapshot="$("${compose[@]}" config --format json | python3 "$SCRIPT_ROOT/scripts/runtime-services.py" begin \
+runtime_snapshot="$(compose_config | python3 "$SCRIPT_ROOT/scripts/runtime-services.py" begin \
     --workspace "$runtime_owner" --state "$runtime_state" --podman "$PODMAN" \
-    --services "${dependencies[@]}" "${recreate_services[@]}")" || fail "could not capture test runtime ownership"
+    --services "${dependencies[@]}" "${recreate_services[@]}" \
+    --recreate-services "${recreate_services[@]}")" || fail "could not capture test runtime ownership"
 compose+=(-f "$runtime_snapshot.override")
 if [[ "$repository" == "foyr2" ]]; then
     for runtime_service in ibis foyr; do
-        runtime_image="$("${compose[@]}" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"][sys.argv[1]]["image"])' "$runtime_service")"
+        runtime_image="$(compose_config | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"][sys.argv[1]]["image"])' "$runtime_service")"
         if [[ "$runtime_service" == "ibis" ]]; then runtime_mount=/ibis; else runtime_mount=/src; fi
-        runtime_source="$("${compose[@]}" config --format json | python3 -c 'import json,sys; s=json.load(sys.stdin)["services"][sys.argv[1]]; print(next(v["source"] for v in s["volumes"] if v.get("target")==sys.argv[2]))' "$runtime_service" "$runtime_mount")"
+        runtime_source="$(compose_config | python3 -c 'import json,sys; s=json.load(sys.stdin)["services"][sys.argv[1]]; print(next(v["source"] if isinstance(v,dict) else v.split(":")[0] for v in s["volumes"] if (v.get("target") if isinstance(v,dict) else v.split(":")[1])==sys.argv[2]))' "$runtime_service" "$runtime_mount")"
         run_logged run_container 600s --pull=never --network host \
             --entrypoint "/virtualenv/$runtime_service/bin/python" \
             -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy \
