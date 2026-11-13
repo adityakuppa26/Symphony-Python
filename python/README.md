@@ -402,6 +402,16 @@ examples. The reviewer field starts as `Operator` and can be changed to the actu
 reviewer's name. A review/PR URL is optional; when provided it must be an absolute
 HTTP(S) URL. No MCP connector is needed for manual feedback.
 
+QA defect reports can use the same continuation flow. Include reproduction steps,
+expected and actual results, and environment/version details when available.
+The prompts require inspection of the retained implementation before accepting a
+diagnosis: restore approved behavior with focused fixes, or report already-satisfied
+behavior with code/check evidence. Failure to reproduce alone is not proof of a fix.
+Changes to required behavior or approved scope still require replanning and approval.
+Planning and review use their own read-only output contracts; implementation may
+complete without edits when the existing behavior already satisfies the approved work.
+These are agent instructions; independent review and recorded evidence remain necessary.
+
 The form previews the exact text and saves drafts in session storage for this
 browser tab. Reloading restores the draft; closing the tab ends that storage.
 **Clear draft** removes it. Submission errors appear inline and retain the input.
@@ -709,3 +719,24 @@ then stops and removes the container. It does not use force removal or Podman's
 negative stop timeout. If database shutdown fails, cleanup reports the failure and
 retains ownership for retry instead of force-killing the database. Data volumes
 are never removed by this cleanup.
+
+## Human questions and readable documents
+
+Clarification requests in planning, implementation, review, and human-review triage
+include three concrete choices. The UI adds **Other** for a free-text answer. No
+choice is preselected or submitted automatically. Selecting a reply records its
+label and explanation as the human response; exact-plan approval remains a separate
+explicit action with the existing approval and integrity checks.
+
+Question choices are retained in run history and survive restarts. Draft answers
+stay in the browser tab. Review drafts keep their original question revision;
+when a new question arrives, the UI preserves the draft and asks the operator to
+clear it before answering the new question. Older questions without saved choices
+show three clarification requests rather than inventing business decisions.
+
+Plans, requirements, review reports, final responses, and verification output have
+readable views with headings, lists, and formatted code. Full plan pages include
+section navigation. Technical references and original text remain expandable, and
+the original JSON endpoint is unchanged. Readable plan pages use the same frozen
+plan validation as the JSON endpoint; verification readers cannot open files outside
+the run's workspace.

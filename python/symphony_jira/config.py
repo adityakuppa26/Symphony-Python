@@ -349,24 +349,25 @@ class CodexConfig(BaseModel):
         "When Jira requires backward compatibility, existing behavior, or a standard component pattern, inspect and preserve that established repository behavior for incidental edge cases instead of requesting a new product decision. "
         "Ask only when Jira conflicts with the established behavior or no applicable precedent exists and implementation would introduce new user-visible semantics. "
         "Do not edit files during the planning pass. "
-        "If multiple reasonable choices exist, ask for clarification instead of choosing silently."
+        "Resolve routine implementation choices using existing patterns; ask only when an unresolved choice changes required behavior or scope."
     )
     output_plan_file: str = ".symphony/codex-plan.md"
     review_after_run: bool = False
     review_prompt: str = (
         "Review the code changes for this Jira issue. Return JSON with decision "
-        "'approve' or 'changes_required', a findings array, and residual_risk. "
+        "'approve', 'changes_required', 'plan_changes_required', or 'needs_human', a findings array, and residual_risk. "
         "Focus on correctness, regressions, tests, and translation consistency."
     )
     max_review_iterations: int = 1
     human_review_triage_prompt: str = (
-        "Classify pasted human code-review feedback against the exact frozen "
+        "Classify pasted human code-review feedback or QA defects against the exact frozen "
         "requirements snapshot, validated PlanSpec, approval, prior reviews, and "
         "current workspace diff. Use code_changes only when the comments can be "
-        "addressed without changing behavior, scope, architecture, acceptance "
+        "addressed without changing approved required behavior, scope, architecture, acceptance "
         "criteria, affected surfaces, compatibility, or non-goals. Use "
         "plan_changes_required when any of those must change. Do not edit files "
-        "during triage."
+        "during triage. Restoring approved behavior is an in-scope bug fix. Findings "
+        "already satisfied by current code can proceed without edits, with evidence."
     )
     output_human_review_triage_file: str = (
         ".symphony/codex-human-review-triage.md"

@@ -756,7 +756,7 @@ def build_human_review_triage_prompt(
     action: dict[str, Any],
     triage_instructions: str,
 ) -> str:
-    return f"""You are triaging pasted human code-review feedback for a completed Symphony run.
+    return f"""You are triaging pasted human code-review feedback or QA defect reports for a completed Symphony run.
 
 This pass is classification only. The sandbox is read-only. Do not edit any file.
 
@@ -766,7 +766,7 @@ Reserved result run: {action["result_run_id"]}
 Reviewer: {action["reviewer_identity"]}
 Review source / PR: {action["source_url"] or "Manual feedback pasted by the operator"}
 
-Pasted reviewer comments:
+Pasted review feedback or QA defects:
 {action["comments"]}
 
 Triage instructions:
@@ -801,10 +801,20 @@ Submission-time workspace diff:
 
 Inspect the live workspace diff as needed and compare it with the frozen context above.
 Return exactly one JSON object:
-- {{"decision":"code_changes","reason":"..."}} when the comments are code-only and fit the exact PlanSpec.
-- {{"decision":"plan_changes_required","reason":"..."}} when behavior, scope, architecture,
+- {{"decision":"code_changes","reason":"..."}} when the findings fit the exact PlanSpec, including bug fixes restoring approved behavior or findings already satisfied by existing code.
+- {{"decision":"plan_changes_required","reason":"..."}} when approved required behavior, scope, architecture,
   acceptance criteria, affected surfaces, compatibility, or non-goals must change.
 - {{"decision":"needs_human","question":"..."}} only when the boundary cannot be determined safely.
+
+Inspect the actual implementation before classifying. For QA defects, preserve
+reproduction steps, expected versus actual results, environment/version details,
+and defect references when supplied. Compare expected behavior to the approved
+plan: correcting broken behavior to meet that plan is not a scope change.
+Do not assume a reported defect is reproduced or that a suggested fix is correct.
+If existing code already satisfies a finding, retain it in the checklist for
+independent verification; code_changes permits a no-edit outcome. Missing runtime
+access alone is not a product question. Ask only for information that materially
+prevents determining the expected behavior or safe scope.
 
 Also include a feedback_items array. Preserve every distinct actionable comment,
 assign stable IDs R1, R2, ..., and give each item a concise comment, scope
@@ -838,11 +848,21 @@ Human review action: {action["id"]}
 Reviewer: {action["reviewer_identity"]}
 Review source / PR: {action["source_url"] or "Manual feedback pasted by the operator"}
 
-Pasted code-review comments:
+Pasted review feedback or QA defects:
 {action["comments"]}
 
-Read the retained workspace and current git diff. Apply only code-level feedback that
-fits the exact validated PlanSpec. Run relevant verification when available and report unavailable checks as not run; verification is advisory. Do not change the PlanSpec.
+Continue from the retained implementation; do not rebuild the feature from scratch.
+Read the current code, retained workspace, and git diff. For each finding, trace
+its reproduction path and establish the mismatch with approved behavior before
+editing. Reproduce through permitted focused checks when available, or record
+that reproduction was not run and cite the code evidence instead. Fix the cause
+using the existing path and add focused regression coverage where appropriate.
+If already correct, leave it unchanged and report already satisfied with evidence.
+An inability to reproduce alone does not prove a defect is fixed or already satisfied.
+Apply only code-level feedback that
+fits the exact validated PlanSpec. Follow configured verification ownership; Symphony
+runs host/service-backed checks. Report unavailable checks as not run; verification
+is advisory. Do not change the PlanSpec.
 
 Exact validated PlanSpec hash:
 {action.get("plan_spec_hash") or "none"}
@@ -850,14 +870,18 @@ Exact validated PlanSpec hash:
 Exact validated PlanSpec:
 {action.get("plan_spec") or "No PlanSpec was configured."}
 
-If any requested change would alter behavior, scope, architecture, acceptance criteria,
+If any requested change would alter approved required behavior, scope, architecture, acceptance criteria,
 affected surfaces, compatibility, non-goals, or the development PlanSpec, do not edit
 for that request. Return:
 {{"decision":"plan_changes_required","reason":"<why the approved plan must change>"}}
 
+Restoring the approved behavior by fixing a defect does not itself change the plan.
+
 Otherwise leave a concise final report with files changed, verification, how each pasted
 comment was addressed, and residual risk. Include a comment-by-comment response table
-with Comment ID, Resolution, and Evidence (file/location and relevant check). Use the
+with Comment ID, Resolution, and Evidence (file/location and relevant check). When
+implementation_status JSON is required, place this report in its summary string
+instead of emitting a competing final format. Use the
 triage IDs when supplied. Distinguish addressed, already satisfied, and unresolved
 items; never call an item addressed without implementation evidence. Explain any
 disagreement against the approved plan and recorded operator decisions. Do not post
@@ -903,7 +927,12 @@ Cover every triage ID exactly once. Status must be addressed, already_satisfied,
 or unresolved. Evidence must be nonempty and cite the actual code or checks you
 inspected. A passing test alone does not prove an unrelated comment was fixed.
 Compare the checklist with the original feedback; flag omitted actionable comments.
-Do not claim missing execution evidence exists. Unresolved items require changes_required.
+Verify already_satisfied against the current execution path and approved expected
+behavior; absence of a diff or inability to reproduce is insufficient. Distinguish
+code inspection from executed checks and verify that results apply to this revision.
+Do not claim missing execution evidence exists. Unresolved items require changes_required
+when an in-scope correction is known; use needs_human for a genuine unresolved
+product decision or plan_changes_required when the approved scope must change.
 Preserve the existing review decision, findings, and residual_risk fields."""
 
 

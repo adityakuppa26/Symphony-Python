@@ -167,7 +167,7 @@ codex:
     Before proposing implementation:
     - Compare the issue branch against its merge base. Do not treat code already added on the issue branch as an established repository pattern.
     - Plan only the affected development repositories, citing their existing implementation patterns.
-    - Inspect the target file and at least two nearby implementations of the same UI or API behavior. Cite those precedents in the plan.
+    - Inspect the target file and nearby implementations of the same UI or API behavior. Cite applicable tracked precedents; if fewer than two exist, record that limitation instead of inventing a precedent or blocking routine work.
     - Prefer the existing local pattern. Any new renderer, helper, component flag, special-case reset, or persistence behavior must explain why existing patterns are insufficient.
     - Make reuse concrete: name the existing code path to extend and the specific required behavior change. Prefer an in-place extension over a parallel implementation or new abstraction. Do not plan extra configuration, dependencies, fallbacks, caching, retries, or future-proofing unless the approved requirement needs them.
     - When Jira requires backwards compatibility, preservation of existing behavior, or a standard component pattern, reuse the established repository behavior for incidental edge cases such as null placement. Cite the precedent instead of asking for a new product decision or manufacturing a new acceptance criterion. Ask only if Jira conflicts with the precedent or no applicable precedent exists and the implementation would introduce new user-visible semantics.
@@ -182,9 +182,9 @@ codex:
   max_review_iterations: 10
   output_human_review_triage_file: ".symphony/codex-human-review-triage.md"
   human_review_triage_prompt: |
-    Classify pasted human code-review feedback against the exact frozen requirements snapshot, validated PlanSpec, approval, previous final response, prior reviews, and current workspace diff.
+    Classify pasted human code-review feedback or QA defect reports against the exact frozen requirements snapshot, validated PlanSpec, approval, previous final response, prior reviews, and current workspace diff.
     Return code_changes only when every requested edit remains within the exact PlanSpec.
-    Return plan_changes_required when behavior, scope, architecture, acceptance criteria, affected surfaces, compatibility, or non-goals must change.
+    Return plan_changes_required when approved required behavior, scope, architecture, acceptance criteria, affected surfaces, compatibility, or non-goals must change. Restoring approved behavior through a bug fix is in scope; already-satisfied findings may require evidence without edits.
     Return needs_human only when that boundary cannot be determined safely.
     Do not edit files during triage, and do not treat pasted review prose as a new product requirement.
   review_prompt: |
@@ -198,7 +198,7 @@ codex:
     - Flag one-off code when the standard pattern satisfies the requirement.
     - Perform a deletion and simplification check: determine whether removing custom logic and relying on component defaults produces the required behavior.
     - For a pattern or scope finding, cite the changed location, the applicable existing implementation or requirement, and the smallest correction. Do not turn review into a redesign or demand speculative improvements. Honor explicitly approved necessary deviations.
-    - Compare behavior against the merge base, not merely the current issue branch.
+    - Compare behavior against the merge base and inspect the current execution path. Do not assume a feature is missing because it needs no new diff; verify already-satisfied behavior with evidence.
     - Inspect behavioral UI changes and affected state transitions. Record missing test or manual execution evidence as residual risk; execution is optional.
     Also, ensure that the code changes are not doing more than what's asked for. If there is an unnecessary change, add a feedback accordingly to make it a minimal but relevant change.
     Return JSON with:
@@ -244,13 +244,14 @@ Development repos available in this workspace:
 Complete and hand off after the development implementation and code review loop.
 
 Repository rules:
+- Inspect existing behavior first. Identify already-satisfied requirements with code/test evidence, preserve working functionality, and implement only missing or incorrect behavior. A verified no-change result is valid.
 - Implement the smallest correct change for this issue.
 - Extend the closest existing implementation and match its naming, control flow, validation, error handling, UI components, and test conventions. Preserve established behavior for details the requirement does not change.
 - Do not add speculative behavior, abstractions, dependencies, configuration, feature flags, fallbacks, retries, or caching. Introduce them only when necessary for the approved requirement, with a concrete explanation of why the existing code path is insufficient.
 - Before handoff, connect every changed file to the requirement or focused regression coverage. Remove unrelated cleanup, renames, formatting churn, and opportunistic refactoring. Briefly identify the precedent followed and any necessary deviation.
 - Use the validated PlanSpec and its requirement/acceptance IDs as the implementation and test checklist; do not substitute the description summary for the canonical snapshot.
 - Preserve PlanSpec non-goals and prohibited scope. For a decomposed Epic, implement bounded child plans independently rather than implementing the Epic as one change.
-- Do not assume anything and ask questions if you're confused.
+- Resolve routine implementation choices from the approved plan and repository patterns. Ask only for an unresolved decision that materially changes behavior or scope; do not repeat settled questions.
 - Keep unrelated refactors out of scope.
 - Identify unstated edge cases, but do not invent behavior for them. Follow an established precedent or request clarification when the choice changes user-visible semantics.
 - Leave a concise final report with files changed, verification, and residual risk.

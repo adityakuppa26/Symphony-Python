@@ -166,7 +166,7 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(state["recent_runs"][0]["blocked_phase"], "implementation")
             self.assertIn("T-1", html)
             self.assertIn("Development Implementation", html)
-            self.assertIn(f'/api/v1/runs/{run.id}/plan', html)
+            self.assertIn(f'/runs/{run.id}/plan', html)
             self.assertIn("Open plan ↗", html)
             self.assertNotIn("Plan summary unavailable", html)
             self.assertNotIn("Plan content", html)

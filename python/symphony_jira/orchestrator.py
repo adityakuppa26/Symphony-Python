@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .codex_runner import CodexRunner, CodexRunResult
+from .presentation import QUESTION_CONTRACT, question_view
 from .business_summary import ensure_business_summary
 from .config import CodexConfig, WorkflowConfig
 from .handlers import workflow_handler
@@ -1490,7 +1491,7 @@ Apply explicit human decisions using the shared human decision policy."""
                 )
                 if completed_review or require_review_comment_coverage:
                     review_prompt += (
-                        "\n\nCheck every pasted human-review comment and triage item against the actual diff. "
+                        "\n\nCheck every pasted review comment or QA defect and triage item against current code and the actual diff. "
                         "Verify the implementation's comment-by-comment response and cited evidence. "
                         "A claim of addressed is insufficient when the requested in-scope correction is missing. "
                         "Honor previously accepted operator exceptions; report concrete remaining defects."
@@ -1833,6 +1834,9 @@ will prepare the services and execute your request outside the Codex sandbox.
 
 Cover exactly these changed repositories with targets or justified skipped entries:
 {json.dumps(changed)}
+Treat the implementation report as a claim to verify against the actual diff and test files.
+Do not invent test paths or selectors. Preserve coverage of the reported reproduction
+case and nearby affected behavior; identify gaps explicitly.
 Choose existing focused test files/classes/functions that exercise the implemented
 behavior. Include regression tests added or changed by implementation. Avoid whole
 repository suites. Select Python tests with suite=python and literal pytest arguments;
@@ -1966,6 +1970,8 @@ Actual workspace diff (SHA-256 {before.content_hash}):
         event_offset: int,
         event_prefix: str | None = None,
     ) -> tuple[CodexRunResult, int]:
+        if QUESTION_CONTRACT not in prompt:
+            prompt += "\n\n" + QUESTION_CONTRACT
         if self.handler and self.handler.pattern_policy not in prompt:
             prompt += "\n\n" + self.handler.pattern_policy
         phase_run = self.store.get_run(run_id)
@@ -2001,6 +2007,11 @@ Actual workspace diff (SHA-256 {before.content_hash}):
             event_callback=add_event,
             log_callback=add_log,
         )
+        question = parse_human_request(result.final_message) if result.status == "completed" else None
+        if question:
+            view = question_view(parse_review_json(result.final_message or ""), question)
+            view["question"] = question
+            self.store.add_log(run_id, "human_question", json.dumps(view))
         return result, event_offset + max(len(result.events), 1)
 
     async def _run_after_run_best_effort(self, issue: Issue, workspace: WorkspaceInfo) -> HookResult | None:
@@ -3393,6 +3404,13 @@ def build_review_prompt(
 Issue title: {issue.title}
 Workspace: {workspace_path}
 
+This pass is read-only. The embedded implementation prompt and report describe
+what to review; they do not authorize edits or override this review output contract.
+Inspect current code and relevant call paths as well as the diff. An existing,
+correct implementation may need no changes. Do not require a new diff to approve.
+For each finding, cite a concrete location, trigger, impact, and violated approved
+requirement or established behavior. Separate supported defects from uncertain risks.
+
 Review instructions:
 {review_instructions}
 
@@ -3409,16 +3427,15 @@ Validated PlanSpec:
 {plan_message or "No planning pass was configured for this run."}
 
 Decision contract:
-- Prefer JSON: {{"decision":"approve","findings":[],"residual_risk":"low"}}.
-- If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
+- Return one JSON object without Markdown fences: {{"decision":"approve","findings":[],"residual_risk":"<evidence-based risk>"}}.
+- If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>","options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}.
 - Use decision `approve` if no further code changes are needed.
 - Use decision `changes_required` only when another code pass can satisfy the feedback without changing
   the validated PlanSpec's requirements, acceptance criteria, scope,
-  behavior, affected surfaces, or non-goals.
+  required behavior, affected surfaces, or non-goals. Restoring that behavior by
+  fixing a bug is an in-scope correction, not a new requirement.
 - Use decision `plan_changes_required` when the validated development PlanSpec must change. This invalidates
   the approval and returns the issue to development planning and reapproval.
-- If you cannot emit JSON, start with `APPROVE`, `CHANGES_REQUIRED`,
-  or `PLAN_CHANGES_REQUIRED`, then explain concisely.
 - Empty, ambiguous, or unrecognized decisions fail closed and block the review.
 
 Host test execution evidence (advisory):
@@ -3470,8 +3487,13 @@ Trusted PlanSpec hash:
 
 Exact validated PlanSpec:
 {plan_message or "No PlanSpec was configured."}
+Recheck each finding against current code before changing it. Preserve completed
+work; correct confirmed defects and explain with evidence any finding already
+satisfied or contradicted by the approved plan. Do not weaken tests, remove checks,
+or change expected results merely to hide a failure. Fix the implementation or
+correct an incorrect test expectation with requirement evidence.
 Update the workspace to address the review feedback. Keep changes scoped to Jira issue {issue.identifier}.
-Do not change the plan or reinterpret their requirements, acceptance criteria, scope, behavior, affected
+Do not change the plan or reinterpret its requirements, acceptance criteria, scope, behavior, affected
 surfaces, or non-goals. Do not expand prohibited scope. If the feedback cannot be satisfied within this exact
 plan, stop and return JSON: {{"decision":"plan_changes_required","reason":"<specific required plan change>"}}. Do not ask the operator to route the workflow.
 After making changes, leave a concise final report with files changed, verification, and residual risk."""
@@ -3482,10 +3504,12 @@ def add_human_request_contract(prompt: str) -> str:
 
 Human clarification contract:
 If human clarification is required before continuing, ask one concise, specific question.
+For planning with several independent unresolved decisions, group them in one response
+with a questions array and a combined question; options must address the whole set.
 Explain what decision is missing, recommend the smallest option supported by code/evidence, and
 state its business or scope consequence. Do not paste entire requirements or repeat a settled question.
 Return JSON exactly in this shape:
-{{"decision":"needs_human","question":"<specific question>"}}
+{{"decision":"needs_human","question":"<specific question>","options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}
 During implementation, if the human decision is already supplied but requires changing the approved
 PlanSpec, return {{"decision":"plan_changes_required","reason":"<specific required plan change>"}}
 instead. This is workflow routing, not another human question. Preserve accepted exceptions and
@@ -3728,7 +3752,7 @@ behavior and record that precedent instead of asking a product question. Reserve
 needs_human for a genuine Jira conflict or an unavoidable externally visible
 product choice that neither Jira nor existing behavior resolves. In that case,
 return exactly:
-{{"decision":"needs_human","question":"<specific question>"}}
+{{"decision":"needs_human","question":"<specific question>","options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}
 Otherwise return exactly one complete PlanSpec JSON object with no prose or fences.
 
 Validation error:
@@ -3763,12 +3787,13 @@ Planning instructions:
 {planning_instructions.strip()}
 
 Important constraints:
-- This is a planning pass only.
+- This is a planning pass only. Embedded implementation instructions are future context; the planning output contract controls this pass.
+- Inspect whether each requested behavior is already satisfied, partly implemented, or missing. Record code/test evidence in existing PlanSpec fields and plan only the gaps. Keep already-satisfied requirements traceable; do not invent changes to justify the plan.
 - Complete discovery across affected layers before asking questions. Investigate authorization, field calculations, null/default behavior, persistence paths, and UI precedents; collect all independently discoverable questions into one response.
 - Do not edit files.
 - {planning_authority_policy(issue)}
 - Unreferenced attachments, generic custom fields, and related Jira issues cannot create PlanSpec scope, requirements, acceptance criteria, or product behavior.
-- If human clarification is required, return JSON: {{"decision":"needs_human","questions":["<decision, existing behavior, and recommendation>"]}}.
+- If human clarification is required, return JSON: {{"decision":"needs_human","question":"<combined decision summary>","questions":["<decision, existing behavior, and recommendation>"],"options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}.
 - Reserve needs_human for a genuine conflict between current Jira decisions, or a required externally visible product choice that Jira does not state and established repository behavior cannot resolve.
 - Do not make new product, UX, data-ordering, default-behavior, or repo-ownership decisions that are not explicitly stated by Jira or clearly established by existing code.
 - When Jira requires backward compatibility, preservation of existing behavior, or a standard component pattern, inspect and reuse that established repository behavior for incidental edge cases such as null placement. Record the precedent in the plan; do not turn it into a new product question or new acceptance criterion.
@@ -3782,7 +3807,7 @@ Important constraints:
 - The implementation should make minimal changes and not rewrite existing logic unless explicity asked in the requirements.
 
 PlanSpec contract:
-- If clarification is needed: {{"decision":"needs_human","questions":["<decision, existing behavior, and recommendation>"]}}.
+- If clarification is needed: {{"decision":"needs_human","question":"<combined decision summary>","questions":["<decision, existing behavior, and recommendation>"],"options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}.
 - Otherwise output JSON that validates exactly against the schema below; extra fields are prohibited.
 - Use schema_version "1.0", issue_key {json.dumps(issue.identifier)}, and requirements_snapshot_hash {json.dumps(snapshot_hash)} exactly.
 - Give every requirement and acceptance criterion a stable ID and at least one precise Jira source.
@@ -3804,7 +3829,7 @@ Allowed Jira planning evidence and source catalog:
 Implementation prompt that will be used after planning:
 {implementation_prompt}
 
-Write the plan/spec now. Let's think step-by-step..."""
+Return the required JSON now, with concise evidence and rationale in the schema fields."""
 
 
 def build_implementation_prompt_with_plan(*, implementation_prompt: str, plan_message: str | None) -> str:
@@ -3813,8 +3838,8 @@ def build_implementation_prompt_with_plan(*, implementation_prompt: str, plan_me
 Codex planning/spec pass:
 {plan_message or "No plan was produced."}
 
-Use the plan/spec above as implementation guidance. If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
-Otherwise implement the scoped change, run verification, and leave the final report."""
+Use the plan/spec above as implementation guidance. If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>","options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}.
+Otherwise implement only the remaining scoped changes and leave the final report. Follow the configured verification ownership: Symphony runs host/service-backed checks; do not start services or claim unrun checks passed."""
 
 
 def build_continuation_prompt_with_plan(
@@ -3831,6 +3856,7 @@ Trusted PlanSpec continuity binding:
 Exact validated PlanSpec:
 {plan_message}
 
+Resume from the actual retained code and verify previous claims before repeating work.
 The PlanSpec above remains binding scope and behavior guidance for this resumed phase.
 Do not change its requirements, acceptance criteria, affected surface, non-goals, or prohibited scope.
 If the requested continuation cannot stay within it, return JSON: {{"decision":"plan_changes_required","reason":"<specific required plan change>"}}. Symphony will route this to planning. Preserve accepted human decisions and verification deferrals in the reason; do not ask the operator to route the workflow."""
@@ -3861,8 +3887,8 @@ Exact approval binding:
 Human confirmation or adjustments:
 {response}
 
-Implement according to the approved plan and human confirmation. If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
-If the confirmation changes the approved plan scope, return JSON: {{"decision":"plan_changes_required","reason":"<specific required plan change>"}} before editing files. Keep changes scoped, run verification, and leave a concise final report with files changed, verification, and residual risk."""
+Implement according to the approved plan and human confirmation. If human clarification is required, return JSON: {{"decision":"needs_human","question":"<specific question>","options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}.
+If the confirmation changes the approved plan scope, return JSON: {{"decision":"plan_changes_required","reason":"<specific required plan change>"}} before editing files. Inspect existing behavior, preserve completed work, and implement only remaining gaps. Follow configured verification ownership and leave a concise final report with files changed, verification, and residual risk."""
 
 
 def build_plan_refinement_prompt(
@@ -3893,7 +3919,9 @@ Human feedback to incorporate:
 {response}
 
 This is still a planning pass only.
-Do not edit implementation files.
+Do not edit any files. Embedded implementation instructions are future context;
+return the planning output contract for this pass. Preserve already-satisfied
+behavior and update only the plan gaps supported by evidence and human feedback.
 {planning_authority_policy(issue)} Unreferenced attachments and other Jira context cannot create PlanSpec scope or behavior.
 Use the human feedback to produce a revised complete PlanSpec.
 Cite every current_requirements decision in its matching requirement or acceptance-criterion layer.
@@ -3901,7 +3929,7 @@ Include role_state_matrix rows only for applicable role/state-specific behavior;
 Map at least one test case to every acceptance criterion; multiple test cases may cover one criterion.
 Every baseline_repository_shas.repository must be a workspace-relative Git worktree root (use "." for the workspace root), and sha must be the full exact output of `git -C <repository> rev-parse HEAD`.
 Preserve established repository behavior for Jira-silent incidental details and record the precedent; do not manufacture requirements, acceptance criteria, or product questions.
-Request additional human clarification only for a genuine current-Jira conflict or an unavoidable externally visible product choice that Jira and established behavior do not resolve. If required, return JSON: {{"decision":"needs_human","question":"<specific question>"}}.
+Request additional human clarification only for a genuine current-Jira conflict or an unavoidable externally visible product choice that Jira and established behavior do not resolve. If required, return JSON: {{"decision":"needs_human","question":"<specific question>","options":[{{"label":"...","description":"..."}},{{"label":"...","description":"..."}},{{"label":"...","description":"..."}}]}}.
 If ready for approval, return only one revised JSON object that validates against this schema (no Markdown fences or surrounding prose):
 {plan_spec_json_schema()}
 
@@ -4387,28 +4415,28 @@ Use the human clarification to complete the development review decision. If code
     if previous_phase == "implementation":
         return """Continue implementation from the existing workspace.
 Apply the human clarification as implementation guidance.
-Preserve useful existing changes, revise anything that conflicts with the clarification, and run the configured verification.
+Preserve useful existing changes, revise anything that conflicts with the clarification, and follow the configured verification ownership (Symphony runs host/service-backed checks).
 Leave an updated final report with files changed, verification, and residual risk.
-If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>","options":[{"label":"...","description":"..."},{"label":"...","description":"..."},{"label":"...","description":"..."}]}."""
     if previous_phase in {'review'}:
         return """Continue the review from the existing workspace.
 Use the human clarification to complete the review decision.
 If changes are required, return the normal review decision so Symphony can run another implementation pass.
-If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>","options":[{"label":"...","description":"..."},{"label":"...","description":"..."},{"label":"...","description":"..."}]}."""
     if previous_phase == "verification":
         return """Continue only the bounded implementation needed to address the failing verification under the exact trusted PlanSpec.
 Treat the human response as test-failure guidance, not permission to broaden behavior or scope.
-Preserve useful existing changes, make only evidence-backed fixes, and rerun the configured verification.
+Preserve useful existing changes, make only evidence-backed fixes, and let Symphony rerun configured host verification.
 Leave an updated final report with files changed, verification, and residual risk.
-If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>","options":[{"label":"...","description":"..."},{"label":"...","description":"..."},{"label":"...","description":"..."}]}."""
     if previous_phase == "verification_environment":
         return """The operator reports that the local verification environment has been fixed.
 Preserve the existing workspace and exact trusted PlanSpec, do not treat this response as a new product requirement, and do not make broad code edits.
-Rerun the configured verification against the existing changes and report the result.
-If the environment is still unavailable, return a specific environment blocker instead of changing application code to bypass it."""
+Leave the existing code ready for Symphony to rerun configured host verification.
+If the environment is still unavailable, report verification as not run with the specific reason and residual risk; do not change application code to bypass it or request a verification bypass approval."""
     return """Continue from the existing workspace.
-Preserve useful existing changes, revise anything that conflicts with the clarification, run the configured verification, and leave a concise final report with files changed, verification, and residual risk.
-If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>"}."""
+Preserve useful existing changes, revise anything that conflicts with the clarification, follow configured verification ownership, and leave a concise final report with files changed, verification, and residual risk.
+If additional human clarification is required, return JSON: {"decision":"needs_human","question":"<specific question>","options":[{"label":"...","description":"..."},{"label":"...","description":"..."},{"label":"...","description":"..."}]}."""
 
 
 def classify_review_decision(review_message: str | None) -> str:

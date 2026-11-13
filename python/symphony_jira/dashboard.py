@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from .dashboard_client import DASHBOARD_SCRIPT
 from .review_page import render_review_page, review_progress
 from .conversation import answer_question, decision_ledger, plan_changes
+from .presentation import (PRESENTATION_CSS, QUESTION_SCRIPT, document_page, question_view, render_document, render_question)
 from .human_review import (
     HumanReviewContextError,
     capture_workspace_diff,
@@ -97,7 +98,7 @@ def create_app(
         is_json = "application/json" in request.headers.get("content-type", "")
         try:
             payload = json.loads(body) if is_json else {key: values[0] for key, values in parse_qs(body.decode()).items()}
-            response = payload.get("response") if isinstance(payload, dict) else None
+            response = (payload.get("response") or (payload.get("choice") if payload.get("choice") != "__other__" else None)) if isinstance(payload, dict) else None
             if not isinstance(response, str) or not response.strip() or len(response.strip()) > 16000:
                 raise ValueError("answer must contain 1–16000 characters")
             revision = payload.get("expected_revision")
@@ -197,6 +198,43 @@ def create_app(
             ) from exc
         return PlainTextResponse(content, media_type="application/json")
 
+    @app.get("/runs/{run_id}/plan", response_class=HTMLResponse)
+    async def readable_plan(run_id: str):
+        try:
+            original = await run_plan(run_id)
+        except HTTPException as exc:
+            return HTMLResponse(document_page("Plan unavailable", str(exc.detail)), status_code=exc.status_code)
+        run = store.get_run(run_id)
+        return HTMLResponse(document_page(f"{run.issue_identifier} · Development plan",
+            original.body.decode("utf-8"), f"/api/v1/runs/{run_id}/plan"))
+
+    @app.get("/runs/{run_id}/requirements", response_class=HTMLResponse)
+    async def readable_requirements(run_id: str):
+        run = store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        try:
+            snapshot = store.get_requirements_snapshot(run.issue_identifier, run.issue_fingerprint or "")
+        except StoreIntegrityError as exc:
+            raise HTTPException(status_code=409, detail="Requirements failed integrity validation") from exc
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="requirements not available")
+        return HTMLResponse(document_page(f"{run.issue_identifier} · Requirements", snapshot.model_dump_json(indent=2)))
+
+    @app.get("/runs/{run_id}/verification", response_class=HTMLResponse)
+    async def readable_verification(run_id: str):
+        run = store.get_run(run_id)
+        if run is None or not run.verification_output_path:
+            return HTMLResponse(document_page("Verification unavailable", "No saved verification output is available for this run."), status_code=404)
+        try:
+            path = Path(run.verification_output_path)
+            relative = str(path.relative_to(Path(run.workspace_path))) if path.is_absolute() else str(path)
+            content = read_frozen_text_artifact(Path(run.workspace_path), relative,
+                label="saved verification output", required=True)
+        except (ValueError, HumanReviewContextError):
+            return HTMLResponse(document_page("Verification unavailable", "The saved output is missing or outside this workspace."), status_code=409)
+        return HTMLResponse(document_page(f"{run.issue_identifier} · Verification results", content or "No output recorded."))
+
     question_lock = asyncio.Lock()
 
     @app.post("/api/v1/runs/{run_id}/question")
@@ -261,7 +299,7 @@ def create_app(
             payload = {key: values[0] if values else "" for key, values in form.items()}
 
         action = str(payload.get("action") or "").strip().lower()
-        response = str(payload.get("response") or "").strip()
+        response = str(payload.get("response") or (payload.get("choice") if payload.get("choice") != "__other__" else "") or "").strip()
         approver_identity = str(payload.get("approver_identity") or "").strip()
         approval: dict[str, Any] | None = None
         if action == "approve":
@@ -773,6 +811,23 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
         "Plan approval" if run.blocked_phase == 'planning_approval' else
         "Human clarification" if run.status == 'blocked' else None
     )
+    data["human_question"] = question_view({}, run.error or "What should Symphony do next?")
+    try:
+        retained_question = json.loads(run.final_message or "{}")
+    except (ValueError, TypeError):
+        retained_question = {}
+    if isinstance(retained_question, dict) and retained_question.get("decision") == "needs_human" and retained_question.get("question") == run.error:
+        data["human_question"] = question_view(retained_question)
+    for entry in store.list_logs(run_id=run.id):
+        if entry["level"] != "human_question":
+            continue
+        try:
+            candidate = json.loads(entry["message"])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(candidate, dict) and candidate.get("question") and candidate["question"] in (run.error or ""):
+            data["human_question"] = question_view(candidate)
+            break
     data["business_summary"] = store.get_business_summary(run.issue_identifier, str(run.issue_fingerprint or ""))
     events = store.list_codex_events(run.id)
     latest_event_type = events[-1].event_type if events else None
@@ -845,7 +900,8 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
             ),
             "elapsed_seconds": elapsed_seconds(run),
             "plan_path": str(plan_path),
-            "plan_url": f"/api/v1/runs/{run.id}/plan",
+            "plan_url": f"/runs/{run.id}/plan",
+            "requirements_url": f"/runs/{run.id}/requirements" if requirements_snapshot else None,
             "plan_exists": plan_path.exists(),
             "plan_content": plan_content,
             "plan_summary": summarize_plan_content(
@@ -1137,6 +1193,7 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     .badge-input-needed, .badge-approval-needed {{ background: #fff4d6; color: #805000; }}
     .badge-handed-off {{ background: #e8f7ee; color: #167a45; }}
     .badge-resume-queued {{ background: #e8f1ff; color: #1d63c6; }}
+    {PRESENTATION_CSS}
   </style>
 </head>
 <body>
@@ -1187,7 +1244,8 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     </table></div>
   </main>
   <script type="text/javascript">
-    {DASHBOARD_SCRIPT}
+    {QUESTION_SCRIPT}
+{DASHBOARD_SCRIPT}
   </script>
 </body>
 </html>"""
@@ -1235,6 +1293,7 @@ def render_run_row(
     )
     if run.get("verification_output_path"):
         verification_note += (
+            f'<a class="artifact-link" href="/runs/{escape(run.get("id"))}/verification">Read test results</a>'
             '<details class="verification-note"><summary>Result location</summary>'
             f'<code>{escape(run["verification_output_path"])}</code></details>'
         )
@@ -1419,28 +1478,30 @@ def render_run_details(
     if run.get("human_input_context"):
         details.append(
             '<details><summary>Accumulated human input</summary>'
-            f'<pre>{escape(run["human_input_context"])}</pre></details>'
+            f'{render_document(run["human_input_context"])}</details>'
         )
     error = display_error(run)
     if error:
         details.append(
-            f'<details open><summary>{escape(run.get("blocker_category") or "Error")}</summary>'
-            f'<pre>{escape(error)}</pre></details>'
+            f'<details><summary>{escape(run.get("blocker_category") or "Details of the blocker")}</summary>'
+            f'{render_document(error, raw=False)}</details>'
         )
     human_input = render_human_input_cell(run)
     if human_input and human_input != "none":
         open_attribute = " open" if run.get("status") == "blocked" else ""
         action_label = "Action required" if run.get("human_input_actionable") else "Human feedback &amp; continuation"
-        details.append(
-            f'<details class="action-panel"{open_attribute}><summary>{action_label}</summary>'
-            f'<div class="detail-grid">{human_input}</div></details>'
-        )
+        panel = (f'<details class="action-panel"{open_attribute}><summary>{action_label}</summary>'
+                 f'<div class="detail-grid">{human_input}</div></details>')
+        if run.get("human_input_actionable"):
+            details.insert(0, panel)
+        else:
+            details.append(panel)
     if run.get("status") == "completed" and run.get("human_review_actionable"):
         details.insert(0, '<div class="handoff-note">Handoff complete. Later feedback continues from this implementation, saved plan and code context, and accepted decisions. Verification is advisory; inspect its result and residual risks before using the changes.</div>')
     if final_message:
         details.append(
             '<details><summary>Final output</summary>'
-            f'<pre>{escape(final_message)}</pre></details>'
+            f'{render_document(final_message)}</details>'
         )
     details.append(
         '<details><summary>Workspace</summary>'
@@ -1468,50 +1529,15 @@ def format_elapsed(value: Any) -> str:
 
 
 def render_review_cell(run: dict[str, Any]) -> str:
-    sections: list[str] = []
-    for label, prefix in (
-        ("Development Review", "development_review"),
-    ):
-        label = workflow_phase_label(run, label)
-        artifacts: list[str] = []
-        if run.get(f"{prefix}_exists"):
-            content = str(run.get(f"{prefix}_content") or "")
-            artifacts.append(
-                "<div>Artifact: "
-                f"<code>{escape(run.get(f'{prefix}_path'))}</code>"
-                + (
-                    render_long_text_cell(
-                        content,
-                        f"Show {label.lower()}",
-                        force_details=True,
-                    )
-                    if content
-                    else ""
-                )
-                + "</div>"
-            )
-        if run.get(f"{prefix}_history_exists"):
-            history_content = str(
-                run.get(f"{prefix}_history_content") or ""
-            )
-            artifacts.append(
-                "<div>History: "
-                f"<code>{escape(run.get(f'{prefix}_history_path'))}</code>"
-                + (
-                    render_long_text_cell(
-                        history_content,
-                        f"Show {label.lower()} history",
-                        force_details=True,
-                    )
-                    if history_content
-                    else ""
-                )
-                + "</div>"
-            )
-        if artifacts:
-            sections.append(
-                f"<div><strong>{escape(label)}</strong>{''.join(artifacts)}</div>"
-            )
+    sections = []
+    for suffix, label in (("", "Development Review"), ("_history", "Review history")):
+        key = "development_review" + suffix
+        if not run.get(key + "_exists"):
+            continue
+        content = str(run.get(key + "_content") or "")
+        location = str(run.get(key + "_path") or "")
+        sections.append(f'<div><strong>{escape(label)}</strong>{render_document(content)}'
+                        f'<details class="artifact-path"><summary>File location</summary><code>{escape(location)}</code></details></div>')
     return "".join(sections) or "none"
 
 
@@ -1565,7 +1591,8 @@ def render_requirements_cell(run: dict[str, Any]) -> str:
         if run.get("requirements_exists")
         else "Expected requirements file (not present)"
     )
-    return render_brief_artifact(
+    readable_link = (f'<a class="artifact-link" href="{escape(run.get("requirements_url"))}">Read requirements</a>' if run.get("requirements_url") else "")
+    return readable_link + render_brief_artifact(
         summary,
         run.get("requirements_path"),
         label,
@@ -1576,8 +1603,8 @@ def render_brief_artifact(summary: str, path: Any, label: str) -> str:
     path_html = ""
     if path:
         path_html = (
-            f'<div class="artifact-path">{escape(label)}:<br>'
-            f"<code>{escape(path)}</code></div>"
+            f'<details class="artifact-path"><summary>File location</summary>{escape(label)}:<br>'
+            f"<code>{escape(path)}</code></details>"
         )
     return f'<div class="brief-summary">{escape(summary)}</div>{path_html}'
 
@@ -1586,14 +1613,14 @@ def render_long_text_cell(value: Any, summary: str, *, force_details: bool = Fal
     text = str(value or "")
     if not text:
         return ""
+    if "diff" in summary.lower():
+        return f'<details><summary>{escape(summary)}</summary><pre>{escape(text)}</pre></details>'
     preview = text if len(text) <= 220 else f"{text[:220]}..."
     if len(text) <= 220 and not force_details:
-        return f"<pre>{escape(text)}</pre>"
+        return render_document(text)
     return (
         f"<details><summary>{escape(summary)}</summary>"
-        f"<div class=\"preview\">{escape(preview)}</div>"
-        f"<pre>{escape(text)}</pre>"
-        "</details>"
+        f"{render_document(text)}</details>"
     )
 
 
@@ -1983,11 +2010,9 @@ def render_human_input_cell(run: dict[str, Any]) -> str:
             "</form></div>"
         )
     return review_lineage + (
-        f"<form method=\"post\" action=\"{action_url}\">"
-        "<label>Feedback for Codex<textarea name=\"response\" required rows=\"4\" cols=\"36\" "
-        "placeholder=\"Add clarification for Codex\"></textarea></label>"
-        "<button type=\"submit\" name=\"action\" value=\"decision\">Record decision &amp; resume</button>"
-        "</form>"
+        f'<form method="post" action="{action_url}" data-human-question-form>'
+        + render_question(run.get("human_question") or question_view({}, run.get("error") or "What should Symphony do next?"))
+        + '<button type="submit" name="action" value="decision">Record decision &amp; resume</button></form>'
     )
 
 
