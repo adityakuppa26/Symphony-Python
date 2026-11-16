@@ -36,7 +36,13 @@ choices follow existing patterns without another approval request.
 The development handler owns changes in `foyr2`, `cpm`, and `pi`. Workspaces remain
 under `~/codex-workspaces/development`; run history, approvals, and review context
 remain in `.symphony/development.sqlite3`. Issues are selected with `codex-ready`.
-Run the polling process and dashboard against the same workflow:
+From the repository root, run `./run-symphony.sh` and `./run-dashboard.sh` in
+separate terminals. The launchers select this directory's virtual environment and
+`WORKFLOW.md`; the dashboard opens at <http://127.0.0.1:3333>. Use `--help` for options
+and Ctrl-C to stop each process. See the [root guide](../README.md#run) for setup.
+
+You can also run the polling process and dashboard directly from `python/`,
+using the configured virtual environment and the same workflow:
 
 ```sh
 python3 -m symphony_jira run ./WORKFLOW.md
@@ -553,6 +559,23 @@ and after execution; it cannot report stale results as passing.
 Foyr Python/frontend targets use the standalone Foyr controller. Pi retains
 `scripts/test.sh`. Test processes run on the host's Podman runtime,
 outside Codex's sandbox.
+
+The local verification controllers check and recover known setup problems automatically:
+
+- Oracle container replacement is accepted only when the pinned data volume, test
+  PDB/schema, and stored schema ownership marker match. A stopped matching container
+  is started and readiness is checked before testing. Unknown volumes or owners
+  remain errors; the controller never recreates the database to bypass them.
+- Frontend browser availability is checked before snapshot/build work. Dependency
+  caches with a stale image marker or missing runner files are reinstalled using
+  the existing lockfiles before testing.
+- Source build/lint errors remain failures, while missing infrastructure and missing
+  execution evidence remain environment errors. Neither is reported as passing.
+
+These checks live in the configured local controllers under
+`/home/adkuppa/playground/cpm-verification/`. Preserve their `.state` ownership
+secrets and identity records. External outages and unknown identity changes can
+still prevent verification; recovery does not bypass those checks.
 
 The checked-in workflow enables `codex.development_test_suites: [python, functional, frontend]`.
 

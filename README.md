@@ -9,21 +9,42 @@ the existing implementation with its saved plan, requirements, and review contex
 
 ## Run
 
-The application lives in `python/`; existing command and configuration paths are
-unchanged. From that directory, using its configured virtual environment:
+From the repository root, start Symphony:
 
 ```sh
-cd python
-.venv/bin/python -m symphony_jira validate ./WORKFLOW.md
-.venv/bin/python -m symphony_jira run ./WORKFLOW.md
+./run-symphony.sh
 ```
 
-Run the dashboard in another terminal:
+Start the dashboard in another terminal, then open <http://127.0.0.1:3333>:
 
 ```sh
-cd python
-.venv/bin/python -m symphony_jira dashboard ./WORKFLOW.md --port 3333
+./run-dashboard.sh
 ```
+
+Both launchers use `python/.venv/bin/python` and `python/WORKFLOW.md` by default.
+They run in the foreground; press Ctrl-C in each terminal to stop. You can invoke
+them by absolute path from any directory. Run either with `--help` for usage.
+
+If the virtual environment is not installed yet:
+
+```sh
+python3 -m venv python/.venv
+python/.venv/bin/python -m pip install -e ./python
+```
+
+Jira credentials and Codex setup must also be configured as described in the guide.
+To customize the dashboard port or use another workflow:
+
+```sh
+./run-dashboard.sh --port 3334
+./run-symphony.sh /path/to/WORKFLOW.md
+./run-dashboard.sh /path/to/WORKFLOW.md --port 3334
+```
+
+Use the same workflow for both processes to share run history and approvals.
+Relative workflow paths resolve from your current directory. Set `SYMPHONY_PYTHON`
+to an alternative Python interpreter with the package dependencies installed.
+The existing `python -m symphony_jira` commands remain available.
 
 See the [Python workflow guide](python/README.md) for setup, Jira configuration,
 approvals, feedback, and host test execution. The active configuration and agent

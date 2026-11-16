@@ -121,9 +121,8 @@ codex:
   max_review_no_progress_passes: 2
   # A human-review handoff needs a recorded resolution for every triaged comment.
   require_review_comment_coverage: true
-  # Use the installed extension CLI; PATH currently selects an older npm CLI
-  # that cannot read the model cache written by the VS Code extension.
-  command: "/home/adkuppa/.vscode-server/extensions/openai.chatgpt-26.5908.31748-linux-x64/bin/linux-x86_64/codex"
+  # Resolve the installed CLI through PATH so extension upgrades do not break startup.
+  command: "codex"
   args:
     - "exec"
     - "--json"
@@ -136,9 +135,6 @@ codex:
     # Codex 0.153.4 no longer accepts the retired "untrusted" policy.
     - "-c"
     - 'approval_policy="on-request"'
-    # The development workflow does not require the local PI MCP service.
-    - "-c"
-    - "mcp_servers.pi.enabled=false"
   output_last_message_file: ".symphony/codex-final.md"
   output_development_verification_request_file: ".symphony/development-verification-request.json"
   auto_replan: true
