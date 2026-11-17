@@ -1,12 +1,14 @@
 import html
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .dashboard_client import DASHBOARD_SCRIPT
+from .dashboard_ux import DASHBOARD_UX_CSS, CASE_INTERACTIONS
 from .review_page import render_review_page, review_progress
 from .conversation import answer_question, decision_ledger, plan_changes
 from .presentation import (PRESENTATION_CSS, QUESTION_SCRIPT, document_page, question_view, render_document, render_question)
@@ -17,6 +19,7 @@ from .human_review import (
     validate_frozen_snapshot_artifacts,
 )
 from .models import RequirementsSnapshot, RunRecord
+from .recordings import MAX_RECORDINGS, Recording, RecordingError, open_verified_recording
 from .orchestrator import (
     managed_diff_repositories,
     validate_plan_repository_baselines,
@@ -30,6 +33,8 @@ from .plan_spec import (
 )
 from .store import Store, StoreIntegrityError
 from .workflow import WorkflowDefinition
+from .verification_view import phase_excerpt, verification_page
+from .run_impact import compact_impact, impact_history
 
 MAX_HUMAN_REVIEW_REQUEST_BYTES = 1024 * 1024
 SUMMARY_ITEM_LIMIT = 3
@@ -41,6 +46,145 @@ PLAN_SUMMARY_UNAVAILABLE = (
     "Plan summary unavailable because the plan could not be validated for this run. "
     "Open the full plan file for details."
 )
+def verification_content(run: RunRecord) -> str:
+    if not run.verification_output_path:
+        raise HumanReviewContextError("No saved verification output is available for this run")
+    path = Path(run.verification_output_path)
+    relative = str(path.relative_to(Path(run.workspace_path))) if path.is_absolute() else str(path)
+    return read_frozen_text_artifact(Path(run.workspace_path), relative,
+        label="saved verification output", required=True) or ""
+
+
+def verification_recordings(content: str) -> tuple[dict, list[dict]]:
+    report = json.loads(content)
+    if not isinstance(report, dict):
+        raise ValueError("Verification report must be an object")
+    values = report.get("recordings", [])
+    if not isinstance(values, list) or len(values) > MAX_RECORDINGS:
+        raise ValueError("Invalid verification recordings")
+    recordings = [Recording.model_validate(value).model_dump(mode="json") for value in values]
+    ids = [item["id"] for item in recordings]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate recording IDs")
+    return report, recordings
+
+
+def run_recordings(run: RunRecord, store: Store) -> tuple[dict, list[dict]]:
+    """Read only reports attached to this run; supplemental evidence never replaces it."""
+    primary = {"status": run.verification_status or "not recorded"}
+    entries = []
+    ids = set()
+
+    def add(report: dict, recordings: list[dict], label: str, original: bool):
+        for recording in recordings:
+            if recording["id"] in ids:
+                raise ValueError("Duplicate recording IDs across reports")
+            ids.add(recording["id"])
+            entries.append({"recording": recording, "report": report,
+                            "label": label, "original": original})
+        if len(entries) > 100:
+            raise ValueError("Too many recording entries")
+
+    if run.verification_output_path:
+        primary, recordings = verification_recordings(verification_content(run))
+        add(primary, recordings, "Original verification", True)
+    seen_paths = set()
+    for log in store.list_logs(run_id=run.id):
+        if log["level"] != "verification_recording":
+            continue
+        if len(log["message"]) > 4096:
+            raise ValueError("Invalid recording report reference")
+        reference = json.loads(log["message"])
+        if not isinstance(reference, dict):
+            raise ValueError("Invalid recording report reference")
+        path = reference.get("report_path")
+        if not isinstance(path, str) or not re.fullmatch(r"\.symphony/verification/[A-Za-z0-9_.-]+\.json", path):
+            raise ValueError("Recording report must remain in the verification directory")
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        if len(seen_paths) > 20:
+            raise ValueError("Too many supplemental recording reports")
+        content = read_frozen_text_artifact(Path(run.workspace_path), path,
+            label="supplemental recording report", required=True)
+        report, recordings = verification_recordings(content or "")
+        label = reference.get("label", "Recorded verification rerun")
+        if not isinstance(label, str) or not label.strip() or len(label) > 200:
+            raise ValueError("Invalid recording report label")
+        add(report, recordings, label, False)
+    return primary, entries
+
+
+def recording_byte_range(value: str | None, size: int) -> tuple[int, int, bool]:
+    if not value:
+        return 0, size - 1, False
+    if len(value) > 128:
+        raise ValueError("Invalid byte range")
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or not any(match.groups()) or size <= 0:
+        raise ValueError("Invalid byte range")
+    first, last = match.groups()
+    if not first:
+        suffix = int(last)
+        if suffix <= 0:
+            raise ValueError("Invalid byte range")
+        return max(0, size - suffix), size - 1, True
+    start = int(first)
+    end = min(int(last), size - 1) if last else size - 1
+    if start >= size or start > end:
+        raise ValueError("Invalid byte range")
+    return start, end, True
+
+
+def render_recordings_page(run: RunRecord, report: dict, entries: list[dict]) -> str:
+    status = str(report.get("status") or run.verification_status or "not recorded")
+    stale = status == "stale" or run.verification_status == "stale"
+    cards = []
+    labels = {"passed": "Passed", "failed": "Failed", "skipped": "Not covered",
+              "timed_out": "Timed out", "unknown": "Outcome not recorded"}
+    for entry in entries:
+        item, origin = entry["recording"], entry["report"]
+        url = f'/api/v1/runs/{run.id}/recordings/{item["id"]}'
+        outcome = labels.get(item["outcome"], item["outcome"].replace("_", " "))
+        source_hash = origin.get("workspace_diff_hash")
+        source = (source_hash if isinstance(source_hash, str) and re.fullmatch(r"[0-9a-f]{64}", source_hash)
+                  else "Not recorded")
+        origin_status = str(origin.get("status") or "not recorded")
+        request_hash = origin.get("request_hash")
+        request_binding = (request_hash if isinstance(request_hash, str) and re.fullmatch(r"[0-9a-f]{64}", request_hash)
+                           else "Not recorded")
+        card_stale = origin_status == "stale" or (entry["original"] and stale)
+        cards.append(
+            '<section class="recording"><h2>' + escape(item["title"]) + '</h2>'
+            + '<p><strong>' + escape(outcome) + '</strong> · Recorded ' + escape(item["recorded_at"]) + '</p>'
+            + ('<p><strong>Stale recording</strong> · This is historical evidence.</p>' if card_stale else '')
+            + '<video controls preload="metadata" playsinline style="width:100%;max-height:72vh;background:#111">'
+            + '<source src="' + escape(url) + '" type="video/webm">'
+            + 'Your browser does not support WebM playback.</video>'
+            + '<details><summary>Details</summary><p>' + escape(entry["label"])
+            + ' · Report status: <strong>' + escape(origin_status.replace("_", " ")) + '</strong></p>'
+            + '<p>Test: <code>' + escape(item["spec"]) + '</code></p>'
+            + '<p>Recorded workspace diff SHA-256: <code>' + escape(source) + '</code></p>'
+            + '<p>Verification request SHA-256: <code>' + escape(request_binding) + '</code></p>'
+            + '<p>Each source hash identifies its recorded snapshot; current workspace changes are not checked during playback.</p>'
+            + '</details></section>'
+        )
+    if not cards:
+        cards.append('<p>No verification video was recorded for this run.</p>')
+    stale_note = ('<p role="status"><strong>Stale verification:</strong> the original report belongs to an earlier '
+                  'code snapshot and is not evidence for the current workspace.</p>') if stale else ''
+    return ('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            + '<title>' + escape(run.issue_identifier) + ' · Verification video</title><style>'
+            + PRESENTATION_CSS + '.recording{margin:1.5rem 0;padding:1rem;border:1px solid #dfe6ef;border-radius:12px}</style>'
+            + '<body class="document-page"><nav><a href="/">← All cases</a> '
+            + '<a href="/runs/' + escape(run.id) + '/verification">Read test results</a></nav>'
+            + '<h1>' + escape(run.issue_identifier) + ' · Verification video</h1>'
+            + '<p>Original run verification: <strong>' + escape(status.replace("_", " ")) + '</strong></p>'
+            + stale_note + '<p>Supplemental recording reports do not replace this run’s original verification result.</p>'
+            + '<p>Playback shows the selected test scenario. It does not establish coverage of other behavior.</p>'
+            + ''.join(cards) + '</body></html>')
+
+
 def create_app(
     workflow: WorkflowDefinition,
     store: Store,
@@ -50,15 +194,61 @@ def create_app(
 ):
     try:
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+        from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+        from starlette.background import BackgroundTask
+        from starlette.concurrency import run_in_threadpool
     except ImportError as exc:
         raise RuntimeError("FastAPI dashboard dependencies are not installed. Install with: pip install .[dashboard]") from exc
 
     app = FastAPI(title="Symphony Jira")
 
+    @app.post("/api/v1/runs/{run_id}/verify")
+    async def queue_verification(run_id: str, request: Request):
+        if not workflow.config.hooks.verify or not workflow.config.hooks.use_development_verification_request:
+            raise HTTPException(status_code=409, detail="Change-aware host verification is not configured")
+        body = await request.body()
+        if len(body) > 1024:
+            raise HTTPException(status_code=413, detail="Request too large")
+        try:
+            payload = json.loads(body) if 'application/json' in request.headers.get('content-type', '') else {key: values[0] for key, values in parse_qs(body.decode()).items()}
+            if not isinstance(payload, dict):
+                raise ValueError('Expected a verification request')
+            attempt = store.queue_verification(run_id, payload.get('mode', 'all'))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if 'text/html' in request.headers.get('accept', ''):
+            return RedirectResponse(f'/runs/{run_id}/verification', status_code=303)
+        return {'verification_attempt': attempt, 'message': 'Queued for the Symphony polling worker'}
+
+    @app.get("/api/v1/runs/{run_id}/verifications")
+    async def verification_attempts(run_id: str):
+        if store.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail='run not found')
+        return store.list_verification_attempts(run_id)
+
     @app.get("/api/v1/state")
     async def state() -> dict[str, Any]:
         return build_state(workflow, store, orchestrator_snapshot(orchestrator))
+
+    @app.get("/runs/{run_id}", response_class=HTMLResponse)
+    async def case_page(run_id: str):
+        run = store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail='run not found')
+        data = enrich_run(run, store, workflow)
+        history = [enrich_run(item, store, workflow) for item in store.list_runs_for_issue(run.issue_identifier, limit=20)
+                   if item.started_at < run.started_at]
+        content = render_run_details(data, display_final_message(data))
+        if history:
+            content += render_attempt_history(history)
+        return (f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<title>{escape(run.issue_identifier)} · Symphony</title><style>{PRESENTATION_CSS}{DASHBOARD_UX_CSS}</style>'
+                '<body data-case-page="true"><main class="case-page"><nav><a href="/">← All cases</a></nav>'
+                f'<header><div><p class="eyebrow">Run {run.attempt}</p><h1>{escape(run.issue_identifier)}</h1>'
+                f'<p>{escape(data.get("business_summary") or "Run details, decisions, and saved evidence.")}</p></div></header>'
+                f'<div class="case-overview">{render_badge(display_status(data))}'
+                f'<a class="artifact-link" href="/runs/{escape(run.id)}/verification">Verification history</a></div>'
+                f'{render_verification_actions(data)}{content}</main><script>{QUESTION_SCRIPT}{CASE_INTERACTIONS}</script></body></html>')
 
     @app.get("/api/v1/runs")
     async def runs(limit: int = 50) -> list[dict[str, Any]]:
@@ -224,16 +414,83 @@ def create_app(
     @app.get("/runs/{run_id}/verification", response_class=HTMLResponse)
     async def readable_verification(run_id: str):
         run = store.get_run(run_id)
-        if run is None or not run.verification_output_path:
+        if run is None:
             return HTMLResponse(document_page("Verification unavailable", "No saved verification output is available for this run."), status_code=404)
         try:
-            path = Path(run.verification_output_path)
-            relative = str(path.relative_to(Path(run.workspace_path))) if path.is_absolute() else str(path)
-            content = read_frozen_text_artifact(Path(run.workspace_path), relative,
-                label="saved verification output", required=True)
+            content = verification_content(run) if run.verification_output_path else ''
         except (ValueError, HumanReviewContextError):
             return HTMLResponse(document_page("Verification unavailable", "The saved output is missing or outside this workspace."), status_code=409)
-        return HTMLResponse(document_page(f"{run.issue_identifier} · Verification results", content or "No output recorded."))
+        page = await run_in_threadpool(verification_page, run, store, workflow, content)
+        try:
+            _, recordings = run_recordings(run, store)
+        except (ValueError, HumanReviewContextError, RecordingError):
+            recordings = []
+        if recordings:
+            page = page.replace('</nav>', f'<a href="/runs/{escape(run.id)}/recordings">Watch verification video</a></nav>', 1)
+        return HTMLResponse(page)
+
+    @app.get("/runs/{run_id}/recordings", response_class=HTMLResponse)
+    async def readable_recordings(run_id: str):
+        run = store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        try:
+            report, recordings = run_recordings(run, store)
+        except (ValueError, HumanReviewContextError, RecordingError):
+            return HTMLResponse(document_page("Verification video unavailable", "The saved recording metadata could not be validated."), status_code=409)
+        return HTMLResponse(render_recordings_page(run, report, recordings))
+
+    @app.api_route("/api/v1/runs/{run_id}/recordings/{recording_id}", methods=["GET", "HEAD"])
+    async def recording_video(run_id: str, recording_id: str, request: Request):
+        run = store.get_run(run_id)
+        if run is None or not re.fullmatch(r"[0-9a-f]{32}", recording_id):
+            raise HTTPException(status_code=404, detail="recording not found")
+        try:
+            _, recordings = run_recordings(run, store)
+        except (ValueError, HumanReviewContextError, RecordingError):
+            raise HTTPException(status_code=409, detail="recording metadata unavailable")
+        metadata = next((entry["recording"] for entry in recordings if entry["recording"]["id"] == recording_id), None)
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="recording not found")
+        try:
+            video = await run_in_threadpool(open_verified_recording, Path(run.workspace_path), metadata)
+        except (OSError, ValueError, RecordingError):
+            raise HTTPException(status_code=409, detail="recording unavailable or failed integrity validation")
+        size = metadata["size_bytes"]
+        etag = '"' + metadata["sha256"] + '"'
+        range_header = request.headers.get("range")
+        if request.headers.get("if-range") not in (None, etag):
+            range_header = None
+        try:
+            start, end, partial = recording_byte_range(range_header, size)
+        except ValueError:
+            video.close()
+            return PlainTextResponse("Requested byte range is unavailable", status_code=416,
+                headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes", "Cache-Control": "no-store"})
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1), "ETag": etag,
+                   "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                   "Content-Disposition": f'inline; filename="{recording_id}.webm"'}
+        if partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        if request.method == "HEAD":
+            video.close()
+            return Response(status_code=206 if partial else 200, headers=headers, media_type="video/webm")
+
+        def chunks():
+            try:
+                video.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    data = video.read(min(256 * 1024, remaining))
+                    if not data:
+                        raise OSError("Verified recording ended unexpectedly")
+                    remaining -= len(data)
+                    yield data
+            finally:
+                video.close()
+
+        return StreamingResponse(chunks(), status_code=206 if partial else 200, headers=headers,
+                                 media_type="video/webm", background=BackgroundTask(video.close))
 
     question_lock = asyncio.Lock()
 
@@ -261,6 +518,7 @@ def create_app(
             async with question_lock:
                 answer = await answer_question(run=run, question=question,
                     plan=read_text_if_exists(Path(run.workspace_path) / workflow.config.codex.output_plan_file) or "",
+                    impact_history=impact_history(store, run),
                     config=workflow.config.codex)
         except (ValueError, TimeoutError, OSError) as exc:
             raise HTTPException(status_code=503, detail="Question service unavailable; case state is unchanged.") from exc
@@ -798,6 +1056,18 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
     data = run_to_dict(run)
     data["workflow_kind"] = workflow.config.kind
     data["verification_advisory"] = True
+    saved_impact = store.get_impact_summary(run.id)
+    data['handoff_impact'] = compact_impact(saved_impact) if saved_impact else None
+    data['verification_attempts'] = store.list_verification_attempts(run.id)
+    data['verification_actionable'] = bool(workflow.config.hooks.verify and workflow.config.hooks.use_development_verification_request
+        and store.is_latest_actionable_completed_run(run.id)
+        and not any(item['status'] in {'queued', 'running'} for item in data['verification_attempts']))
+    data["recording_count"] = 0
+    try:
+        _, recordings = run_recordings(run, store)
+        data["recording_count"] = len(recordings)
+    except (ValueError, HumanReviewContextError, RecordingError):
+        pass
     data["decision_ledger"] = decision_ledger(run.human_input_context)
     previous_runs = store.list_runs_for_issue(run.issue_identifier, limit=10)
     data["conversation"] = [json.loads(item["message"]) for previous in previous_runs
@@ -953,6 +1223,32 @@ def enrich_run(run: RunRecord, store: Store, workflow: WorkflowDefinition) -> di
             ),
         }
     )
+    data['phase_summaries'] = [
+        {'phase': 'Requirements', 'summary': phase_excerpt(data.get('requirements_summary')), 'path': data.get('requirements_path')},
+        {'phase': 'Planning', 'summary': phase_excerpt(data.get('plan_summary')), 'path': str(plan_path)},
+        {'phase': 'Approval', 'summary': 'Approved plan recorded.' if run.plan_approval_id else 'No approval recorded.', 'path': None},
+        {'phase': 'Implementation', 'summary': phase_excerpt(run.final_message), 'path': str(Path(run.workspace_path) / workflow.config.codex.output_last_message_file)},
+        {'phase': 'Test selection', 'summary': 'Selected tests and coverage gaps are retained in the request artifact.', 'path': str(Path(run.workspace_path) / workflow.config.codex.output_development_verification_request_file)},
+        {'phase': 'Verification', 'summary': 'Original result: ' + str(run.verification_status or 'not recorded'), 'path': run.verification_output_path},
+        {'phase': 'Review', 'summary': phase_excerpt(data.get('review_content')), 'path': str(review_path)},
+        {'phase': 'Handoff', 'summary': 'Implementation completed; verification remains advisory.' if run.status == 'completed' else 'Not completed.', 'path': None},
+    ]
+    labels = {'plan': 'Planning', 'development_implementation': 'Implementation', 'implementation': 'Implementation',
+              'test_selection': 'Test selection', 'development_review': 'Review', 'review': 'Review',
+              'human_review.triage': 'Feedback triage'}
+    for entry in store.list_phase_summaries(run.id):
+        try:
+            saved = json.loads(entry['message'])
+            label = labels.get(saved['phase'], saved['phase'].replace('_', ' '))
+            item = {'phase': label, 'summary': phase_excerpt(saved['summary']), 'path': saved['path']}
+            index = next((i for i, old in enumerate(data['phase_summaries']) if old['phase'] == label), None)
+            if index is None:
+                data['phase_summaries'].append(item)
+            else:
+                data['phase_summaries'][index] = item
+        except (ValueError, KeyError, TypeError):
+            continue
+    data['final_output_path'] = str(Path(run.workspace_path) / workflow.config.codex.output_last_message_file)
     return data
 
 
@@ -1194,9 +1490,11 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     .badge-handed-off {{ background: #e8f7ee; color: #167a45; }}
     .badge-resume-queued {{ background: #e8f1ff; color: #1d63c6; }}
     {PRESENTATION_CSS}
+    {DASHBOARD_UX_CSS}
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#recent-cases">Skip to cases</a>
   <main>
     <header>
       <div><div class="eyebrow">Development orchestrator</div><h1>Symphony</h1><p class="subtitle">From Jira requirements to reviewed code, with a clear human handoff.</p></div>
@@ -1215,6 +1513,7 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
       {render_queue_panel("Queued", state["queued_issues"], queued, "queued")}
       {render_queue_panel("Needs your input", state["blocked_issues"], blocked, "blocked")}
     </div>
+    <details class="utility-settings"><summary>Workflow &amp; notification settings</summary>
     <details class="settings">
       <summary>Workflow settings</summary>
       <div class="settings-grid">
@@ -1231,24 +1530,38 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
       </div>
       <p class="preview">Sound requires enabling in each tab. Keep this dashboard open for alerts. <span id="alert-status" role="status">Connecting…</span></p>
     </section>
+    </details>
     <div id="attention-banner" class="attention-banner" role="status"><strong id="attention-summary">Checking for human input…</strong> <a href="/">Load latest cases</a></div>
-    <h2>Recent cases</h2>
+    <h2 id="recent-cases" tabindex="-1">Recent cases</h2>
     <div class="case-tools">
-      <label>Find a case<input id="case-search" type="search" placeholder="Search issue key"></label>
+      <label>Find a case<input id="case-search" type="search" placeholder="Search issue key or summary" autocomplete="off"></label>
       <label>Show<select id="case-filter"><option value="all">All cases</option><option value="attention">Needs your input</option><option value="running">Running</option><option value="queued">Queued to resume</option><option value="completed">Handed off</option><option value="failed">Failed</option></select></label>
-      <span id="case-count" class="muted" role="status"></span>
+      <button id="clear-filters" type="button" class="secondary-button">Clear filters</button>
+      <span id="case-count" class="muted case-count" role="status"></span>
     </div>
     <div class="table-shell"><table>
       <thead><tr><th>Issue</th><th>Status</th><th>Phase</th><th>Verification</th><th>Elapsed</th><th>Details</th></tr></thead>
       <tbody>{rows}</tbody>
     </table></div>
+    <div id="filter-empty" class="filter-empty" role="status" hidden>No cases match these filters. Try another search or clear the filters.</div>
   </main>
   <script type="text/javascript">
     {QUESTION_SCRIPT}
 {DASHBOARD_SCRIPT}
+{CASE_INTERACTIONS}
   </script>
 </body>
 </html>"""
+
+
+def render_verification_actions(run: dict[str, Any]) -> str:
+    if not run.get('verification_actionable'):
+        return ''
+    identifier = escape(run.get('id'))
+    return (f'<form class="verification-actions" data-verification-form data-results-url="/runs/{identifier}/verification" method="post" action="/api/v1/runs/{identifier}/verify">'
+            '<button name="mode" value="all" type="submit">Verify current code</button>'
+            '<button name="mode" value="retry" type="submit">Retry unsuccessful suites</button>'
+            '<p class="inline-status" data-action-status role="status" aria-live="polite"></p></form>')
 
 
 def render_run_row(
@@ -1275,7 +1588,8 @@ def render_run_row(
             phase_cell += '<div class="waiting-label">Waiting for your response</div>'
         else:
             phase_cell += f'<div class="blocked-label">Blocked: {escape(blocked_phase)}</div>'
-    phase_cell += render_phase_progress(phase_progress)
+    if phase_progress:
+        phase_cell += '<details class="pipeline"><summary>Workflow progress</summary>' + render_phase_progress(phase_progress) + '</details>'
     status = display_status(run)
     verification = str(run.get("verification_status") or "not configured")
     verification_explanation = {
@@ -1291,6 +1605,16 @@ def render_run_row(
         f'<div class="verification-note">{escape(verification_explanation)}</div>'
         '<div class="verification-note">Advisory · does not block handoff</div>'
     )
+    attempts = run.get('verification_attempts') or []
+    if attempts:
+        latest = attempts[0]
+        verification_note += f'<p>Original: {escape(verification)}<br>Latest attempt (recorded): <strong>{escape(latest["status"])}</strong> · {escape(latest["created_at"])}</p>'
+        verification_note += f'<a href="/runs/{escape(run.get("id"))}/verification">Verification history and current code match</a>'
+    verification_note += render_verification_actions(run)
+    if run.get("recording_count", 0):
+        verification_note += (
+            f'<a class="artifact-link" href="/runs/{escape(run.get("id"))}/recordings">Watch verification video</a>'
+        )
     if run.get("verification_output_path"):
         verification_note += (
             f'<a class="artifact-link" href="/runs/{escape(run.get("id"))}/verification">Read test results</a>'
@@ -1303,11 +1627,19 @@ def render_run_row(
     details = render_run_details(run, final_message)
     if earlier_attempts:
         details += render_attempt_history(earlier_attempts)
+    label = 'Action required' if run.get('human_input_actionable') else 'Impact & details'
+    approval = run.get('human_input_actionable') and run.get('blocked_phase') == 'planning_approval'
+    primary_label = 'Review plan ↗' if approval else 'Respond ↗' if run.get('human_input_actionable') else 'Open case ↗'
+    preview = ('Review and approve the saved plan to continue.' if approval else str(run.get('error') or '') if run.get('human_input_actionable') else
+               str((run.get('handoff_impact') or {}).get('this_run_summary') or ''))
+    preview_html = f'<p class="case-preview">{escape(compact_summary_text(preview, 180))}</p>' if preview else ''
+    details = (preview_html + f'<a class="artifact-link case-primary-link" href="/runs/{escape(run.get("id"))}">{primary_label}</a>'
+               f'<details class="case-details"><summary>{label}</summary>{details}</details>')
     filter_status = (
         "attention" if run.get("human_input_actionable") else
         "queued" if run.get("human_input_submitted") else str(run.get("status") or "")
     )
-    case_search = str(run.get("issue_identifier") or "").lower()
+    case_search = ' '.join(str(run.get(key) or '') for key in ('issue_identifier', 'business_summary')).lower()
     summary = str(run.get("business_summary") or "")
     summary_hidden = "" if summary else " hidden"
     return (
@@ -1317,7 +1649,7 @@ def render_run_row(
         f'<p class="business-summary" data-business-summary-run="{escape(run.get("id"))}" aria-label="Business overview from Jira requirements"{summary_hidden}>{escape(summary)}</p></td>'
         f'<td data-label="Status">{render_badge(status)}</td>'
         f'<td data-label="Phase">{phase_cell}</td>'
-        f'<td data-label="Verification">{render_badge(verification)}{verification_note}</td>'
+        f'<td data-label="Verification">{"<div>Original verification</div>" if attempts else ""}{render_badge(verification)}{verification_note}</td>'
         f"<td data-label=\"Elapsed\">{format_elapsed(run.get('elapsed_seconds'))}</td>"
         f'<td data-label="Details">{details}</td>'
         "</tr>"
@@ -1380,9 +1712,10 @@ def render_queue_panel(
     chips: str,
     tone: str,
 ) -> str:
+    filter_name = {'running': 'running', 'queued': 'queued', 'blocked': 'attention'}[tone]
     return (
         f'<section class="panel panel-{tone}">'
-        f'<div class="panel-label">{escape(label)}</div>'
+        f'<div class="panel-label"><a href="/?filter={filter_name}#recent-cases">{escape(label)}</a></div>'
         f'<span class="metric">{len(runs)}</span>{chips}</section>'
     )
 
@@ -1501,12 +1834,31 @@ def render_run_details(
     if final_message:
         details.append(
             '<details><summary>Final output</summary>'
-            f'{render_document(final_message)}</details>'
+            f'{render_brief_artifact(phase_excerpt(final_message), run.get("final_output_path") or str(Path(str(run.get("workspace_path") or "")) / ".symphony/codex-final.md"), "Full output")}</details>'
         )
     details.append(
         '<details><summary>Workspace</summary>'
         f'<code>{escape(run.get("workspace_path"))}</code></details>'
     )
+    if run.get('phase_summaries'):
+        summaries = ''.join(f'<li><strong>{escape(item["phase"])}</strong>{render_brief_artifact(item["summary"], item["path"], "Artifact")}</li>' for item in run['phase_summaries'])
+        details.insert(0, f'<details><summary>Phase summaries</summary><ol>{summaries}</ol></details>')
+    impact = run.get('handoff_impact')
+    if impact:
+        verification = impact['verification']
+        comparison = f'Since handoff attempt {impact["previous_attempt"]}' if impact['previous_attempt'] is not None else 'Previous handoff'
+        files = ', '.join(impact['changed_files'])
+        gaps = ' '.join(verification['gaps'])
+        details.insert(0, '<section class="handoff-note"><strong>This run’s impact</strong>'
+            f'<p>Reported behavior: {escape(impact["reported_behavior"])}</p>'
+            f'<p>This run: {escape(impact["this_run_summary"])}</p>'
+            f'<p>{escape(comparison)}: {escape(impact["comparison_summary"])}</p>'
+            f'<p>Verification at handoff: {escape(verification["status"])} · {verification["passed_suites"]} suites passed · {verification["unsuccessful_suites"]} unsuccessful.</p>'
+            + (f'<p>Remaining gaps: {escape(gaps[:800])}</p>' if gaps else '')
+            + (f'<p>Changed files (up to 12): {escape(files)}</p>' if files else '')
+            + render_brief_artifact('Full impact evidence', impact['artifact_path'], 'Artifact') + '</section>')
+    elif run.get('status') == 'completed':
+        details.insert(0, '<p class="muted">No frozen impact summary was recorded for this handoff.</p>')
     return f'<div class="details-stack">{"".join(details)}</div>'
 
 
@@ -1536,7 +1888,7 @@ def render_review_cell(run: dict[str, Any]) -> str:
             continue
         content = str(run.get(key + "_content") or "")
         location = str(run.get(key + "_path") or "")
-        sections.append(f'<div><strong>{escape(label)}</strong>{render_document(content)}'
+        sections.append(f'<div><strong>{escape(label)}</strong><p>{escape(phase_excerpt(content))}</p>'
                         f'<details class="artifact-path"><summary>File location</summary><code>{escape(location)}</code></details></div>')
     return "".join(sections) or "none"
 
@@ -1604,7 +1956,7 @@ def render_brief_artifact(summary: str, path: Any, label: str) -> str:
     if path:
         path_html = (
             f'<details class="artifact-path"><summary>File location</summary>{escape(label)}:<br>'
-            f"<code>{escape(path)}</code></details>"
+            f'<div class="artifact-location"><code>{escape(path)}</code><button type="button" class="copy-path" data-copy-path="{escape(path)}" aria-label="Copy artifact path">Copy</button></div></details>'
         )
     return f'<div class="brief-summary">{escape(summary)}</div>{path_html}'
 

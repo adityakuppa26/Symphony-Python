@@ -168,7 +168,7 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("Development Implementation", html)
             self.assertIn(f'/runs/{run.id}/plan', html)
             self.assertIn("Open plan ↗", html)
-            self.assertNotIn("Plan summary unavailable", html)
+            self.assertIn("Plan summary unavailable", html)
             self.assertNotIn("Plan content", html)
             self.assertIn("Codex could not run verification", html)
             self.assertIn("done", html)
@@ -252,7 +252,7 @@ class DashboardTests(unittest.TestCase):
             )
             development_html = render_dashboard_html(build_state(workflow, store))
             self.assertIn("Open plan ↗", development_html)
-            self.assertNotIn(
+            self.assertIn(
                 "Goal: Show the concise planning result",
                 development_html,
             )
@@ -497,7 +497,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertIn(content, html)
 
 
-    def test_dashboard_still_expands_long_non_planning_final_message(self) -> None:
+    def test_dashboard_summarizes_long_final_message_with_artifact_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workflow = load_workflow(
@@ -523,7 +523,9 @@ class DashboardTests(unittest.TestCase):
 
             self.assertIn("<details", html)
             self.assertIn("<summary>Final output</summary>", html)
-            self.assertIn("FULL-END", html)
+            self.assertNotIn("FULL-END", html)
+            self.assertIn("Implementation summary", html)
+            self.assertIn(".symphony/codex-final.md", html)
 
     def test_dashboard_survives_corrupt_stored_requirements_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1351,7 +1353,7 @@ class DashboardTests(unittest.TestCase):
 
             self.assertEqual(state["blocked_issues"], [])
             self.assertIn("panel panel-blocked", html)
-            self.assertIn('<div class="panel-label">Needs your input</div>', html)
+            self.assertIn('<a href="/?filter=attention#recent-cases">Needs your input</a>', html)
             self.assertIn('<span class="metric">0</span>', html)
 
 

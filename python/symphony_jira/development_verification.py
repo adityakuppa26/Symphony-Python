@@ -4,10 +4,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import subprocess
 import time
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -19,10 +22,16 @@ from .human_review import (
     write_frozen_text_artifact,
 )
 from .plan_spec import PlanSpec
+from .verification_insights import coverage_summary, failure_summary, runtime_readiness, runner_failure_evidence
+from .recordings import (
+    MAX_RECORDINGS, Recording, RecordingError, create_recording_capture,
+    load_recording_manifest, validate_unique_recordings,
+)
 
 
 CPM_VERIFICATION_ENTRYPOINT = Path("/home/adkuppa/playground/cpm-verification/verify.py")
 FOYR_VERIFICATION_ENTRYPOINT = Path("/home/adkuppa/playground/cpm-verification/foyr.py")
+PLAYWRIGHT_VERIFICATION_ENTRYPOINT = Path("/home/adkuppa/playground/cpm-verification/playwright.py")
 
 
 def validate_foyr_frontend_selector(selector: str) -> None:
@@ -36,12 +45,20 @@ def validate_foyr_frontend_selector(selector: str) -> None:
     raise ValueError("unsupported Foyr frontend test family")
 
 
+def validate_playwright_selector(selector: str) -> None:
+    path = Path(selector)
+    if (not re.fullmatch(r"playwright/integrated/[A-Za-z0-9_./-]+\.spec\.js", selector)
+            or ".." in path.parts or path.as_posix() != selector):
+        raise ValueError("playwright requires explicit normalized files under playwright/integrated/ ending in .spec.js")
+
+
 class DevelopmentVerificationTarget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: Literal["cpm", "foyr2", "pi"]
-    suite: Literal["python", "functional", "frontend", "karma", "smoke"] = "python"
+    suite: Literal["python", "functional", "ibis", "frontend", "playwright", "karma", "smoke"] = "python"
     reason: str = ""
+    acceptance_criterion_ids: list[str] = Field(default_factory=list, max_length=100)
     test_args: list[str] = Field(min_length=1, max_length=104)
 
     @field_validator("test_args")
@@ -64,8 +81,8 @@ class DevelopmentVerificationTarget(BaseModel):
 
     @model_validator(mode="after")
     def supported_suite(self):
-        if self.suite == "functional" and self.repository != "cpm":
-            raise ValueError("functional suite requires cpm")
+        if self.suite in {"functional", "ibis"} and self.repository != "cpm":
+            raise ValueError(f"{self.suite} suite requires cpm")
         if self.suite == "smoke":
             profiles = {"foyr2": ["projects-page"]}
             if self.test_args != profiles.get(self.repository):
@@ -75,6 +92,11 @@ class DevelopmentVerificationTarget(BaseModel):
                 raise ValueError("frontend suite requires foyr2")
             for selector in self.test_args:
                 validate_foyr_frontend_selector(selector)
+        elif self.suite == "playwright":
+            if self.repository != "foyr2":
+                raise ValueError("playwright suite requires foyr2")
+            for selector in self.test_args:
+                validate_playwright_selector(selector)
         elif self.suite == "karma":
             if self.repository != "foyr2" or len(self.test_args) != 1:
                 raise ValueError("karma requires foyr2 and one relative test selector")
@@ -82,7 +104,7 @@ class DevelopmentVerificationTarget(BaseModel):
             if Path(selector).is_absolute() or ".." in Path(selector).parts or selector.startswith("-"):
                 raise ValueError("karma selector must stay within foyr/web/karma_test")
         elif self.repository in {"cpm", "foyr2"}:
-            root = ("Test/functional" if self.suite == "functional" else "Test/unit") if self.repository == "cpm" else "tests"
+            root = {"functional": "Test/functional", "ibis": "Test/flask"}.get(self.suite, "Test/unit") if self.repository == "cpm" else "tests"
             selectors = []
             option_value = False
             for argument in self.test_args:
@@ -99,9 +121,9 @@ class DevelopmentVerificationTarget(BaseModel):
                     raise ValueError(f"unsupported focused pytest option: {argument}")
                 else:
                     path = Path(argument.split("::", 1)[0])
-                    if path.is_absolute() or ".." in path.parts or not path.as_posix().startswith(root + "/"):
+                    if path.is_absolute() or ".." in path.parts or not path.as_posix().startswith(root + "/") or any(c in path.as_posix() for c in "*?[]{}"):
                         raise ValueError(f"{self.repository} requires focused selectors under {root}/")
-                    if (self.suite == "functional" or self.repository == "foyr2") and path.suffix != ".py":
+                    if (self.suite in {"functional", "ibis"} or self.repository == "foyr2") and path.suffix != ".py":
                         raise ValueError("verification requires explicit test files or node IDs")
                     selectors.append(argument)
             if option_value or not selectors:
@@ -138,6 +160,9 @@ class DevelopmentVerificationRequest(BaseModel):
             raise ValueError("a code-bound request must name its snapshot repositories")
         if self.workspace_diff_hash and not {target.repository for target in self.targets} <= set(self.snapshot_repositories):
             raise ValueError("requested tests are outside the code snapshot")
+        if (self.workspace_diff_hash and any(target.suite == "playwright" for target in self.targets)
+                and not {"cpm", "foyr2"} <= set(self.snapshot_repositories)):
+            raise ValueError("playwright code binding must include both cpm and foyr2 runtime sources")
         return self
 
     def validate_repositories(
@@ -184,7 +209,8 @@ def include_changed_test_files(
             path = Path(name)
             python_test = path.suffix == ".py" and (path.name.startswith("test_") or path.name.endswith("_test.py"))
             frontend_test = repository == "foyr2" and (name.lower().endswith("test.js") or name.endswith((".spec.ts", ".spec.tsx", ".node.tsx")))
-            if not (python_test or frontend_test):
+            playwright_test = repository == "foyr2" and name.startswith("playwright/") and name.endswith(".spec.js")
+            if not (python_test or frontend_test or playwright_test):
                 continue
             if not (checkout / path).is_file():
                 continue
@@ -194,9 +220,18 @@ def include_changed_test_files(
                     suite = "python"
                 elif name.startswith("Test/functional/"):
                     suite = "functional"
+                elif name.startswith("Test/flask/"):
+                    suite = "ibis"
             elif repository == "foyr2":
                 if python_test and name.startswith("tests/"):
                     suite = "python"
+                elif playwright_test:
+                    try:
+                        validate_playwright_selector(name)
+                    except ValueError:
+                        pass
+                    else:
+                        suite = "playwright"
                 elif frontend_test:
                     try:
                         validate_foyr_frontend_selector(name)
@@ -254,12 +289,15 @@ class VerificationTargetResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: Literal["cpm", "foyr2", "pi"]
-    suite: Literal["python", "functional", "frontend", "karma", "smoke"]
+    suite: Literal["python", "functional", "ibis", "frontend", "playwright", "karma", "smoke"]
     test_args: list[str]
     reason: str = ""
+    acceptance_criterion_ids: list[str] = Field(default_factory=list, max_length=100)
     status: Literal["passed", "failed", "environment_error"]
     returncode: StrictInt
     setup_returncode: StrictInt | None = None
+    diagnostic: dict = Field(default_factory=dict)
+    log_path: str | None = None
 
 
 class VerificationReport(BaseModel):
@@ -271,6 +309,14 @@ class VerificationReport(BaseModel):
     finished_at: datetime
     results: list[VerificationTargetResult] = Field(max_length=10)
     skipped: list[SkippedVerificationTarget] = Field(max_length=3)
+    recordings: list[Recording] = Field(default_factory=list, max_length=MAX_RECORDINGS)
+    readiness: list[dict] = Field(default_factory=list)
+    coverage: list[dict] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def unique_recordings(self) -> "VerificationReport":
+        validate_unique_recordings(self.recordings)
+        return self
 
 
 def verification_request_hash(request: DevelopmentVerificationRequest) -> str:
@@ -302,6 +348,9 @@ def validate_verification_report(
             raise ValueError("host verification target status contradicts its exit code")
         if result.setup_returncode is not None and result.setup_returncode != 0 and result.status != "environment_error":
             raise ValueError("host verification cannot pass after runtime setup failed")
+    selected_specs = {spec for target in request.targets if target.suite == "playwright" for spec in target.test_args}
+    if any(recording.spec not in selected_specs for recording in report.recordings):
+        raise ValueError("host recording does not match a selected Playwright spec")
     data = report.model_dump(mode="json", exclude_none=True)
     # Keep the nullable diff binding in legacy requests that have no code snapshot.
     data["workspace_diff_hash"] = report.workspace_diff_hash
@@ -350,10 +399,22 @@ def execute_request(
     prepare_with_test: bool = False,
     cpm_entrypoint: Path = CPM_VERIFICATION_ENTRYPOINT,
     foyr_entrypoint: Path = FOYR_VERIFICATION_ENTRYPOINT,
+    playwright_entrypoint: Path = PLAYWRIGHT_VERIFICATION_ENTRYPOINT,
+    preflight: bool = False,
 ) -> int:
     results = []
     failures = []
+    recordings: list[dict] = []
+    target_output = ""
     prepared: dict[str, int] = {}
+    readiness = []
+    if preflight:
+        for target in request.targets:
+            controller = (cpm_entrypoint if target.repository == "cpm" else
+                          playwright_entrypoint if target.suite == "playwright" else foyr_entrypoint)
+            if target.repository in {"cpm", "foyr2"}:
+                readiness.append(runtime_readiness(target, controller))
+        print("Runtime readiness: " + json.dumps(readiness), flush=True)
     deadline = time.monotonic() + timeout_seconds
     deadline_epoch = int(time.time() + timeout_seconds)
 
@@ -366,17 +427,21 @@ def execute_request(
             managed_repositories=tuple(request.snapshot_repositories))
         return snapshot.content_hash == request.workspace_diff_hash
 
-    def invoke(command):
+    def invoke(command, *, cleanup_timeout=5):
+        nonlocal target_output
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             print("Verification time budget exhausted", flush=True)
             return 125
         process = None
+        transcript = tempfile.TemporaryFile(mode='w+b')
         try:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=os.name == "posix",
+                stdout=transcript, stderr=subprocess.STDOUT,
                 env={**os.environ, "SYMPHONY_VERIFICATION_DEADLINE_EPOCH": str(deadline_epoch)})
             return process.wait(timeout=remaining)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            target_output += f"Verification runner unavailable or timed out: {exc}\n"
             print(f"Verification runner unavailable or timed out: {exc}", flush=True)
             if process is not None:
                 try:
@@ -384,7 +449,7 @@ def execute_request(
                         os.killpg(process.pid, signal.SIGTERM)
                     else:
                         process.terminate()
-                    process.wait(timeout=5)
+                    process.wait(timeout=cleanup_timeout)
                 except subprocess.TimeoutExpired:
                     if os.name == "posix":
                         os.killpg(process.pid, signal.SIGKILL)
@@ -394,6 +459,15 @@ def execute_request(
                 except ProcessLookupError:
                     process.wait()
             return 125
+        finally:
+            transcript.seek(0, os.SEEK_END)
+            length = transcript.tell()
+            transcript.seek(max(0, length - 256_000))
+            output = transcript.read().decode('utf-8', errors='replace')
+            transcript.close()
+            target_output += output
+            if output:
+                print(output, flush=True)
 
     try:
         unchanged = code_matches()
@@ -401,9 +475,12 @@ def execute_request(
         print(f"Cannot validate verification code: {exc}", flush=True)
         unchanged = False
     for target in request.targets:
-        if not unchanged:
+        target_output = ""
+        readiness_failure = next((item for item in readiness if item['repository'] == target.repository
+                                  and item['suite'] == target.suite and item['status'] == 'unavailable'), None)
+        if not unchanged or readiness_failure:
             code = 125
-        elif target.repository == "cpm" and target.suite in {"python", "functional"}:
+        elif target.repository == "cpm" and target.suite in {"python", "functional", "ibis"}:
             action = "unit" if target.suite == "python" else target.suite
             selectors, options = split_pytest_arguments(target.test_args)
             command = [sys.executable, str(cpm_entrypoint), action,
@@ -416,6 +493,34 @@ def execute_request(
                 code = 125
             else:
                 code = invoke(command)
+        elif target.repository == "foyr2" and target.suite == "playwright":
+            if not playwright_entrypoint.is_file():
+                print(f"Playwright verification controller missing: {playwright_entrypoint}", flush=True)
+                code = 125
+            else:
+                try:
+                    capture_path = create_recording_capture(workspace_path)
+                except RecordingError as exc:
+                    print(f"Cannot allocate Playwright recordings: {exc}", flush=True)
+                    code = 125
+                else:
+                    command = [sys.executable, str(playwright_entrypoint),
+                               "--workspace", str(workspace_path),
+                               "--timeout", str(max(1, int(deadline - time.monotonic()) - 10)),
+                               "--recording-output", str(capture_path), *target.test_args]
+                    code = invoke(command, cleanup_timeout=90)
+                    try:
+                        captured = load_recording_manifest(workspace_path, capture_path, target.test_args)
+                    except RecordingError as exc:
+                        print(f"Playwright recording evidence unavailable: {exc}", flush=True)
+                        # Preserve a real test failure even if its video export also failed.
+                        if code == 0:
+                            code = 125
+                    else:
+                        recordings.extend(captured)
+                        if code == 0 and set(target.test_args) - {item["spec"] for item in captured}:
+                            print("Playwright recording evidence unavailable: selected-spec recordings are missing", flush=True)
+                            code = 125
         elif target.repository == "foyr2" and target.suite in {"python", "frontend", "karma"}:
             action = "python" if target.suite == "python" else "frontend"
             selectors, options = split_pytest_arguments(target.test_args) if action == "python" else (target.test_args, [])
@@ -451,7 +556,20 @@ def execute_request(
         state = "passed" if code == 0 else "environment_error" if code == 125 else "failed"
         results.append({"repository": target.repository, "suite": target.suite,
                         "test_args": target.test_args, "reason": target.reason,
+                        "acceptance_criterion_ids": target.acceptance_criterion_ids,
                         "status": state, "returncode": code})
+        results[-1]['diagnostic'] = failure_summary(results[-1], json.dumps(readiness_failure) if readiness_failure else target_output)
+        if code and target_output and target.repository in {'cpm', 'foyr2'}:
+            controller = (cpm_entrypoint if target.repository == 'cpm' else
+                          playwright_entrypoint if target.suite == 'playwright' else foyr_entrypoint)
+            evidence = runner_failure_evidence(target_output, controller)
+            results[-1]['diagnostic'].update(evidence)
+            if evidence['assertions']:
+                results[-1]['diagnostic']['summary'] = evidence['assertions'][0]
+        if result_path and target_output:
+            log_path = f'.symphony/verification/{uuid.uuid4()}-{target.repository}-{target.suite}.log'
+            write_frozen_text_artifact(workspace_path, log_path, target_output, label='suite output')
+            results[-1]['log_path'] = log_path
         if target.suite == "python" and prepared.get(target.repository, 0) != 0:
             results[-1]["setup_returncode"] = prepared[target.repository]
         if code:
@@ -464,7 +582,14 @@ def execute_request(
     report = {"status": status, "workspace_diff_hash": request.workspace_diff_hash,
               "request_hash": verification_request_hash(request),
               "finished_at": datetime.now(timezone.utc).isoformat(), "results": results,
-              "skipped": [target.model_dump() for target in request.skipped]}
+              "skipped": [target.model_dump() for target in request.skipped], "recordings": recordings}
+    report['readiness'] = readiness
+    try:
+        plan_content = read_frozen_text_artifact(workspace_path, plan_path, label="coverage PlanSpec")
+        if plan_content:
+            report['coverage'] = coverage_summary(PlanSpec.model_validate_json(plan_content), request, results)
+    except (ValueError, HumanReviewContextError):
+        report['coverage'] = []
     if result_path:
         write_frozen_text_artifact(workspace_path, result_path, json.dumps(report, indent=2),
                                   label="verification result")
@@ -486,11 +611,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cpm-entrypoint", default=str(CPM_VERIFICATION_ENTRYPOINT),
                         help="Trusted schema-only CPM verification controller")
     parser.add_argument("--foyr-entrypoint", default=str(FOYR_VERIFICATION_ENTRYPOINT))
+    parser.add_argument("--playwright-entrypoint", default=str(PLAYWRIGHT_VERIFICATION_ENTRYPOINT))
     parser.add_argument("--prepare-with-test", action="store_true",
                         help="prepare and execute in one entrypoint call under its runtime lock")
     parser.add_argument("--result")
     parser.add_argument("--plan", default=".symphony/codex-plan.md")
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args(argv)
 
     workspace_path = Path(args.workspace).expanduser().resolve()
@@ -511,8 +638,10 @@ def main(argv: list[str] | None = None) -> int:
         plan_path=args.plan,
         timeout_seconds=args.timeout_seconds,
         prepare_with_test=args.prepare_with_test,
+        preflight=args.preflight,
         cpm_entrypoint=Path(args.cpm_entrypoint).expanduser().resolve(),
         foyr_entrypoint=Path(args.foyr_entrypoint).expanduser().resolve(),
+        playwright_entrypoint=Path(args.playwright_entrypoint).expanduser().resolve(),
     )
 
 

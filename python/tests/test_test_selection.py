@@ -117,6 +117,7 @@ def run_selection_attempts(root, messages, *, changed_code=False, status='comple
     orchestrator.store = Mock()
     plan = SimpleNamespace(
         affected_surface=SimpleNamespace(repositories=[repository]),
+        requirements=[],
         baseline_repository_shas=[],
     )
     snapshot = SimpleNamespace(changed_repositories=(repository,), content_hash='a' * 64, content='actual diff')

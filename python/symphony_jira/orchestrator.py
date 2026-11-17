@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -582,6 +583,11 @@ Apply explicit human decisions using the shared human decision policy."""
                     hook_context=self.hook_context(issue),
                 )
             self._persist_requirements_snapshot(issue, workspace.path)
+            from .run_impact import capture_impact_snapshot
+            if self.store.get_run_impact(run.id) is None:
+                impact_start = await asyncio.to_thread(capture_impact_snapshot, workspace.path,
+                                                       self.config.workspace.managed_repositories)
+                self.store.save_impact_start(run.id, impact_start)
 
             if self.config.hooks.before_run and not completed_review:
                 before = await self.workspace_manager.run_hook(
@@ -1766,6 +1772,12 @@ Apply explicit human decisions using the shared human decision policy."""
                 verification_status=verification_status,
                 verification_output_path=verification_output_path,
             )
+            if status == 'completed' and workspace is not None:
+                from .run_impact import save_handoff_impact
+                try:
+                    await asyncio.to_thread(save_handoff_impact, updated, self.store, self.config, redact=self.redact)
+                except Exception as exc:
+                    self.store.add_log(run.id, 'warning', self.redact(f'Handoff impact summary unavailable: {exc}') or '')
 
             if (
                 self.config.codex.auto_replan and status == "blocked" and blocked_phase == "planning"
@@ -1847,7 +1859,11 @@ suite. Run every newly introduced test, including new cases in existing test fil
 by selecting their full files without filters. Select additional existing tests only
 when they exercise this branch's changed behavior. Never add an unrelated sanity
 profile or substitute unrelated tests for missing coverage.
-CPM API suites require separate iBIS integration; record that coverage gap. For Foyr select Python files under tests/. Use explicit relative
+For CPM iBIS endpoint tests choose suite=ibis with explicit Test/flask/ Python files.
+These instantiate the real application in a disposable runner against the owned test
+schema, with response validation enabled by the repository fixtures. Do not send
+requests to Compost or other running developer services. Test/api, Test/epp, and
+Test/db are outside this suite; report those coverage gaps. For Foyr select Python files under tests/. Use explicit relative
 test paths (optionally ::Class::test), with -k/-m filters or concise pytest output flags.
 For Foyr frontend tests choose suite=frontend with explicit source paths under
 foyr/client_src/karma_test/ ending in Test.js or _test.js, or foyr/src/ ending in
@@ -1855,19 +1871,37 @@ foyr/client_src/karma_test/ ending in Test.js or _test.js, or foyr/src/ ending i
 The standalone runner builds the branch assets and runs Karma or Jest with one worker;
 it does not start Foyr, iBIS, CPM, Oracle, or cache services. A missing
 runtime is an environment result, never a product clarification or reason to edit code.
+For live browser regressions choose repository=foyr2 and suite=playwright with
+explicit complete files under playwright/integrated/ ending in .spec.js, without
+flags, globs, line filters, or test-name filters. The trusted controller owns an
+isolated runtime using copied Foyr and CPM sources, a dedicated test schema, and
+seeded login data. The initial profile supplies a non-MFA GC local administrator
+(gc1) and Home projects; native CPM web navigation and other user fixtures are not
+provided. Never point the request at Compost, production, or another
+running developer environment. Inspect each spec's fixture needs; report unsupported
+external integrations rather than inventing credentials or claiming coverage.
+Selected Playwright specs are recorded and shown in the run dashboard. Prefer tests
+that perform this feature's actual user actions and assert visible outcomes. State
+which behavior the selected spec exercises in reason; a generic login/page-load
+recording is not complete feature coverage. If the relevant browser scenario is
+missing, report that gap instead of describing unrelated footage as proof.
+Do not select the older shared-service smoke profile as a replacement for these tests.
 If a changed surface lacks an applicable test, report the gap in a skipped entry;
 do not label backend-only coverage as complete verification of frontend changes.
 
 Return exactly one JSON object with schema_version=1.0, targets, and optionally skipped.
 Enabled suites for this workflow: {json.dumps(self.config.codex.development_test_suites)}.
 Do not request disabled suites; record the uncovered behavior in skipped entries.
-If smoke is enabled, when changing the Projects page or its loader, select foyr2 suite=smoke with
+Only if smoke is enabled and playwright is disabled, when changing the Projects page or its loader, select foyr2 suite=smoke with
 test_args=["projects-page"]. These profiles use the existing local stack only;
 the host validates checkout mounts and reports missing fixture/login/browser setup
 as environment_error. They do not create a test database. Other features currently
 have no smoke profile; do not invent one or claim these checks cover unrelated code.
 Each target: repository, suite (one of the enabled suites), test_args (array), reason (why it covers
-the changed behavior). Each skipped entry: repository, reason. No shell commands.
+the changed behavior), acceptance_criterion_ids (IDs from the approved PlanSpec that these
+tests actually assert). Never map a page-load check to filtering or role behavior it does
+not assert. Unmapped criteria will be displayed as uncovered.
+Each skipped entry: repository, reason. No shell commands.
 Use at most one target per repository/suite pair; combine Python selectors in its
 test_args. Use at most three skipped entries, consolidating reasons per repository.
 The host will add the code-hash binding; do not infer verification success.
@@ -1898,6 +1932,9 @@ Actual workspace diff (SHA-256 {before.content_hash}):
                         raise ValueError("Code changed during read-only test selection; test results would be stale")
                     try:
                         request = DevelopmentVerificationRequest.model_validate_json(result.final_message or "")
+                        criterion_ids = {criterion.id for requirement in plan.requirements for criterion in requirement.acceptance_criteria}
+                        if any(set(target.acceptance_criterion_ids) - criterion_ids for target in request.targets):
+                            raise ValueError("Test selection references unknown acceptance criteria")
                         if any(target.suite not in self.config.codex.development_test_suites for target in request.targets):
                             raise ValueError("Test selection requested a suite disabled by this workflow")
                         request.validate_repositories(changed)
@@ -2007,6 +2044,20 @@ Actual workspace diff (SHA-256 {before.content_hash}):
             event_callback=add_event,
             log_callback=add_log,
         )
+        from .verification_view import phase_excerpt
+        phase = event_prefix or "implementation"
+        artifact = f'.symphony/phases/{run_id}-{uuid.uuid4()}.md'
+        try:
+            write_frozen_text_artifact(workspace_path, artifact,
+                self.redact(result.final_message or result.error or result.status) or result.status,
+                label="phase outcome")
+            self.store.add_log(run_id, "phase_summary", json.dumps({
+                "phase": phase, "status": result.status,
+                "summary": phase_excerpt(self.redact(result.final_message or result.error or result.status)),
+                "path": str(workspace_path / artifact),
+            }))
+        except (HumanReviewContextError, OSError) as exc:
+            self.store.add_log(run_id, "warning", self.redact(f"Phase summary artifact could not be saved: {exc}") or "")
         question = parse_human_request(result.final_message) if result.status == "completed" else None
         if question:
             view = question_view(parse_review_json(result.final_message or ""), question)
@@ -2297,6 +2348,7 @@ class PollingOrchestrator:
         self.last_poll_at: datetime | None = None
         self._stop = asyncio.Event()
         self._poll_lock = asyncio.Lock()
+        self.verification_tasks: dict[str, asyncio.Task] = {}
 
     async def run_forever(self) -> None:
         try:
@@ -2312,12 +2364,13 @@ class PollingOrchestrator:
     async def shutdown(self) -> None:
         """Settle workers before releasing the Jira client or event loop."""
         self.stop()
-        tasks = [item.task for item in self.running.values()]
+        tasks = [item.task for item in self.running.values()] + list(self.verification_tasks.values())
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.reap_finished()
+        await self.dispatch_verifications()
 
     def stop(self) -> None:
         self._stop.set()
@@ -2332,6 +2385,7 @@ class PollingOrchestrator:
         self.last_poll_at = utc_now()
         await self.reap_finished()
         await self.reconcile_running()
+        await self.dispatch_verifications()
         await self.dispatch_human_reviews()
         try:
             issues = await self.jira.search_issues(self.config.tracker.jql, limit=self.search_limit)
@@ -2344,6 +2398,31 @@ class PollingOrchestrator:
         await self.dispatch_human_resumes()
         await self.dispatch_due_retries()
         self.dispatch_fresh_issues(issues)
+
+    async def dispatch_verifications(self) -> None:
+        from .verification_attempts import run_verification_attempt
+        for issue_id, task in list(self.verification_tasks.items()):
+            if task.done():
+                self.verification_tasks.pop(issue_id)
+                self.claimed.discard(issue_id)
+                if not task.cancelled():
+                    task.exception()
+        for attempt in reversed(self.store.list_verification_attempts()):
+            if attempt['status'] == 'running' and attempt.get('started_at'):
+                if (utc_now() - datetime.fromisoformat(attempt['started_at'])).total_seconds() > 21600:
+                    self.store.finish_verification(attempt['id'], 'interrupted', error='Verification worker lease expired; queue a new attempt.')
+            if attempt['status'] != 'queued' or self.available_slots() <= 0:
+                continue
+            source = self.store.get_run(attempt['run_id'])
+            if source is None or source.issue_id in self.claimed:
+                continue
+            if not self.store.claim_verification(attempt['id']):
+                continue
+            single = SingleIssueOrchestrator(self.workflow, self.jira, self.store,
+                workspace_manager=self.workspace_manager, codex_runner=self.codex_runner, secret_values=self.secret_values)
+            self.claimed.add(source.issue_id)
+            self.verification_tasks[source.issue_id] = asyncio.create_task(
+                asyncio.wait_for(run_verification_attempt(single, attempt), timeout=18000))
 
     async def reconcile_running(self) -> None:
         for issue_id, running in list(self.running.items()):
@@ -3085,7 +3164,7 @@ class PollingOrchestrator:
     def available_slots(self) -> int:
         if self._stop.is_set():
             return 0
-        return max(0, self.config.agent.max_concurrent_agents - len(self.running))
+        return max(0, self.config.agent.max_concurrent_agents - len(self.running) - len(self.verification_tasks))
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -3814,6 +3893,7 @@ PlanSpec contract:
 - Cite every current_requirements decision in the matching PlanSpec layer: requirement decisions in requirements and acceptance-criterion decisions in acceptance_criteria.
 - Include role_state_matrix rows for applicable role/state-specific behavior. Role-neutral requirements need no matrix row, and every referenced ID must exist in this PlanSpec.
 - Map at least one test case to every acceptance criterion. Multiple test cases may cover the same criterion.
+- For visible UI behavior, describe a focused browser scenario with user actions and observable expected results in the existing test_cases fields. Name the requirement/acceptance IDs exercised, suitable test data, and supported runtime/role. Plan a recording that shows the changed behavior, not only login or page loading; record unsupported visual coverage honestly.
 - Include the role/state matrix, all affected repositories and surfaces, repository baseline SHAs, precedents, simplest implementation, non-goals, prohibited scope, rollout, rollback, compatibility, risks, and open questions.
 - Every baseline_repository_shas.repository must be a workspace-relative Git worktree root (use "." for the workspace root), and sha must be the full exact output of `git -C <repository> rev-parse HEAD`.
 - If this issue is an Epic, either partition every requirement and acceptance criterion across bounded child plans or use single_change mode with requires_explicit_single_change_approval=true. Approval of that exact PlanSpec is then the explicit authorization.

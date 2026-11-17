@@ -368,8 +368,14 @@ class OrchestratorTests(unittest.TestCase):
                 runner = ReleasableCodexRunner()
                 polling = PollingOrchestrator(workflow, FakeJira(issues[0], issues), Store(root / "db.sqlite3"), codex_runner=runner)
 
+                async def wait_started(count):
+                    async def wait_for_count():
+                        while len(runner.started) < count:
+                            await asyncio.sleep(0.01)
+                    await asyncio.wait_for(wait_for_count(), timeout=5)
+
                 await polling.poll_once()
-                await asyncio.sleep(0.05)
+                await wait_started(1)
 
                 self.assertEqual(len(polling.running), 1)
                 self.assertEqual(runner.started, ["T-1"])
@@ -378,7 +384,7 @@ class OrchestratorTests(unittest.TestCase):
                 await polling.reap_finished()
 
                 await polling.poll_once()
-                await asyncio.sleep(0.05)
+                await wait_started(2)
 
                 self.assertEqual(len(polling.running), 1)
                 self.assertEqual(runner.started, ["T-1", "T-2"])

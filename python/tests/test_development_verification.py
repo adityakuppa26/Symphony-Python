@@ -346,6 +346,7 @@ def test_executor_reports_validate_against_the_selected_commands(code, expected)
 
 @pytest.mark.parametrize('suite,args', [
     ('functional', ['Test/functional/lib/test_x.py::test_case']),
+    ('ibis', ['Test/flask/v3/test_home.py::TestHomeProjects']),
 ])
 def test_cpm_schema_suites_are_scoped(suite, args):
     DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
@@ -371,18 +372,19 @@ def test_schema_runner_bypasses_compost_preserves_filters_and_reports_failures(t
     request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
         {'repository': 'cpm', 'test_args': ['Test/unit/test_x.py', '-k', 'a or b']},
         {'repository': 'cpm', 'suite': 'functional', 'test_args': ['Test/functional/test_x.py']},
+        {'repository': 'cpm', 'suite': 'ibis', 'test_args': ['Test/flask/v3/test_home.py', '-k', 'metadata']},
     ]})
     status = execute_request(request, workspace_path=tmp_path,
         entrypoint=tmp_path/'must-not-run', runtime_entrypoint=tmp_path/'must-not-prepare',
         cpm_entrypoint=runner, result_path='.symphony/result.json')
     assert status == 1
     commands = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert [command[0] for command in commands] == ['unit', 'functional']
+    assert [command[0] for command in commands] == ['unit', 'functional', 'ibis']
     assert all(command[1:3] == ['--source', str(tmp_path/'cpm')] for command in commands)
     assert commands[0][-2:] == ['--pytest-arg=-k', '--pytest-arg=a or b']
     report = validate_verification_report(json.loads((tmp_path/'.symphony/result.json').read_text()),
         request, command_succeeded=False)
-    assert [item['status'] for item in report['results']] == ['failed', 'passed']
+    assert [item['status'] for item in report['results']] == ['failed', 'passed', 'passed']
 
 
 def test_missing_schema_controller_is_environment_error_without_compost_fallback(tmp_path):
@@ -511,3 +513,189 @@ def test_foyr_python_uses_private_stack_and_literal_filters(tmp_path):
     args=json.loads(capture.read_text())
     assert args[:3]==['python','--source',str(tmp_path/'foyr2')]
     assert args[-2:]==['--pytest-arg=-k','--pytest-arg=case or other']
+
+
+@pytest.mark.parametrize('selector', [
+    'Test/flask', 'Test/flask/v3', 'Test/api/test_home.py',
+    'Test/flask/../functional/test_home.py', '/Test/flask/v3/test_home.py',
+    'Test/flask/**/test_home.py', 'Test/flask/v3/test_home.py;touch /tmp/unsafe',
+])
+def test_ibis_rejects_unbounded_or_unsafe_selectors(selector):
+    with pytest.raises(ValueError):
+        DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
+            {'repository': 'cpm', 'suite': 'ibis', 'test_args': [selector]}]})
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_changed_ibis_tests_are_selected_in_full_or_reported_uncovered(tmp_path, enabled):
+    import subprocess
+    from symphony_jira.development_verification import include_changed_test_files
+    checkout = tmp_path/'cpm'
+    subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
+    subprocess.run(['git', '-C', str(checkout), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '--allow-empty', '-qm', 'baseline'], check=True)
+    path = checkout/'Test/flask/v3/test_home.py'
+    path.parent.mkdir(parents=True); path.write_text('def test_added(): pass\n')
+    request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': []})
+    result = include_changed_test_files(request, workspace_path=tmp_path, repositories=('cpm',),
+                                       baseline_shas={}, enabled_suites=['ibis'] if enabled else ['python'])
+    if enabled:
+        assert [(t.suite, t.test_args) for t in result.targets] == [('ibis', ['Test/flask/v3/test_home.py'])]
+        assert not result.skipped
+    else:
+        assert not result.targets
+        assert 'Test/flask/v3/test_home.py' in result.skipped[0].reason
+
+
+@pytest.mark.parametrize('selector', [
+    'playwright/integrated/live_home.spec.js',
+    'playwright/integrated/projects/date_filters.spec.js',
+])
+def test_playwright_accepts_explicit_integrated_files_only_for_foyr(selector):
+    request = {'schema_version': '1.0', 'targets': [
+        {'repository': 'foyr2', 'suite': 'playwright', 'test_args': [selector]}]}
+    DevelopmentVerificationRequest.model_validate(request)
+    for repository in ('cpm', 'pi'):
+        request['targets'][0]['repository'] = repository
+        with pytest.raises(ValueError, match='requires foyr2'):
+            DevelopmentVerificationRequest.model_validate(request)
+
+
+@pytest.mark.parametrize('selector', [
+    'playwright/integrated', 'playwright/local.spec.js',
+    'playwright/integrated/**/*.spec.js', 'playwright/integrated/../local.spec.js',
+    '/playwright/integrated/live_home.spec.js', 'playwright/integrated/./live_home.spec.js',
+    'playwright//integrated/live_home.spec.js', 'playwright/integrated/live_home.spec.js:12',
+    'playwright/integrated/live_home.spec.ts', 'playwright/integrated/live_home.spec.js\n',
+    '--project=chromium', '--grep=home', '--list',
+    'playwright/integrated/test with spaces.spec.js', 'playwright/integrated/test\\name.spec.js',
+])
+def test_playwright_rejects_unbounded_or_alternate_selection(selector):
+    with pytest.raises(ValueError):
+        DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
+            {'repository': 'foyr2', 'suite': 'playwright', 'test_args': [selector]}]})
+
+
+def test_playwright_code_binding_requires_both_application_repositories():
+    request = {'schema_version': '1.0', 'targets': [
+        {'repository': 'foyr2', 'suite': 'playwright', 'test_args': ['playwright/integrated/live_home.spec.js']}],
+        'workspace_diff_hash': 'a' * 64, 'snapshot_repositories': ['foyr2']}
+    with pytest.raises(ValueError, match='both cpm and foyr2'):
+        DevelopmentVerificationRequest.model_validate(request)
+    request['snapshot_repositories'] = ['cpm', 'foyr2']
+    DevelopmentVerificationRequest.model_validate(request)
+
+
+@pytest.mark.parametrize('code,status', [(0, 'passed'), (1, 'failed'), (125, 'environment_error')])
+def test_playwright_uses_isolated_controller_and_preserves_result(tmp_path, code, status):
+    capture = tmp_path/'args.json'
+    from test_recordings import controller_script
+    controller = controller_script(tmp_path, code=code)
+    controller.write_text('import json,sys,pathlib\n'
+        + f'pathlib.Path({str(capture)!r}).write_text(json.dumps(sys.argv[1:]))\n'
+        + controller.read_text())
+    selectors = ['playwright/integrated/live_home.spec.js', 'playwright/integrated/project_dates.spec.js']
+    request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
+        {'repository': 'foyr2', 'suite': 'playwright', 'test_args': selectors}]})
+    result = execute_request(request, workspace_path=tmp_path, entrypoint=tmp_path/'must-not-run',
+                             runtime_entrypoint=tmp_path/'must-not-start-compost',
+                             playwright_entrypoint=controller, result_path='.symphony/result.json',
+                             timeout_seconds=60)
+    assert result == code
+    args = json.loads(capture.read_text())
+    assert args[:3] == ['--workspace', str(tmp_path), '--timeout']
+    assert 1 <= int(args[3]) <= 50
+    assert args[4] == '--recording-output'
+    assert Path(args[5]).parent == tmp_path/'.symphony/recordings'
+    assert args[6:] == selectors
+    report = validate_verification_report(json.loads((tmp_path/'.symphony/result.json').read_text()),
+                                         request, command_succeeded=code == 0)
+    assert report['status'] == status
+    assert report['results'][0]['suite'] == 'playwright'
+
+
+def test_missing_playwright_controller_never_uses_shared_smoke_fallback(tmp_path):
+    request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
+        {'repository': 'foyr2', 'suite': 'playwright', 'test_args': ['playwright/integrated/live_home.spec.js']}]})
+    assert execute_request(request, workspace_path=tmp_path, entrypoint=tmp_path/'must-not-run',
+                           runtime_entrypoint=tmp_path/'must-not-prepare',
+                           playwright_entrypoint=tmp_path/'missing.py') == 125
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_changed_integrated_specs_are_selected_in_full_or_reported_uncovered(tmp_path, enabled):
+    import subprocess
+    from symphony_jira.development_verification import include_changed_test_files
+    checkout = tmp_path/'foyr2'
+    subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
+    subprocess.run(['git', '-C', str(checkout), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '--allow-empty', '-qm', 'baseline'], check=True)
+    integrated = 'playwright/integrated/live_home.spec.js'
+    local = 'playwright/local_only.spec.js'
+    for name in (integrated, local):
+        path = checkout/name; path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('test source\n')
+    request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': []})
+    result = include_changed_test_files(request, workspace_path=tmp_path, repositories=('foyr2',),
+                                       baseline_shas={}, enabled_suites=['playwright'] if enabled else ['frontend'])
+    if enabled:
+        assert [(t.suite, t.test_args) for t in result.targets] == [('playwright', [integrated])]
+        assert integrated not in result.skipped[0].reason
+    else:
+        assert not result.targets
+        assert integrated in result.skipped[0].reason
+    assert local in result.skipped[0].reason
+
+
+@pytest.mark.parametrize('suite,selector,cleanup_timeout', [
+    ('playwright', 'playwright/integrated/live_home.spec.js', 90),
+    ('python', 'tests/test_home.py', 5),
+])
+def test_timeout_allows_playwright_service_cleanup_before_forced_kill(tmp_path, monkeypatch, suite, selector, cleanup_timeout):
+    import subprocess
+    from unittest.mock import Mock
+    import symphony_jira.development_verification as verification
+    controller = tmp_path/'controller.py'; controller.write_text('unused')
+    process = Mock(pid=12345)
+    process.wait.side_effect = [subprocess.TimeoutExpired('controller', 1), 0]
+    monkeypatch.setattr(verification.subprocess, 'Popen', Mock(return_value=process))
+    kill = Mock(); monkeypatch.setattr(verification.os, 'killpg', kill)
+    request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0', 'targets': [
+        {'repository': 'foyr2', 'suite': suite, 'test_args': [selector]}]})
+    assert execute_request(request, workspace_path=tmp_path, entrypoint=tmp_path/'must-not-run',
+                           foyr_entrypoint=controller, playwright_entrypoint=controller) == 125
+    assert process.wait.call_args_list[1].kwargs == {'timeout': cleanup_timeout}
+    kill.assert_called_once_with(process.pid, verification.signal.SIGTERM)
+
+
+@pytest.mark.parametrize('when', ['before', 'during'])
+def test_playwright_cpm_dependency_drift_invalidates_browser_result(tmp_path, when):
+    from symphony_jira.human_review import capture_workspace_diff
+    from symphony_jira.plan_spec import PlanSpec
+    from test_orchestrator import ensure_test_git_repository, valid_plan_spec_message
+    ensure_test_git_repository(tmp_path, repository='cpm')
+    sha = ensure_test_git_repository(tmp_path, repository='foyr2')
+    message = valid_plan_spec_message('requirements_snapshot_hash "' + 'a' * 64 + '"',
+                                     'Implement scoped behavior', baseline_sha=sha, repository='foyr2')
+    plan = PlanSpec.model_validate_json(message)
+    (tmp_path/'.symphony').mkdir()
+    (tmp_path/'.symphony/codex-plan.md').write_text(message)
+    before = capture_workspace_diff(tmp_path, plan, managed_repositories=('cpm', 'foyr2'))
+    changed = tmp_path/'cpm/changed.py'
+    marker = tmp_path/'runner-called'
+    controller = tmp_path/'browser-controller.py'
+    controller.write_text('from pathlib import Path\n'
+                          + f'Path({str(marker)!r}).write_text("executed")\n'
+                          + (f'Path({str(changed)!r}).write_text("CPM changed during browser test")\n'
+                             if when == 'during' else ''))
+    request = DevelopmentVerificationRequest.model_validate({'schema_version': '1.0',
+        'targets': [{'repository': 'foyr2', 'suite': 'playwright',
+                     'test_args': ['playwright/integrated/live_home.spec.js']}],
+        'workspace_diff_hash': before.content_hash, 'snapshot_repositories': ['cpm', 'foyr2']})
+    if when == 'before':
+        changed.write_text('CPM changed after selection')
+    assert execute_request(request, workspace_path=tmp_path, entrypoint=tmp_path/'must-not-run',
+                           playwright_entrypoint=controller, result_path='.symphony/result.json') == 125
+    assert marker.exists() == (when == 'during')
+    report = json.loads((tmp_path/'.symphony/result.json').read_text())
+    assert report['status'] == 'stale'

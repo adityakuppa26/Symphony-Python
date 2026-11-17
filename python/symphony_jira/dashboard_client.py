@@ -16,6 +16,8 @@ DASHBOARD_SCRIPT = r"""
     $('refresh-status').textContent = 'Page refresh paused · alerts still checked';
   };
   document.addEventListener('input', pauseRefresh);
+  document.addEventListener('symphony:reading', pauseRefresh);
+  document.addEventListener('submit', pauseRefresh);
   document.querySelectorAll('[data-review-form]').forEach(form => {
     const key = 'symphony.review-draft:' + form.getAttribute('action');
     const fields = ['reviewer_identity', 'source_url', 'comments'];
@@ -170,14 +172,17 @@ DASHBOARD_SCRIPT = r"""
           element.textContent = run.business_summary || '';
         }
         element.hidden = !run.business_summary;
+        const row = element.closest?.('tr[data-case]');
+        if (row) row.dataset.case = `${run.issue_identifier || ''} ${run.business_summary || ''}`.toLowerCase();
       }
     });
+    filterCases();
     try { JSON.parse(read('symphony.alerted', '[]')).forEach(id => seen.add(id)); } catch {}
     // Use server actionability, not every historical blocked attempt.
     const waiting = (state.blocked_issues || []).filter(run => run.human_input_actionable);
     const fresh = waiting.filter(run => !seen.has(run.id));
     $('attention-summary').textContent = waiting.length
-      ? `${waiting.length} case${waiting.length === 1 ? '' : 's'} need your input: ${waiting.map(run => run.issue_identifier).join(', ')}`
+      ? `${waiting.length} case${waiting.length === 1 ? ' needs' : 's need'} your input: ${waiting.map(run => run.issue_identifier).join(', ')}`
       : 'No human input needed right now';
     $('attention-banner').classList.toggle('needs-attention', waiting.length > 0);
     document.title = waiting.length ? `(${waiting.length}) Input needed · Symphony` : 'Symphony Jira';
@@ -212,6 +217,11 @@ DASHBOARD_SCRIPT = r"""
     finally { polling = false; }
   }
   const rows = [...document.querySelectorAll('tr[data-case]')];
+  const allowedFilters = ['all', 'attention', 'running', 'queued', 'completed', 'failed'];
+  const requestedFilter = typeof URLSearchParams !== 'undefined' ? new URLSearchParams(window.location.search || '').get('filter') : null;
+  $('case-search').value = requestedFilter ? '' : read('symphony.case-search', '');
+  const savedFilter = requestedFilter || read('symphony.case-filter', 'all');
+  $('case-filter').value = allowedFilters.includes(savedFilter) ? savedFilter : 'all';
   function filterCases() {
     const query = $('case-search').value.trim().toLowerCase(), filter = $('case-filter').value;
     let count = 0;
@@ -221,7 +231,13 @@ DASHBOARD_SCRIPT = r"""
       if (matches) count++;
     });
     $('case-count').textContent = `${count} of ${rows.length} recent cases`;
+    $('filter-empty').hidden = count !== 0 || rows.length === 0;
+    save('symphony.case-search', $('case-search').value);
+    save('symphony.case-filter', filter);
   }
+  $('clear-filters').addEventListener('click', () => {
+    $('case-search').value = ''; $('case-filter').value = 'all'; filterCases();
+  });
   $('case-search').addEventListener('input', filterCases);
   $('case-filter').addEventListener('change', () => { pauseRefresh(); filterCases(); });
   filterCases(); poll();

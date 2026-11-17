@@ -97,9 +97,10 @@ hooks:
       --cpm-entrypoint /home/adkuppa/playground/cpm-verification/verify.py \
       --foyr-entrypoint /home/adkuppa/playground/cpm-verification/foyr.py \
       --prepare-with-test \
+      --preflight \
       --result "{{ config.codex.output_development_verification_result_file }}" \
       --plan "{{ config.codex.output_plan_file }}" \
-      --timeout-seconds 1800
+      --timeout-seconds 3600
   verify_required: false
   # Release only runtime services and temporary runners owned by this workspace.
   after_run: |
@@ -141,7 +142,7 @@ codex:
   summarize_requirements_before_planning: true
   business_summary_timeout_seconds: 30
   select_tests_after_implementation: true
-  development_test_suites: [python, functional, frontend]
+  development_test_suites: [python, functional, ibis, frontend, playwright]
   output_development_verification_result_file: ".symphony/development-verification-result.json"
   output_plan_file: ".symphony/codex-plan.md"
   output_review_file: ".symphony/codex-review.md"

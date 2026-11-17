@@ -44,6 +44,27 @@ class Store:
                   failed_at TEXT NOT NULL,
                   error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS verification_attempts (
+                  id TEXT PRIMARY KEY,
+                  run_id TEXT NOT NULL,
+                  issue_identifier TEXT NOT NULL,
+                  mode TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  started_at TEXT,
+                  finished_at TEXT,
+                  report_path TEXT,
+                  error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS run_impacts (
+                  run_id TEXT PRIMARY KEY,
+                  start_snapshot TEXT NOT NULL,
+                  end_snapshot TEXT,
+                  summary TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS active_verification_issue
+                  ON verification_attempts(issue_identifier)
+                  WHERE status IN ('queued', 'running');
                 CREATE TABLE IF NOT EXISTS business_summaries (
                   issue_identifier TEXT NOT NULL,
                   requirements_hash TEXT NOT NULL,
@@ -386,6 +407,9 @@ class Store:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if require_no_active_run:
+                if conn.execute("SELECT 1 FROM verification_attempts WHERE issue_identifier=? AND status IN ('queued','running')",
+                                (issue.identifier,)).fetchone():
+                    raise ValueError(f"issue {issue.identifier} already has active verification")
                 active = conn.execute(
                     """
                     SELECT id FROM runs
@@ -455,6 +479,9 @@ class Store:
                 )
 
             source_run = run_from_row(source_row)
+            if conn.execute("SELECT 1 FROM verification_attempts WHERE issue_identifier=? AND status IN ('queued','running')",
+                            (source_run.issue_identifier,)).fetchone():
+                raise ValueError("Verification is queued or running; wait for it to finish before starting a review")
             requirements_snapshot_hash = str(source_run.issue_fingerprint or "").strip()
             if not requirements_snapshot_hash:
                 raise ValueError("completed run has no requirements snapshot hash")
@@ -2279,6 +2306,71 @@ class Store:
             """,
             run_values(record),
         )
+
+    def queue_verification(self, run_id: str, mode: str = "all") -> dict:
+        if not isinstance(mode, str) or mode not in {"all", "retry"}:
+            raise ValueError("verification mode must be all or retry")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if run is None or run["status"] != "completed":
+                raise ValueError("Verification requires a completed implementation")
+            latest = conn.execute("SELECT id FROM runs WHERE issue_identifier=? ORDER BY started_at DESC LIMIT 1",
+                                  (run["issue_identifier"],)).fetchone()
+            if latest["id"] != run_id:
+                raise ValueError("Verify the latest implementation attempt")
+            identifier = str(uuid.uuid4())
+            try:
+                conn.execute("INSERT INTO verification_attempts (id,run_id,issue_identifier,mode,status,created_at) VALUES (?,?,?,?,?,?)",
+                             (identifier, run_id, run["issue_identifier"], mode, "queued", utc_now().isoformat()))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Verification is already queued or running for this issue") from exc
+        return self.list_verification_attempts(run_id)[0]
+
+    def list_verification_attempts(self, run_id: str | None = None) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM verification_attempts" + (" WHERE run_id=?" if run_id else "")
+                                + " ORDER BY created_at DESC", (run_id,) if run_id else ()).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_phase_summaries(self, run_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT message FROM logs WHERE run_id=? AND level='phase_summary' ORDER BY id DESC LIMIT 50",
+                                (run_id,)).fetchall()
+            return [dict(row) for row in reversed(rows)]
+
+    def save_impact_start(self, run_id: str, snapshot: dict) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO run_impacts(run_id,start_snapshot) VALUES (?,?)",
+                         (run_id, json.dumps(snapshot)))
+
+    def save_impact_end(self, run_id: str, snapshot: dict, summary: dict) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE run_impacts SET end_snapshot=?,summary=? WHERE run_id=? AND summary IS NULL",
+                         (json.dumps(snapshot), json.dumps(summary), run_id))
+
+    def get_run_impact(self, run_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM run_impacts WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                return None
+            return {key: json.loads(row[key]) if row[key] else None
+                    for key in ('start_snapshot', 'end_snapshot', 'summary')}
+
+    def get_impact_summary(self, run_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT summary FROM run_impacts WHERE run_id=?", (run_id,)).fetchone()
+            return json.loads(row['summary']) if row and row['summary'] else None
+
+    def claim_verification(self, identifier: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute("UPDATE verification_attempts SET status='running',started_at=? WHERE id=? AND status='queued'",
+                                (utc_now().isoformat(), identifier)).rowcount == 1
+
+    def finish_verification(self, identifier: str, status: str, *, report_path: str | None = None, error: str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE verification_attempts SET status=?,finished_at=?,report_path=?,error=? WHERE id=? AND status='running'",
+                         (status, utc_now().isoformat(), report_path, error, identifier))
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)

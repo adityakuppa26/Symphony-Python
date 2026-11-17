@@ -336,8 +336,8 @@ class CodexConfig(BaseModel):
     max_implementation_continuations: int = Field(default=6, ge=0, le=20)
     max_review_no_progress_passes: int = Field(default=2, ge=1, le=10)
     require_review_comment_coverage: bool = False
-    development_test_suites: list[Literal["python", "functional", "frontend", "karma", "smoke"]] = Field(
-        default_factory=lambda: ["python", "functional", "frontend"], min_length=1,
+    development_test_suites: list[Literal["python", "functional", "ibis", "frontend", "playwright", "karma", "smoke"]] = Field(
+        default_factory=lambda: ["python", "functional", "ibis", "frontend", "playwright"], min_length=1,
     )
     output_development_verification_result_file: str = ".symphony/development-verification-result.json"
     plan_before_implementation: bool = False

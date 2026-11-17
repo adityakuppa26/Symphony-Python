@@ -1,0 +1,12 @@
+diff --git a/playwright/integrated/live_home.spec.js b/playwright/integrated/live_home.spec.js
+--- a/playwright/integrated/live_home.spec.js
++++ b/playwright/integrated/live_home.spec.js
+@@ -19,7 +19,7 @@ test("GC home shows Project Created Date between My Tasks and Status", async ({log
+     const page = await loginAs("gc1");
+     const grid = page.locator("#projectsGrid");
+     await expect(grid).toBeVisible({timeout: 60 * 1000});
+-    const headers = grid.locator("thead .oj-table-column-header-text");
++    const headers = grid.locator("thead .grid-header-text");
+     await expect(headers.filter({hasText: "Project Created Date"})).toHaveCount(1);
+     const labels = (await headers.allTextContents()).map(label => label.trim());
+     const index = labels.indexOf("Project Created Date");

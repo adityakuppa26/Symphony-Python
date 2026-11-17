@@ -26,7 +26,7 @@ def decision_ledger(context: str | None) -> list[dict]:
     } for item in reversed(history) if item.get('kind') != 'system_routing']
 
 
-async def answer_question(*, run, question: str, plan: str, config, runner=None) -> str:
+async def answer_question(*, run, question: str, plan: str, config, runner=None, impact_history=None) -> str:
     prompt = f'''Answer the operator's question about this Symphony case in plain language.
 This is a read-only conversation, not a resume, decision, approval, or request to edit code.
 Use only the supplied evidence. Do not use tools, run commands, fetch pages, or modify files.
@@ -41,6 +41,10 @@ Current blocker: {(run.error or '')[:8000]}
 Latest output: {(run.final_message or '')[:8000]}
 Human context: {(run.human_input_context or '')[:40000]}
 Plan (bounded excerpt): {plan[:40000]}
+Saved handoff comparisons (up to 10 completed runs through the selected run):
+{json.dumps(impact_history or [], ensure_ascii=False)}
+These are frozen net-change summaries. Distinguish measured file changes from reported
+behavior and test evidence. Never infer missing older snapshots from the current plan.
 Operator question: {question}
 '''
     read_config = read_only_codex_config(config)

@@ -162,7 +162,7 @@ def test_scope_answer_resumes_the_same_review_on_done_jira_after_restart():
             async def run(self, prompt, *args, **kwargs):
                 assert 'Use the existing helper; keep behavior unchanged.' in prompt
                 if prompt.startswith('You are reviewing'):
-                    assert 'Check every pasted human-review comment' in prompt
+                    assert 'Check every pasted review comment or QA defect' in prompt
                 return await super().run(prompt, *args, **kwargs)
 
         restarted = Store(store.db_path)

@@ -555,7 +555,7 @@ reasons, or explicit coverage gaps. Symphony adds the workspace code hash and fr
 and after execution; it cannot report stale results as passing.
 
 `hooks.verify` invokes `symphony_jira.development_verification` with
-`--prepare-with-test`. CPM unit/functional targets use the dedicated schema controller.
+`--prepare-with-test`. CPM unit/functional/iBIS targets use the dedicated schema controller.
 Foyr Python/frontend targets use the standalone Foyr controller. Pi retains
 `scripts/test.sh`. Test processes run on the host's Podman runtime,
 outside Codex's sandbox.
@@ -577,32 +577,86 @@ These checks live in the configured local controllers under
 secrets and identity records. External outages and unknown identity changes can
 still prevent verification; recovery does not bypass those checks.
 
-The checked-in workflow enables `codex.development_test_suites: [python, functional, frontend]`.
+The checked-in workflow enables `codex.development_test_suites: [python, functional, ibis, frontend, playwright]`.
 
 | Repository | Suite and supported selection | Runner |
 | --- | --- | --- |
 | CPM | `python`: `Test/unit/<file>.py`, optionally `::Class::test` | Dedicated schema stack |
 | CPM | `functional`: `Test/functional/<file>.py`, optionally `::Class::test` | Dedicated schema stack |
+| CPM | `ibis`: `Test/flask/<file>.py`, optionally `::Class::test` | Disposable iBIS runner and owned test schema |
 | Foyr | `python`: `tests/<file>.py`, optionally `::Class::test` | Disposable Foyr runner |
 | Foyr | `frontend`: source files under `foyr/client_src/karma_test/` or `foyr/src/` (`.spec.ts` / `.spec.tsx`) | Karma or Jest, one worker |
+| Foyr | `playwright`: complete `.spec.js` files under `playwright/integrated/` | Isolated application runtime and Playwright browser |
 
 Symphony runs tests relevant to the actual feature-branch diff, with no automatic
 sanity profile. Before freezing the request, the host discovers added and modified
-Python and supported Foyr frontend test files against the approved baseline, including staged and untracked files.
+Python, supported Foyr frontend, and integrated Playwright test files against the approved baseline, including staged and untracked files.
 Supported test files are included in full so every newly introduced case runs; filters
 and early-stop flags are removed from those targets. Existing unchanged tests are
 selected only for relevant behavior. Missing or unsupported coverage remains explicit
 in skipped entries; unrelated checks are never substituted. Functional directory and
 full-suite requests are rejected.
-API suites remain out of scope until separate iBIS verification is configured.
+The `ibis` suite covers `Test/flask/`; other API test families remain explicit coverage gaps.
 
 `--cpm-entrypoint /home/adkuppa/playground/cpm-verification/verify.py` routes CPM
-unit and functional targets directly to the standalone controller, bypassing
+unit, functional, and iBIS targets directly to the standalone controller, bypassing
 Compost startup and application containers. It receives this issue's `cpm/` checkout,
 literal test selectors and validated pytest filters, and the remaining host time budget.
+The `ibis` suite uses the locally pinned iBIS image and the repository's in-process
+Connexion/Flask test clients, including their authentication and response-validation
+fixtures. It mounts a copied checkout at `/ibis` and `/TexturaWD/textura` with
+verification-only settings and keys. It uses the same owned test schema and private
+cache as CPM functional tests, under the existing verification locks. It neither
+calls the running Compost iBIS service nor changes Compost configuration or containers.
+Only explicit Python files under `Test/flask/` are supported; `Test/api/`, `Test/epp/`,
+and `Test/db/` remain outside the iBIS suite. Browser coverage uses the separate `playwright` suite below.
+
+Manual focused check:
+
+```sh
+python3 /home/adkuppa/playground/cpm-verification/verify.py ibis \
+  --source /path/to/issue/cpm Test/flask/v3/test_home.py
+```
+
 The controller snapshots source, resets only its owned schema in the existing Oracle
 service and its private cache, and runs a disposable test container. A missing controller
 is an environment error; there is no fallback to the shared CPM application runner.
+
+Playwright dispatches to
+`--playwright-entrypoint /home/adkuppa/playground/cpm-verification/playwright.py`.
+It receives the issue workspace, a bounded timeout, and explicit complete spec paths;
+flags, globs, line selectors, and test-name filters are rejected. The controller
+owns isolated application services, copied Foyr/CPM checkouts, seeded login fixtures,
+and browser artifacts. The Home profile uses the repository-supported release bundle
+with local static assets; the Karma suite retains its debug build. It does not reuse Compost's running application services or login state; Oracle access is limited to the owned verification schema.
+The checked-in hook gives verification one hour; Playwright timeout cleanup has a
+90-second grace period to stop its owned services before forced termination.
+Code-bound Playwright requests must include both `cpm` and `foyr2` in their source
+snapshot, even when only Foyr changed. Missing runtime support is reported as an
+environment error, with no fallback to the shared-service `smoke` profile.
+Specs that require integrations or fixtures beyond the minimal runtime still need
+explicit coverage-gap reporting; selecting a spec does not prove that it passed.
+Non-integrated browser specs remain outside this initial suite.
+
+```sh
+python3 /home/adkuppa/playground/cpm-verification/playwright.py \
+  --workspace /path/to/issue --timeout 3600 playwright/integrated/live_home.spec.js
+```
+
+Playwright verification records successful and failing scenarios as WebM videos.
+The host copies finalized recordings into the issue workspace under
+`.symphony/recordings/` and includes their test titles, outcomes, timestamps, sizes,
+and hashes in the saved verification report. Missing video evidence cannot be
+reported as a fully successful recorded check. Recordings remain available after
+the disposable runtime is cleaned up.
+
+Open **Watch verification video** on a dashboard run to play or seek through its
+recordings. Each video shows its own test outcome; Details identify the test and
+recorded source snapshot. A recording demonstrates the actions and assertions in
+that scenario, so UI implementation plans should include feature-specific browser
+checks rather than a generic login-only clip. Unsupported scenarios remain explicit
+gaps. Additional recorded reruns may be attached without changing the original
+run's verification history.
 
 Each target's result enters the normal code-bound verification report and review input.
 The hook log includes paths to the controller's logs, JUnit XML, source fingerprints,
@@ -763,3 +817,81 @@ section navigation. Technical references and original text remain expandable, an
 the original JSON endpoint is unchanged. Readable plan pages use the same frozen
 plan validation as the JSON endpoint; verification readers cannot open files outside
 the run's workspace.
+
+## Verification attempts and compact phase summaries
+
+Completed implementations now offer **Verify current code** and **Retry unsuccessful
+suites** in the dashboard. The dashboard durably queues the request; the Symphony
+polling worker must be running to execute it. Verification consumes the normal
+concurrency budget and runs test selection plus the host verification hook, without
+repeating implementation, review, or Jira handoff.
+
+The original run retains its verification result. Each new attempt saves its own
+request, report, and log under `.symphony/verification/`. The verification page
+shows original and later results, checks their code hashes against the current
+workspace, and reports unknown freshness when it cannot validate the saved plan.
+A passing historical result is not silently promoted to a current-code pass.
+
+A targeted retry requires unchanged code and identical selectors for the previously
+failed or environment-blocked suites. Previously passing suites are not reused:
+the current runners do not fully attest their mutable runtime dependencies. They
+remain explicit gaps in a targeted retry; use **Verify current code** for an overall
+result. Duplicate verification requests and concurrent feedback reviews are rejected.
+Interrupted workers retain an interrupted result; abandoned running attempts expire
+after six hours, and executions have a five-hour outer limit.
+
+The checked-in host hook uses `--preflight` to inspect controller files, local
+pinned images, the database container, cached Chromium, and browser fixture seed
+availability before running tests. “Ready for setup” means the prerequisites were
+found; database health, schema ownership, and fixture compatibility are still
+validated by the trusted runner. No images are pulled by these checks.
+
+Test selection maps targets to `acceptance_criterion_ids` from the approved plan.
+The report distinguishes selected assertions that passed from unmapped criteria;
+a browser page-load test does not establish filter or role coverage. Suite summaries
+include bounded diagnostics, next steps, saved output locations, and access to
+recordings.
+
+New Codex phases retain a short summary and a separate outcome artifact under
+`.symphony/phases/`. The main dashboard displays summaries and file locations
+instead of embedding full review and final-output artifacts. Existing runs use
+bounded summaries of their retained data; their workspace artifact paths can reflect
+later work. Full documents remain available for detailed plan approval and inspection.
+Restart the dashboard and polling worker after upgrading to load these changes.
+
+## Per-run handoff impact
+
+Each new completed run saves a frozen impact summary in
+`.symphony/impacts/<run-id>.json`, shown as **This run’s impact** in the dashboard.
+It separates net changes during that run from net changes since the previous
+completed handoff. A change already present when a run starts is not attributed
+to that run. Snapshot metadata is retained in SQLite; the UI loads only summaries.
+
+The summary includes implementation-reported behavior, added/modified/deleted
+files, verification status and gaps at handoff, and the full artifact location.
+File-content and executable-mode changes are measured independently of Git commits.
+Snapshots cover managed repositories' tracked and non-ignored untracked files;
+ignored files, external services, and database state are outside that comparison.
+Incomplete captures are explicit. Snapshot capture has a 60-second budget and a
+32 MB per-file limit; an unavailable repository makes the comparison incomplete.
+The original start snapshot survives resumes, and a completed summary is immutable.
+
+Older runs without retained snapshots are marked unavailable rather than
+reconstructed from the current checkout. **Ask Codex** now receives up to ten
+completed handoff summaries through the selected run, so it can explain supported
+run-to-run comparisons without resuming work. A later verification-only attempt
+does not rewrite the original handoff's impact or verification outcome.
+
+## Dashboard navigation
+
+The case list keeps progress and detailed evidence collapsed for scanning.
+**Respond** and **Review plan** open a full-width case page for the required action;
+**Open case** shows a run's impact, summaries, history, and questions. Historical
+case pages retain their saved context without offering stale workflow actions.
+
+Search covers issue keys and business summaries, and search/filter choices survive
+refreshes. Queue headings filter the list; **Clear filters** resets it. Verification
+submissions show inline queue/error feedback and prevent repeat clicks while pending.
+Artifact locations include a copy button, with selectable paths when clipboard access
+is unavailable. Automatic refresh pauses while reading expanded details or entering
+input. Workflow and notification controls live in a collapsed settings section.
